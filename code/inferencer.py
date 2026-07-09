@@ -635,6 +635,21 @@ class Inferencer:
         # misses, a handful of times per episode at most).
         CAM_D_LO      = 1.2     # m — switch GROUNDING->PROXIMITY below this
         CAM_D_HI      = 1.6     # m — switch PROXIMITY->GROUNDING above this
+        # CAM-P4 (docs/cam_p4_gate.md): the fallback PROBE's plausibility gate is keyed
+        # on the PROXIMITY camera's own physical far limit, not CAM_D_HI (the hysteresis
+        # threshold tuned for the reverse PROXIMITY->GROUNDING switch). CX-3 found
+        # (docs/cam_p3_demo.md) that gating on CAM_D_HI can deadlock: the EMA lags a fast
+        # monotonic approach (it blends past-higher and current-lower raw distances), so
+        # when GROUNDING loses the target just above CAM_D_HI (observed: last EMA~1.70m
+        # at true ~1.2m distance), the frozen last-known distance never re-updates (no
+        # further detection occurs to refresh it) and the probe gate blocks PROXIMITY
+        # forever -> permanent dead-reckoning for the rest of the approach (exactly the
+        # failure mode CAM-2 was built to eliminate). Fix: gate on the PROXIMITY camera's
+        # own physical far limit (d_far~=1.81m, docs/cam_opt2_multicam.md / arena.py
+        # PROXIMITY_PITCH=58 geometry) instead — still safely excludes genuinely-far
+        # detections (e.g. the ep13 blue-ball-at-4.96m regression, docs/cam_p1.md, >>1.81m
+        # either way) while covering the EMA-lag margin. Re-gated clean (docs/cam_p4_gate.md).
+        CAM_PROXIMITY_D_FAR = 1.81   # m — proximity camera's physical far limit (probe gate)
         _active_cam   = 'GROUNDING'   # default at episode start (targets start 1.5-9m away)
         _cam_miss_count = 0            # consecutive misses on the active camera
         _video_frame_cache = None       # demo-viz: last labeled active-cam frame (video only)
@@ -754,9 +769,12 @@ class Inferencer:
                     # no second camera to fall back to. Gate is a no-op for cam2 (default).
                     if CAMERA_MODE != 'widefov' and _cam_miss_count >= 2:
                         other_cam = 'GROUNDING' if _active_cam == 'PROXIMITY' else 'PROXIMITY'
-                        # PLAUSIBILITY GATE (docs/cam_p1.md): only probe the PROXIMITY
-                        # camera when the last-known EMA distance says the target could
-                        # actually be inside its ~0.22-1.81m band. Without this gate, a
+                        # PLAUSIBILITY GATE (docs/cam_p1.md, gate value updated per
+                        # docs/cam_p4_gate.md to CAM_PROXIMITY_D_FAR=1.81, the camera's
+                        # own physical far limit, not the CAM_D_HI hysteresis bound):
+                        # only probe the PROXIMITY camera when the last-known EMA distance
+                        # says the target could actually be inside its ~0.22-1.81m band.
+                        # Without this gate, a
                         # far-range miss streak (e.g. blue/cyan wall-HSV collisions at
                         # 5-9m) probes the proximity cam, which stares at the blue-ish
                         # checkered floor (H~105, inside blue/cyan HSV bounds) and can
@@ -767,7 +785,7 @@ class Inferencer:
                         # always safe (its 1.14-21m band covers everything far).
                         _probe_ok = (other_cam == 'GROUNDING' or
                                      (_last_known_goal is not None and
-                                      float(_last_known_goal[0]) <= CAM_D_HI))
+                                      float(_last_known_goal[0]) <= CAM_PROXIMITY_D_FAR))
                         if _probe_ok:
                             if other_cam == 'PROXIMITY':
                                 rgb2, depth2, intr2 = renderer.render_proximity(
