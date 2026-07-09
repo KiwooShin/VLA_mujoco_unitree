@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+.DS_Store
+
+# Model weights & external checkpoints (obtain / generate separately)
+checkpoint/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.npz
+
+# Generated datasets
+dataset/
+dataset_*/
+*.parquet
+
+# Training runs, evals, logs
+runs/
+eval/
+logs/
+*.log
+MUJOCO_LOG.TXT
+
+# Media (bulk) — the single README demo.gif is committed and NOT ignored
+videos/
+*.mp4
+*.avi
+
+# Packaging / archives
+*.zip
+
+# External source (install separately per README)
+third_party/
+
+# Project/experiment docs (kept out of the public source repo)
+docs/
+archive_v1/
+report.md
+report.pdf
+exam.md
+packages.md
+CAMPAIGN.md
