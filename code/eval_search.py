@@ -279,7 +279,7 @@ def _run_search_rollout(
         FALL_HEIGHT, GROUNDING_PERIOD, HOLD_STEPS_REQUIRED, ACTION_SCALE,
         PROPRIO_K, PROPRIO_DIM, PROPRIO_DIM_PHASE, IMG_SIZE, SIM_DT
     )
-    from code.arena import build_arena, ArenaRenderer, GROUNDING_W, GROUNDING_H
+    from code.arena import build_arena, ArenaRenderer, GROUNDING_W, GROUNDING_H, CAMERA_MODE
     from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
                                NUM_ACTIONS, SIM_DT as _SIM_DT, CONTROL_DECIMATION)
     from code.grounding import ground as classical_ground, get_ego_intrinsics_rendered
@@ -316,6 +316,15 @@ def _run_search_rollout(
 
     # --- Renderer ---
     renderer = ArenaRenderer(model_mj)
+    # CAM-1 (Phase 2, toggle): this loop is a hand-duplicated copy of
+    # Inferencer.rollout()'s render/grounding logic (predates the toggle) and always
+    # called render_grounding() with these fixed (45deg-FOVY-assuming) intrinsics --
+    # harmless for cam2 (the default; matches build_arena()'s untouched 45deg render),
+    # but WRONG in widefov mode: build_arena() sets model.vis.global_.fovy model-wide,
+    # so render_grounding() would actually render at WIDEFOV_FOVY while this precomputed
+    # `intr` still assumed 45deg, corrupting every backprojected (dist,bearing). Only
+    # used now as the cam2-mode fallback; widefov mode gets fresh per-cycle intrinsics
+    # from renderer.render_widefov() below (see intr_active in the main loop).
     intr     = get_ego_intrinsics_rendered(GROUNDING_W, GROUNDING_H)
     tp_cam   = renderer.make_tp_cam()
     frames_ego, frames_tp = [], []
@@ -414,9 +423,16 @@ def _run_search_rollout(
         need_grounding = (step - last_grounding_step) >= GROUNDING_PERIOD
         need_render    = render_video or need_grounding
 
+        intr_active = intr   # default (cam2): the loop-invariant 45deg-FOVY intrinsics
         if need_render:
             if need_grounding:
-                rgb, depth, _ = renderer.render_grounding(data_mj, yaw, render_depth=True)
+                if CAMERA_MODE == 'widefov':
+                    # CAM-1 (Phase 2, toggle): single wide-FOV camera — use its own
+                    # per-call intrinsics (correct FOVY/pitch), not the cam2 `intr`.
+                    rgb, depth, intr_active = renderer.render_widefov(
+                        data_mj, yaw, render_depth=True)
+                else:
+                    rgb, depth, _ = renderer.render_grounding(data_mj, yaw, render_depth=True)
                 if render_video:
                     rgb_video, _, _ = renderer.render_ego(data_mj, yaw, render_depth=False)
                 else:
@@ -432,7 +448,7 @@ def _run_search_rollout(
 
         # Classical grounding
         if need_grounding and rgb is not None and depth is not None:
-            gr = classical_ground(rgb, depth, target_color, target_shape, intr)
+            gr = classical_ground(rgb, depth, target_color, target_shape, intr_active)
             last_grounding_step = step
 
             if not gr.not_visible:

@@ -119,8 +119,44 @@ MAX_DEPTH_M      = 12.0  # discard depth readings beyond this (likely sky/wall)
 # were actively BLOCKING valid target detections (targets at 1.5-2.5m appear in
 # the lower portion of the image).
 # New approach: small 5% bottom crop (for noisy edge pixels) + 3% side margins.
-# MIN_DEPTH_M raised to 0.60m to reject very close noise while allowing targets at 0.8m+.
+#
+# P0 GATE FINDING (2026-07-08, docs/cam_p0.md): lowering this floor (tried 0.18m
+# and 0.35m) was ALSO proposed as a P0 prerequisite fix, on the theory that 0.60m
+# discarded valid near-field depth. Isolated A/B testing (full 3-skill re-eval,
+# n=15 seed=999, plus single-episode causal isolation) showed:
+#   - The cam.distance/CAM_ROBOT_FORWARD_OFFSET_M fix ALONE (this floor unchanged
+#     at 0.60m) already gives easy 93.3%->100%, demo 60.0%->66.7%, search
+#     80.0%->80.0% (zero regression) -- because recalibrating the offset from
+#     0.947m->0.10m alone collapses the *effective* near-cutoff from ~1.55m to
+#     ~0.7m from the robot origin, without touching this constant at all.
+#   - Lowering MIN_DEPTH_M further (0.18 or 0.35, combined with the cam.distance
+#     fix) added NO measurable improvement on easy/demo (identical results) but
+#     caused a real regression on search (80.0%->73.3%, isolated to one episode:
+#     the robot got within 0.53m then overshot/circled instead of stopping).
+#     Root cause: trusting depth that close, combined with the now-correct
+#     (undrifted, closer-to-body) eye position, opens a detection window into
+#     the robot's own self-occlusion zone (legs/feet in frame) -- exactly the
+#     risk flagged as unresolved future-work in docs/cam_opt1_widefov.md /
+#     docs/cam_opt2_multicam.md ("depth-based self-body rejection" needed).
+# Verdict: KEEP this constant at its original 0.60m value; the near-field win
+# comes entirely from the geometry fix below, not from relaxing this floor.
 MIN_DEPTH_M      = 0.60  # discard depth < 0.6m (sensor noise / very close floor)
+
+# CAM-2 (Phase 1): the PROXIMITY camera's whole purpose is detecting targets down to
+# ~0.22-0.3m (docs/cam_opt2_multicam.md geometry), so it cannot use the 0.60m floor above
+# (that would blind it over its entire useful range). Used only when
+# intrinsics['is_proximity'] is set (see ground() below) -- the grounding/ego cameras keep
+# MIN_DEPTH_M=0.60 exactly as the P0 gate validated it.
+MIN_DEPTH_PROXIMITY_M = 0.15  # just under the geometric d_near~0.22m; a loose safety net
+                              # against degenerate near-zero readings, not the primary
+                              # defense (see _reject_depth_outliers below for that).
+
+# CAM-1 (Phase 2, toggle, docs/cam_opt1_widefov.md / docs/cam_p2.md): the wide-FOV
+# camera's stated near-field goal is ~0.3m (task brief), same rationale as the
+# proximity camera above -- used only when intrinsics['is_widefov'] is set (see
+# ground() below). cam2's grounding/ego/proximity paths are unaffected (this key is
+# never present in their intrinsics dicts).
+MIN_DEPTH_WIDEFOV_M = 0.15    # loose safety net; same value as MIN_DEPTH_PROXIMITY_M
 MIN_CONFIDENCE   = 0.05  # V2: lowered from 0.10 (distant targets produce small blobs)
 
 # Reduced margins: robot body is NOT in camera frame (camera is 0.947m ahead of robot).
@@ -143,18 +179,29 @@ MIN_VALID_DEPTH_PX = 3   # was 5, reduced for 480x360 high-res render of distant
 
 CAM_PITCH_RAD = math.radians(32.0)   # matches arena.CAM_PITCH
 
-# E6 fix: The MuJoCo ego camera uses cam.distance=0.001 with a lookat point 1.0m forward,
-# placing the actual camera ~0.947m forward of the robot's pelvis origin.
-# The cam_to_egocentric transform must add this offset so that the returned dist and
-# yaw_err are relative to the ROBOT origin (matching the training data goal_vec convention).
-# Measured empirically: camera is 0.947m forward of robot origin in deployment.
-# Without this correction, grounding reports dist ~0.95m less than actual → student
-# thinks target is too close and turns/stops prematurely.
-CAM_ROBOT_FORWARD_OFFSET_M = 0.947  # metres camera is forward of robot origin
+# P0 fix (2026-07-08): arena._set_ego_cam's cam.distance was 0.001 with a lookat
+# point 1.0m forward, which placed the TRUE rendered eye at
+# `origin + (1-distance)*forward_dir` -- i.e. it DRIFTED with pitch. The old
+# 0.947m constant below was empirically measured only at pitch=32 deg
+# (0.10 + cos(32deg)*0.999 = 0.947) and was WRONG when reused, unchanged, for
+# the grounding render's 26 deg pitch (should have been ~0.10+cos(26)=0.999m).
+#
+# Now that arena._set_ego_cam uses cam.distance=1.0 (see arena.py comment), the
+# true eye sits EXACTLY at `origin_head = pelvis_xy + CAM_FWD*heading, pelvis_z+CAM_HEAD_Z`
+# for ANY pitch -- the (1-distance) drift term is now exactly zero. So the
+# camera-to-robot forward offset collapses to the constant forward mount offset
+# CAM_FWD=0.10m, independent of pitch. This was verified empirically (see
+# docs/cam_p0.md): rendering known-position targets through both the 26 deg
+# grounding camera and the 32 deg ego camera and comparing ground()'s reported
+# (dist, bearing) against the analytic ground-truth confirms the same 0.10m
+# constant holds for both pitches (previously a single mismatched constant was
+# reused across pitches with no such guarantee).
+CAM_ROBOT_FORWARD_OFFSET_M = 0.10  # metres camera is forward of robot origin (CAM_FWD)
 
 
 def cam_to_egocentric(x_cam: float, y_cam: float, z_cam: float,
-                      pitch_deg: float = CAM_PITCH_RAD * 180.0 / math.pi) -> tuple[float, float]:
+                      pitch_deg: float = CAM_PITCH_RAD * 180.0 / math.pi,
+                      use_corrected_unpitch: bool = False) -> tuple[float, float]:
     """
     Convert camera-frame 3-D point to robot-egocentric (dist, yaw_err).
 
@@ -169,19 +216,35 @@ def cam_to_egocentric(x_cam: float, y_cam: float, z_cam: float,
                 Use 32° for standard ego render, 20° for grounding render (V2).
                 The grounding render uses a shallower pitch so distant targets appear
                 in frame; cam_to_egocentric must use the same pitch to un-rotate correctly.
-
-    Returns
-    -------
-    dist    : float  horizontal distance from robot origin (m)
-    yaw_err : float  yaw error (rad), positive = target to the LEFT (CCW)
+    use_corrected_unpitch : CAM-2/Phase-1 finding (docs/cam_p1.md). The forward-distance
+                term below (`z_robot = y_cam*sin + z_cam*cos`) has the WRONG SIGN on the
+                y_cam term -- verified by a ground-truth distance sweep (known target
+                positions vs. reported dist): at the existing shallow pitches (26°/32°)
+                the resulting error is small enough that it hides inside the previously
+                -documented "MuJoCo z-buffer underestimation" and the P0 gate still
+                passed, but at the new PROXIMITY_PITCH=58° camera the SAME bug makes the
+                reported distance *decrease* as the true distance *increases* (completely
+                unusable). The geometrically-correct term is `z_cam*cos - y_cam*sin`
+                (re-derived from the OpenGL look-at camera convention MuJoCo's free
+                camera actually uses, and confirmed empirically: distance now increases
+                monotonically with true distance and matches ground truth to within the
+                object's own near-surface offset). This flag is threaded from
+                `intrinsics['is_proximity']` in ground() below so it activates ONLY for
+                the new proximity camera -- the existing, gated 26°/32° grounding/ego
+                paths are left byte-for-byte unchanged (zero regression risk). Fixing
+                this bug for the grounding camera too is flagged as follow-on work, out
+                of scope for this Phase-1 (CAM-2) change.
     """
     # Un-pitch: rotate around camera x-axis by +pitch_rad
     #   x_robot = x_cam
     #   y_robot = y_cam * cos(pitch) - z_cam * sin(pitch)  (vertical)
-    #   z_robot = y_cam * sin(pitch) + z_cam * cos(pitch)  (forward)
+    #   z_robot = y_cam * sin(pitch) + z_cam * cos(pitch)  (forward)  [pre-existing, see note above]
     pitch_rad = math.radians(pitch_deg)
     cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
-    z_robot = y_cam * sp + z_cam * cp   # forward (+ = in front)
+    if use_corrected_unpitch:
+        z_robot = z_cam * cp - y_cam * sp   # forward (+ = in front) -- CAM-2 corrected sign
+    else:
+        z_robot = y_cam * sp + z_cam * cp   # forward (+ = in front) -- pre-existing (unchanged)
     x_robot = x_cam                     # camera x (+ = image right)
 
     # Add camera-to-robot offset: camera is ~0.947m forward of robot origin.
@@ -195,6 +258,8 @@ def cam_to_egocentric(x_cam: float, y_cam: float, z_cam: float,
     # (matching steer.py's egocentric_goal convention where positive yaw_err = CCW = left).
     # The camera's image x-axis is mirrored relative to the robot's lateral axis.
     # Fix: negate x_robot so that image-left → positive yaw_err (turn left toward target).
+    # (Verified empirically to hold at 58° pitch too -- lateral/bearing sign is unaffected
+    # by the use_corrected_unpitch fix above, only the forward-distance term was wrong.)
     yaw_err = math.atan2(-x_robot, z_robot)  # positive when target is to the LEFT (CCW)
     return dist, yaw_err
 
@@ -365,6 +430,64 @@ def _score_all_contours(contours: list, target_shape: str,
 
 
 # ---------------------------------------------------------------------------
+# CAM-2 (Phase 1): depth-based self-body / near-field-artifact rejection.
+# ---------------------------------------------------------------------------
+# Concrete failure mode this addresses (empirically confirmed, docs/cam_p1.md): at the
+# PROXIMITY camera's steep 58° pitch, once the robot is within ~0.5-0.7m of the target,
+# the robot's OWN arms/hands enter the frame flanking the target (visually confirmed by
+# rendering a real close-approach walk). Because the robot body is grey/low-saturation
+# (g1_gear_wbc.xml rgba 0.2/0.7), it does not itself match the saturated HSV target
+# palette -- but color-bleed at object silhouette edges (antialiasing blending the
+# target's color with whatever is directly behind/around it, including a nearer
+# occluder) can pull a MINORITY of contaminating depth samples into the target's color
+# mask, well outside the plausible depth range for a single compact object. This is
+# exactly the "self-occlusion" risk flagged as unresolved in docs/cam_opt1_widefov.md /
+# docs/cam_opt2_multicam.md and pinned down as the P0 ep14 overshoot mechanism
+# (docs/cam_p0.md): trusting depth that close, without this rejection, corrupts the
+# median-depth estimate and produces jittery (dist,bearing) that can make the frozen
+# policy overshoot/circle instead of stopping.
+#
+# Mechanism: cluster the valid depth samples into a 1-D histogram (fine bins) and keep
+# only the samples in the single largest CONTIGUOUS-nonzero cluster around the modal
+# bin. A real object's own surface (even a tall cone/cylinder up to ~0.7m) produces a
+# continuous run of depths with no internal gaps, so it always survives as one cluster;
+# a disjoint contaminating population (a hand/arm at a very different depth, or floor
+# bleeding in through an anti-aliased edge) shows up as a separate cluster across an
+# empty gap and gets dropped. This is a much more targeted defense than a blanket depth
+# floor (which would either blind the camera over its whole useful near-field range, or
+# fail to catch contamination sitting inside the "trusted" range).
+DEPTH_CLUSTER_BIN_M = 0.05   # histogram bin width for the contiguous-cluster search
+
+
+def _reject_depth_outliers(depth_vals: np.ndarray,
+                           bin_m: float = DEPTH_CLUSTER_BIN_M) -> np.ndarray:
+    """
+    Return the subset of depth_vals belonging to the single largest contiguous
+    histogram cluster (the modal object surface), discarding a disjoint minority
+    population (self-body / edge-bleed contamination -- see module comment above).
+
+    No-op (returns depth_vals unchanged) when there are too few samples to cluster
+    meaningfully, or when all samples already sit within one bin.
+    """
+    if depth_vals.size < 4:
+        return depth_vals
+    lo, hi = float(depth_vals.min()), float(depth_vals.max())
+    if hi - lo < bin_m:
+        return depth_vals
+    nbins = max(1, int(math.ceil((hi - lo) / bin_m)))
+    hist, edges = np.histogram(depth_vals, bins=nbins, range=(lo, hi))
+    peak = int(np.argmax(hist))
+    lo_bin, hi_bin = peak, peak
+    while lo_bin > 0 and hist[lo_bin - 1] > 0:
+        lo_bin -= 1
+    while hi_bin < len(hist) - 1 and hist[hi_bin + 1] > 0:
+        hi_bin += 1
+    lo_val, hi_val = float(edges[lo_bin]), float(edges[hi_bin + 1])
+    cluster = depth_vals[(depth_vals >= lo_val) & (depth_vals <= hi_val)]
+    return cluster if cluster.size > 0 else depth_vals
+
+
+# ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
 @dataclass
@@ -413,6 +536,24 @@ def ground(
     color_key = target_color.lower().strip()
     if color_key not in HSV_BOUNDS:
         return GroundingResult(0, 1, 0, 0.0, True)
+
+    # CAM-2 (Phase 1): the proximity camera needs its own (lower) depth floor and its
+    # own corrected un-pitch sign, and its detections get depth-outlier/self-body
+    # clustering. Flag threaded through by ArenaRenderer.render_proximity()'s
+    # intrinsics dict -- absent (False) for the existing grounding/ego cameras, so
+    # their behaviour is completely unchanged.
+    is_proximity   = bool(intrinsics.get('is_proximity', False))
+    # CAM-1 (Phase 2, toggle): the wide-FOV camera gets the same near-field treatment
+    # (lower depth floor + self-body depth-outlier rejection + corrected un-pitch sign)
+    # as the proximity camera, for the same reason -- see ArenaRenderer.render_widefov().
+    # Absent (False) whenever cam2's cameras are used, so their behaviour is unchanged.
+    is_widefov     = bool(intrinsics.get('is_widefov', False))
+    if is_proximity:
+        min_depth_eff = MIN_DEPTH_PROXIMITY_M
+    elif is_widefov:
+        min_depth_eff = MIN_DEPTH_WIDEFOV_M
+    else:
+        min_depth_eff = MIN_DEPTH_M
 
     # ---- Colour segmentation ----
     # Convert to HSV (OpenCV expects BGR input)
@@ -488,7 +629,13 @@ def ground(
 
     # ---- Depth estimation ----
     depth_vals = ego_depth[eroded > 0]
-    valid      = depth_vals[(depth_vals > MIN_DEPTH_M) & (depth_vals < MAX_DEPTH_M)]
+    valid      = depth_vals[(depth_vals > min_depth_eff) & (depth_vals < MAX_DEPTH_M)]
+    if is_proximity or is_widefov:
+        # CAM-2/CAM-1 self-body / near-field-artifact rejection (see module comment
+        # above _reject_depth_outliers): drop a disjoint contaminating depth population
+        # (robot's own arm/hand, or an anti-aliased edge-bleed pixel) before the
+        # median is computed, rather than hoping the median alone is robust to it.
+        valid = _reject_depth_outliers(valid)
 
     if len(valid) < MIN_VALID_DEPTH_PX:
         # E6 fix: if depth is insufficient (all pixels within robot-body range or
@@ -596,7 +743,9 @@ def ground(
         erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         eroded  = cv2.erode(blob_mask, erode_k, iterations=EROSION_ITER)
         depth_vals = ego_depth[eroded > 0]
-        valid      = depth_vals[(depth_vals > MIN_DEPTH_M) & (depth_vals < MAX_DEPTH_M)]
+        valid      = depth_vals[(depth_vals > min_depth_eff) & (depth_vals < MAX_DEPTH_M)]
+        if is_proximity or is_widefov:
+            valid = _reject_depth_outliers(valid)
 
         if len(valid) < MIN_VALID_DEPTH_PX:
             return GroundingResult(0, 1, 0, 0.0, True,
@@ -631,7 +780,13 @@ def ground(
     # The grounding render uses GROUNDING_PITCH=20° (not 32°), so cam_to_egocentric
     # must un-rotate with the same pitch to get correct bearing and distance.
     pitch_deg_for_unrot = float(intrinsics.get('pitch_deg', CAM_PITCH_RAD * 180.0 / math.pi))
-    dist, yaw_err = cam_to_egocentric(pt3d[0], pt3d[1], pt3d[2], pitch_deg=pitch_deg_for_unrot)
+    # CAM-1 (Phase 2, toggle): the widefov camera's pitch (WIDEFOV_PITCH=42 deg) is
+    # steep enough that the pre-existing un-pitch sign bug (docs/cam_p1.md) is a real
+    # risk (it was fatal at PROXIMITY_PITCH=58 deg, small-but-present at 26/32 deg) --
+    # empirically verified monotonic/accurate via a distance-sweep bench before this
+    # was locked in (see docs/cam_p2.md, bench_widefov_dist.py).
+    dist, yaw_err = cam_to_egocentric(pt3d[0], pt3d[1], pt3d[2], pitch_deg=pitch_deg_for_unrot,
+                                      use_corrected_unpitch=(is_proximity or is_widefov))
 
     dist = max(0.0, dist)
 

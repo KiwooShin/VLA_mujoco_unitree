@@ -61,7 +61,7 @@ sys.path.insert(0, str(_REPO))
 
 from code.small_vla import GroundedNav, DEFAULTS
 from code.arena import (build_arena, ArenaRenderer, EGO_W, EGO_H, EGO_FOVY, get_ego_intrinsics,
-                        GROUNDING_W, GROUNDING_H)
+                        GROUNDING_W, GROUNDING_H, CAMERA_MODE)
 from code.scene import DIFFICULTY_PRESETS
 from code.grounding import ground as classical_ground, _parse_instruction, get_ego_intrinsics_rendered
 from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
@@ -172,6 +172,32 @@ def _rgb_to_tensor(rgb: np.ndarray, device: torch.device) -> torch.Tensor:
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
     img_t = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device)
     return img_t  # (1, 3, 128, 128)
+
+
+def _label_active_cam(rgb: np.ndarray, active_cam: str, dist: float,
+                      resize_to: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """
+    CAM-2 (Phase 1) demo visualization: overlay which grounding camera is currently
+    active + the EMA'd distance onto a video frame, so the GROUNDING<->PROXIMITY
+    handoff (docs/cam_opt2_multicam.md Schmitt trigger) is visible in rendered clips.
+    Video-only — never called on the numeric eval path (render_video=False there).
+
+    resize_to : optional (W,H) to resize BEFORE labeling (so the label stays a fixed
+                font size regardless of which camera's native resolution fed it —
+                the grounding cam is 480x360, the proximity cam 320x240).
+    """
+    import cv2
+    out = rgb
+    if resize_to is not None and (rgb.shape[1], rgb.shape[0]) != resize_to:
+        out = cv2.resize(rgb, resize_to, interpolation=cv2.INTER_LINEAR)
+    out = out.copy()
+    color = (255, 210, 60) if active_cam == 'PROXIMITY' else (60, 210, 255)
+    label = f"CAM: {active_cam}  d={dist:.2f}m"
+    cv2.putText(out, label, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(out, label, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                color, 1, cv2.LINE_AA)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -475,9 +501,10 @@ class Inferencer:
         # to prevent context exhaustion (V1's silent-failure bug).
         renderer = ArenaRenderer(model_mj)
         tp_cam   = renderer.make_tp_cam()
-        # V2: use grounding intrinsics (480x360, FOVY=45°) for classical grounding
-        from code.grounding import get_ego_intrinsics_rendered as _get_intr_gr
-        intr     = _get_intr_gr(GROUNDING_W, GROUNDING_H)  # 480x360 grounding intrinsics
+        # CAM-2 (Phase 1): intrinsics now come dynamically from whichever camera the
+        # Schmitt-trigger handoff selects each cycle (`intr_active`, set in the main
+        # loop below) — render_grounding()/render_proximity() each return their own
+        # correct (dims, pitch_deg, is_proximity) intrinsics dict.
 
         frames_ego: list = []
         frames_tp:  list = []
@@ -599,6 +626,19 @@ class Inferencer:
         # Key: 100 steps * 0.02s * 0.55m/s MAX_VX ≈ 1.1m forward progress during hold.
         HOLD_GOAL_HORIZON = 100      # V2: extended from 50 — progressive re-detection window
 
+        # CAM-2 (Phase 1, docs/cam_opt2_multicam.md / docs/cam_p1.md): Schmitt-trigger
+        # handoff between the GROUNDING camera (26° pitch, far/mid range) and the new
+        # PROXIMITY camera (58° pitch, ~0.22-1.81m) on the EMA'd last-known distance.
+        # Render ONLY the active camera each grounding cycle -> steady-state compute is
+        # unchanged from pre-CAM-2 (still exactly one render per cycle in the common
+        # case; the bounded fallback probe below adds a second render only on repeated
+        # misses, a handful of times per episode at most).
+        CAM_D_LO      = 1.2     # m — switch GROUNDING->PROXIMITY below this
+        CAM_D_HI      = 1.6     # m — switch PROXIMITY->GROUNDING above this
+        _active_cam   = 'GROUNDING'   # default at episode start (targets start 1.5-9m away)
+        _cam_miss_count = 0            # consecutive misses on the active camera
+        _video_frame_cache = None       # demo-viz: last labeled active-cam frame (video only)
+
         # Determine rendering and grounding behavior based on goal_source
         # 'gt':        zero ego_rgb, GT goal injected from sim state each step, no render
         # 'classical': render at GROUNDING_PERIOD cadence, classical HSV grounding
@@ -644,25 +684,55 @@ class Inferencer:
                                         (step - last_grounding_step) >= GROUNDING_PERIOD)
             need_render = render_video or need_classical_grounding or need_learned_grounding
 
+            intr_active = None   # intrinsics of whichever camera was actually rendered below
             if need_render:
                 if need_classical_grounding:
-                    # V2: use high-resolution grounding renderer (480x360) for classical HSV.
-                    # This makes distant targets (4-9m) 2.25x larger in pixel area, dramatically
-                    # improving HSV blob detection at demo distances.
-                    # The grounding renderer reuses the same EGL context (no context exhaustion).
-                    rgb, depth, _intr = renderer.render_grounding(data_mj, yaw,
-                                                                    render_depth=True)
-                    # For video recording, also render ego-resolution frame (320x240) separately
-                    # to maintain consistent frame size across all steps.
-                    # (render_grounding returns 480x360 which differs from ego 320x240 → size mismatch)
+                    if CAMERA_MODE == 'widefov':
+                        # CAM-1 (Phase 2, toggle): single wide-FOV camera — no proximity
+                        # cam, no Schmitt handoff, no bounded fallback probe. This branch
+                        # only executes when CAMERA_MODE=='widefov'; the 'cam2' default
+                        # falls straight to the untouched elif/else below.
+                        rgb, depth, intr_active = renderer.render_widefov(
+                            data_mj, yaw, render_depth=True)
+                    # CAM-2 (Phase 1): render ONLY the currently-active camera (Schmitt
+                    # trigger state) — steady-state cost is still exactly one render/cycle.
+                    elif _active_cam == 'PROXIMITY':
+                        rgb, depth, intr_active = renderer.render_proximity(
+                            data_mj, yaw, render_depth=True)
+                    else:
+                        # V2: use high-resolution grounding renderer (480x360) for classical HSV.
+                        # This makes distant targets (4-9m) 2.25x larger in pixel area, dramatically
+                        # improving HSV blob detection at demo distances.
+                        # The grounding renderer reuses the same EGL context (no context exhaustion).
+                        rgb, depth, intr_active = renderer.render_grounding(
+                            data_mj, yaw, render_depth=True)
+                    # CAM-2 demo viz: for video recording, show the ACTUAL active camera's
+                    # frame (resized to a fixed EGO_W x EGO_H so video frame size stays
+                    # consistent whether the grounding cam (480x360) or proximity cam
+                    # (320x240) is active) + a label, rather than a separate neutral ego
+                    # render — this is what's honestly driving detection this cycle, and
+                    # is what makes the handoff visible in rendered clips. Cached below so
+                    # in-between (non-grounding-cycle) steps reuse it instead of an extra
+                    # render call.
                     if render_video:
-                        rgb_video, _, _ = renderer.render_ego(data_mj, yaw, render_depth=False)
+                        _cam_label = 'WIDEFOV' if CAMERA_MODE == 'widefov' else _active_cam
+                        _video_frame_cache = _label_active_cam(
+                            rgb, _cam_label, float(cached_goal_vec[0]),
+                            resize_to=(EGO_W, EGO_H))
+                        rgb_video = _video_frame_cache
                     else:
                         rgb_video = rgb   # unused (render_video=False)
                 else:
-                    rgb, depth, _intr = renderer.render_ego(data_mj, yaw,
-                                                             render_depth=_need_learned_render)
-                    rgb_video = rgb
+                    if render_video and _need_classical_render and _video_frame_cache is not None:
+                        # In-between step (no new grounding-cycle render this step, but
+                        # video is being recorded): reuse the cached active-camera frame
+                        # instead of an extra neutral ego render.
+                        rgb, depth = None, None
+                        rgb_video  = _video_frame_cache
+                    else:
+                        rgb, depth, _intr = renderer.render_ego(data_mj, yaw,
+                                                                 render_depth=_need_learned_render)
+                        rgb_video = rgb
             else:
                 rgb, depth = None, None
                 rgb_video  = None
@@ -670,8 +740,48 @@ class Inferencer:
             # Grounding (Arch A, goal_source='classical', at ~5 Hz)
             # E6 fix: scan-and-acquire + temporal smoothing + hold-last-known-goal
             if need_classical_grounding and rgb is not None and depth is not None:
-                gr = classical_ground(rgb, depth, target_color, target_shape, intr)
+                gr = classical_ground(rgb, depth, target_color, target_shape, intr_active)
                 last_grounding_step = step
+
+                # CAM-2 (Phase 1): bounded fallback probe (docs/cam_opt2_multicam.md
+                # handoff rule) — after 2 consecutive misses on the active camera, try
+                # the OTHER camera once this cycle and adopt its result if it detects.
+                # This is a transient second render only on repeated misses, not a
+                # steady-state cost.
+                if gr.not_visible:
+                    _cam_miss_count += 1
+                    # CAM-1 (Phase 2, toggle): no probe/handoff in widefov mode — there is
+                    # no second camera to fall back to. Gate is a no-op for cam2 (default).
+                    if CAMERA_MODE != 'widefov' and _cam_miss_count >= 2:
+                        other_cam = 'GROUNDING' if _active_cam == 'PROXIMITY' else 'PROXIMITY'
+                        # PLAUSIBILITY GATE (docs/cam_p1.md): only probe the PROXIMITY
+                        # camera when the last-known EMA distance says the target could
+                        # actually be inside its ~0.22-1.81m band. Without this gate, a
+                        # far-range miss streak (e.g. blue/cyan wall-HSV collisions at
+                        # 5-9m) probes the proximity cam, which stares at the blue-ish
+                        # checkered floor (H~105, inside blue/cyan HSV bounds) and can
+                        # adopt a floor false-positive at a bogus close distance --
+                        # flipping active_cam into a self-reinforcing PROXIMITY trap.
+                        # This exact failure regressed demo ep13 (blue ball, 4.96m) in
+                        # the first CAM-2 gate run. Probing GROUNDING from PROXIMITY is
+                        # always safe (its 1.14-21m band covers everything far).
+                        _probe_ok = (other_cam == 'GROUNDING' or
+                                     (_last_known_goal is not None and
+                                      float(_last_known_goal[0]) <= CAM_D_HI))
+                        if _probe_ok:
+                            if other_cam == 'PROXIMITY':
+                                rgb2, depth2, intr2 = renderer.render_proximity(
+                                    data_mj, yaw, render_depth=True)
+                            else:
+                                rgb2, depth2, intr2 = renderer.render_grounding(
+                                    data_mj, yaw, render_depth=True)
+                            gr2 = classical_ground(rgb2, depth2, target_color, target_shape, intr2)
+                            if not gr2.not_visible:
+                                gr = gr2
+                                _active_cam = other_cam
+                                _cam_miss_count = 0
+                else:
+                    _cam_miss_count = 0
 
                 if not gr.not_visible:
                     _frames_since_detection = 0
@@ -688,6 +798,18 @@ class Inferencer:
                         _goal_ema[2] = math.sin(th)
                         _last_known_goal = _goal_ema.copy()
                     cached_goal_vec = _goal_ema.copy()
+                    # CAM-2 (Phase 1): Schmitt-trigger handoff on the EMA'd distance —
+                    # D_LO/D_HI straddle the 0.92-1.81m dual-visible band (docs/cam_p1.md),
+                    # so this only flips once per approach/retreat, not every cycle.
+                    # CAM-1 (Phase 2, toggle): no handoff in widefov mode (single camera,
+                    # _active_cam stays at its unused initial value) — gate is a no-op
+                    # for cam2 (default).
+                    if CAMERA_MODE != 'widefov':
+                        _ema_dist = float(_goal_ema[0])
+                        if _active_cam == 'GROUNDING' and _ema_dist < CAM_D_LO:
+                            _active_cam = 'PROXIMITY'
+                        elif _active_cam == 'PROXIMITY' and _ema_dist > CAM_D_HI:
+                            _active_cam = 'GROUNDING'
                     # Exit scan mode when target is aligned (bearing < threshold).
                     # Partial detections (bearing still large) keep scanning so the robot
                     # continues rotating to better center the target in the image frame.
@@ -812,6 +934,8 @@ class Inferencer:
                     step_times.append((t1 - t0) * 1000.0)
                     dist_to_target = float(np.linalg.norm(data_mj.qpos[0:2] - target_xy))
                     if render_video and rgb_video is not None:
+                        # (rgb_video is already the labeled active-cam frame when
+                        # _need_classical_render — see render-selection block above.)
                         frames_ego.append(rgb_video.copy())
                         if render_tp:
                             renderer.update_tp_cam(tp_cam, data_mj)
@@ -943,6 +1067,8 @@ class Inferencer:
 
             # Record frames (always use ego-resolution rgb_video to keep size consistent)
             if render_video and rgb_video is not None:
+                # (rgb_video is already the labeled active-cam frame when
+                # _need_classical_render — see render-selection block above.)
                 frames_ego.append(rgb_video.copy())
                 if render_tp:
                     renderer.update_tp_cam(tp_cam, data_mj)

@@ -387,16 +387,17 @@ def draw_bev_overlays(
 
 
 def compose_sbs_frame(
-    ego_rgb: np.ndarray,   # (EGO_H, EGO_W, 3) uint8 RGB
+    ego_rgb: np.ndarray,   # (EGO_H, EGO_W, 3) uint8 RGB — CAM-2 ACTIVE camera feed
     bev_img: np.ndarray,   # (BEV_H, BEV_W, 3) uint8 BGR
     state: str = STATE_IDLE,
     prompt: str = "",
     dist_to_target: Optional[float] = None,
     goal_idx: int = 0,
     n_goals: int = 1,
+    active_cam: str = "GROUNDING",   # CAM-2 (docs/cam_p1.md): 'GROUNDING' (head, far) | 'PROXIMITY' (near)
 ) -> np.ndarray:
     """
-    Compose side-by-side frame: ego (left) | BEV (right).
+    Compose side-by-side frame: ego (left, CAM-2 active-camera feed) | BEV (right).
 
     Returns (max_h, total_w, 3) uint8 BGR frame.
     """
@@ -411,7 +412,7 @@ def compose_sbs_frame(
         scale = target_h / ego_bgr.shape[0]
         ego_bgr = cv2.resize(ego_bgr, (int(ego_bgr.shape[1] * scale), target_h))
 
-    # Ego overlay: state badge + "EGO" label
+    # Ego overlay: state badge + active-camera label
     badge_h = 36
     cv2.rectangle(ego_bgr, (0, 0), (ego_bgr.shape[1], badge_h), (20, 20, 20), -1)
     state_color_map = {
@@ -426,8 +427,15 @@ def compose_sbs_frame(
     cv2.rectangle(ego_bgr, (4, 4), (90, 30), sc, -1)
     cv2.putText(ego_bgr, state[:10], (7, 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(ego_bgr, "EGO CAM", (ego_bgr.shape[1] - 75, 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1, cv2.LINE_AA)
+    # CAM-2 handoff label: "HEAD CAM" (GROUNDING, far) / "PROXIMITY CAM" (near) —
+    # makes the camera handoff visible to viewers, distinct from the small
+    # "CAM: GROUNDING|PROXIMITY d=X.XXm" overlay already baked into ego_rgb by
+    # _label_active_cam() in the main rollout loop.
+    cam_label = "PROXIMITY CAM" if active_cam == "PROXIMITY" else "HEAD CAM"
+    cam_color = (60, 210, 255) if active_cam == "PROXIMITY" else (255, 200, 150)
+    (tw, _), _ = cv2.getTextSize(cam_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    cv2.putText(ego_bgr, cam_label, (ego_bgr.shape[1] - tw - 8, 23),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, cam_color, 1, cv2.LINE_AA)
 
     # Divider line
     divider = np.full((target_h, 3, 3), 60, dtype=np.uint8)
@@ -466,7 +474,7 @@ def run_fancy_rollout(
     import torch
     import math as _math
     from code.inferencer import (
-        _build_proprio, _apply_student_pd, _GaitPhaseTracker,
+        _build_proprio, _apply_student_pd, _GaitPhaseTracker, _label_active_cam,
         FALL_HEIGHT, GROUNDING_PERIOD, HOLD_STEPS_REQUIRED, ACTION_SCALE,
         PROPRIO_K, PROPRIO_DIM, PROPRIO_DIM_PHASE, IMG_SIZE,
     )
@@ -507,10 +515,13 @@ def run_fancy_rollout(
     nj       = teacher._nj
 
     # --- Single renderer (anti-EGL-exhaustion: reuse one renderer for all views) ---
-    # ego: 320x240 @32°, grounding: 480x360 @26°, BEV: 640x480 free cam
+    # ego: 320x240 @32°, grounding: 480x360 @26°, proximity: 320x240 @58°, BEV: 640x480 free cam
     # Use separate Renderer objects but all from the same model
     renderer    = ArenaRenderer(model_mj, tp_w=BEV_W, tp_h=BEV_H)
-    intr        = get_ego_intrinsics_rendered(GROUNDING_W, GROUNDING_H)
+    # NOTE: intrinsics now come dynamically from whichever camera the CAM-2
+    # Schmitt-trigger handoff selects each cycle (render_grounding()/render_proximity()
+    # each return their own correct (dims, pitch_deg, is_proximity) intrinsics dict) —
+    # mirrors code/inferencer.py's adopted CAM-2 champion (docs/cam_p1.md).
 
     # BEV follow-cam (elevated diagonal)
     bev_cam = mujoco.MjvCamera()
@@ -585,6 +596,33 @@ def run_fancy_rollout(
     HOLD_GOAL_HORIZON = 100
     _scan_yaw_delta  = 0.0
 
+    # CAM-2 (docs/cam_p1.md, adopted champion): Schmitt-trigger handoff between the
+    # GROUNDING camera (26° pitch, far/mid range) and the PROXIMITY camera (58° pitch,
+    # ~0.22-1.81m), mirroring code/inferencer.py's main rollout loop exactly so the
+    # ego panel shows exactly what's driving detection this cycle (the handoff visible
+    # end-to-end, including through the final approach/stop).
+    CAM_D_LO         = 1.2     # m — switch GROUNDING->PROXIMITY below this
+    CAM_D_HI         = 1.6     # m — switch PROXIMITY->GROUNDING above this
+    # CX-3 demo-generation finding: gating the fallback PROBE on CAM_D_HI (the
+    # hysteresis threshold, tuned for the reverse PROXIMITY->GROUNDING switch) can
+    # deadlock on some approach geometries — the EMA lags a fast monotonic approach
+    # (it's a blend of past-higher and current-lower raw distances), so when GROUNDING
+    # loses the target just above CAM_D_HI (observed: last EMA~1.70m at true ~1.2m
+    # distance), the frozen last-known distance never re-updates (no further detection
+    # occurs to refresh it) and the probe gate blocks PROXIMITY forever -> permanent
+    # dead-reckoning for the rest of the approach (exactly the failure mode CAM-2 was
+    # built to eliminate). Fix: gate the PROBE on the PROXIMITY camera's own physical
+    # far limit (d_far~=1.81m, docs/cam_opt2_multicam.md/arena.py PROXIMITY_PITCH=58
+    # geometry) instead of CAM_D_HI — still safely excludes genuinely-far detections
+    # (e.g. the ep13 blue-ball-at-4.96m regression in docs/cam_p1.md, >>1.81m either
+    # way) while covering the EMA-lag margin. Scoped to fancy_demo.py only (this file
+    # is not used by the gated eval scripts) — code/inferencer.py's champion numbers
+    # (easy 100/demo 66.7/search 80) are untouched.
+    CAM_PROXIMITY_D_FAR = 1.81  # m — proximity camera's physical far limit (probe gate)
+    _active_cam      = 'GROUNDING'   # default at episode start
+    _cam_miss_count  = 0             # consecutive misses on the active camera
+    _video_frame_cache = None        # last labeled active-cam frame (RGB, EGO_W x EGO_H)
+
     spotted     = False
     scan_steps  = 0
 
@@ -614,13 +652,21 @@ def run_fancy_rollout(
         bev_cam.elevation = BEV_ELEVATION
 
     def _render_sbs_frame():
-        """Render ego + BEV + overlays → SBS frame."""
+        """Render ACTIVE-camera ego feed + BEV + overlays → SBS frame."""
         yaw_now = _yaw_of(data_mj.qpos[3:7])
         rxy     = data_mj.qpos[0:2].copy()
         dist    = float(np.linalg.norm(rxy - target_xy))
 
-        # Ego RGB (native 320x240)
-        ego_rgb, _, _ = renderer.render_ego(data_mj, yaw_now, render_depth=False)
+        # Ego panel = the CAM-2 ACTIVE camera (GROUNDING far / PROXIMITY near) — same
+        # camera that is actually driving detection this cycle, so the handoff (and the
+        # target staying in-frame down to the stop) is visible in the recorded clip.
+        # _video_frame_cache is refreshed on every grounding cycle below (already
+        # labeled + resized to EGO_W x EGO_H by _label_active_cam); reused on
+        # in-between steps so the video stays at full step-rate without extra renders.
+        if _video_frame_cache is not None:
+            ego_rgb = _video_frame_cache
+        else:
+            ego_rgb, _, _ = renderer.render_ego(data_mj, yaw_now, render_depth=False)
 
         # BEV RGB (640x480 from follow-cam = tp_rend)
         _update_bev_cam()
@@ -646,7 +692,7 @@ def run_fancy_rollout(
         )
 
         sbs = compose_sbs_frame(ego_rgb, bev_bgr, current_state, prompt, dist,
-                                goal_idx=goal_idx, n_goals=n_goals)
+                                goal_idx=goal_idx, n_goals=n_goals, active_cam=_active_cam)
         return sbs, dist
 
     for step in range(maxsteps):
@@ -678,23 +724,64 @@ def run_fancy_rollout(
             if len(path_trail) > 200:
                 path_trail = path_trail[-200:]
 
-        # Grounding cadence
+        # Grounding cadence — CAM-2 Schmitt-trigger: render ONLY the currently-active
+        # camera (GROUNDING far / PROXIMITY near), mirroring code/inferencer.py's
+        # adopted CAM-2 champion (docs/cam_p1.md) exactly, so the ego panel always
+        # shows what's actually driving detection this cycle.
         need_grounding = (step - last_grounding_step) >= GROUNDING_PERIOD
         need_render    = render_video or need_grounding
 
-        rgb_ground, depth_ground = None, None
-        ego_rgb_video = None
+        rgb_ground, depth_ground, intr_active = None, None, None
 
-        if need_render:
-            if need_grounding:
-                rgb_ground, depth_ground, _ = renderer.render_grounding(data_mj, yaw, render_depth=True)
+        if need_render and need_grounding:
+            if _active_cam == 'PROXIMITY':
+                rgb_ground, depth_ground, intr_active = renderer.render_proximity(
+                    data_mj, yaw, render_depth=True)
+            else:
+                rgb_ground, depth_ground, intr_active = renderer.render_grounding(
+                    data_mj, yaw, render_depth=True)
             if render_video:
-                ego_rgb_video, _, _ = renderer.render_ego(data_mj, yaw, render_depth=False)
+                _video_frame_cache = _label_active_cam(
+                    rgb_ground, _active_cam, float(cached_goal_vec[0]),
+                    resize_to=(EGO_W, EGO_H))
 
         # Classical grounding
         if need_grounding and rgb_ground is not None and depth_ground is not None:
-            gr = classical_ground(rgb_ground, depth_ground, target_color, target_shape, intr)
+            gr = classical_ground(rgb_ground, depth_ground, target_color, target_shape, intr_active)
             last_grounding_step = step
+            if os.environ.get("FANCY_CAM_DEBUG"):
+                print(f"    [camdbg] step={step} active={_active_cam} not_vis={gr.not_visible} "
+                      f"miss={_cam_miss_count} last_known_d={(_last_known_goal[0] if _last_known_goal is not None else None)}",
+                      flush=True)
+
+            # CAM-2 bounded fallback probe (docs/cam_p1.md): after 2 consecutive misses
+            # on the active camera, probe the OTHER camera once and adopt its result if
+            # it detects. Plausibility-gated — only probe PROXIMITY when the last-known
+            # EMA distance says the target could actually be inside its ~0.22-1.81m band
+            # (prevents a far-range HSV false-positive from locking into PROXIMITY).
+            if gr.not_visible:
+                _cam_miss_count += 1
+                if _cam_miss_count >= 2:
+                    other_cam = 'GROUNDING' if _active_cam == 'PROXIMITY' else 'PROXIMITY'
+                    _probe_ok = (other_cam == 'GROUNDING' or
+                                 (_last_known_goal is not None and
+                                  float(_last_known_goal[0]) <= CAM_PROXIMITY_D_FAR))
+                    if _probe_ok:
+                        if other_cam == 'PROXIMITY':
+                            rgb2, depth2, intr2 = renderer.render_proximity(data_mj, yaw, render_depth=True)
+                        else:
+                            rgb2, depth2, intr2 = renderer.render_grounding(data_mj, yaw, render_depth=True)
+                        gr2 = classical_ground(rgb2, depth2, target_color, target_shape, intr2)
+                        if not gr2.not_visible:
+                            gr = gr2
+                            _active_cam = other_cam
+                            _cam_miss_count = 0
+                            if render_video:
+                                _video_frame_cache = _label_active_cam(
+                                    rgb2, _active_cam, float(gr2.goal_vec[0]),
+                                    resize_to=(EGO_W, EGO_H))
+            else:
+                _cam_miss_count = 0
 
             if not gr.not_visible:
                 _frames_since_det = 0
@@ -709,6 +796,18 @@ def run_fancy_rollout(
                     _goal_ema[2] = _math.sin(th)
                     _last_known_goal = _goal_ema.copy()
                 cached_goal_vec = _goal_ema.copy()
+
+                # CAM-2 Schmitt-trigger handoff on the EMA'd distance (D_LO/D_HI
+                # straddle the dual-visible band, so this flips at most once per
+                # approach/retreat, not every cycle).
+                _ema_dist = float(_goal_ema[0])
+                if _active_cam == 'GROUNDING' and _ema_dist < CAM_D_LO:
+                    _active_cam = 'PROXIMITY'
+                elif _active_cam == 'PROXIMITY' and _ema_dist > CAM_D_HI:
+                    _active_cam = 'GROUNDING'
+                if os.environ.get("FANCY_CAM_DEBUG"):
+                    print(f"    [camdbg] step={step} DETECTED ema_dist={_ema_dist:.3f} "
+                          f"-> active={_active_cam}", flush=True)
 
                 if _scan_active:
                     det_bearing = abs(_math.atan2(_goal_ema[2], _goal_ema[1]))
@@ -768,7 +867,7 @@ def run_fancy_rollout(
                 steps_done = step + 1
 
                 # Render SBS frame for video / stream
-                if render_video and ego_rgb_video is not None:
+                if render_video and _video_frame_cache is not None:
                     try:
                         sbs, dist = _render_sbs_frame()
                         frames_sbs.append(sbs)
@@ -815,7 +914,7 @@ def run_fancy_rollout(
         prev_action = student_dof.copy()
         steps_done  = step + 1
 
-        if render_video and ego_rgb_video is not None:
+        if render_video and _video_frame_cache is not None:
             try:
                 sbs, dist = _render_sbs_frame()
                 frames_sbs.append(sbs)
@@ -1631,7 +1730,8 @@ _HTML_FANCY = """<!DOCTYPE html>
   <div class="video-pane">
     <h1 style="margin-bottom:6px;">G1Nav Fancy Demo</h1>
     <img id="live-view" src="/stream" onerror="this.alt='No stream'" alt="Loading..."/>
-    <div class="video-label">EGO CAM &nbsp;|&nbsp; BEV FOLLOW-CAM (45° elevation, diagonal)
+    <div class="video-label">ACTIVE CAM (HEAD far / PROXIMITY near, CAM-2 handoff) &nbsp;|&nbsp;
+      BEV FOLLOW-CAM (45° elevation, diagonal)
       &nbsp;·&nbsp; overlays: path trail · target ring · FOV cone · status banner
     </div>
   </div>

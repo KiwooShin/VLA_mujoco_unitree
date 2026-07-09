@@ -87,6 +87,45 @@ GROUNDING_PITCH = 26.0                # grounding camera downward tilt (V2); sha
 # 32°: too steep — far targets (7m+) fall off the bottom.
 # 26° is the sweet spot that covers both easy (1.5-2.5m) and demo (4-9m) ranges.
 
+# ---------------------------------------------------------------------------
+# CAM-2 (Phase 1, docs/cam_opt2_multicam.md / docs/cam_p1.md): PROXIMITY camera.
+#
+# Same head mount as the ego/grounding cams (CAM_HEAD_Z, CAM_FWD unchanged — with the
+# P0 cam.distance=1.0 fix, the rendered eye sits EXACTLY at that mount point for ANY
+# pitch, so no new forward-offset constant is needed; grounding.CAM_ROBOT_FORWARD_OFFSET_M
+# =0.10 applies unchanged to this camera too), just steeper tilt so the last ~0.2-1.8m
+# of approach stays in-frame after the head/grounding cameras' near-cutoff (~0.7-0.9m).
+#
+# Geometry (docs/cam_opt2_multicam.md §2, H=CAM_HEAD_Z+pelvis≈1.29m, FOVY=45°):
+#   58° pitch -> d_near≈0.22m, d_far≈1.81m  (overlaps grounding/ego cams' own near-cutoff
+#   by a wide ~0.9m band, giving a safe hysteresis zone for the handoff in inferencer.py).
+PROXIMITY_W, PROXIMITY_H = 320, 240   # cheapest of the three renders — close targets are large
+PROXIMITY_PITCH = 58.0                # steep downward tilt — covers ~0.22-1.81m
+
+# ---------------------------------------------------------------------------
+# CAM-1 (Phase 2, docs/cam_opt1_widefov.md / docs/cam_p2.md): WIDE-FOV single-camera
+# mode, an A/B alternative to the adopted CAM-2 champion above.
+#
+# HARD RULE: this is a config TOGGLE, never a replacement of the CAM-2 code paths.
+# CAMERA_MODE defaults to 'cam2' (the champion, docs/cam_p1.md) — with the toggle at
+# its default, every code path below that reads CAMERA_MODE is a no-op and behaviour
+# is byte-identical to CAM-2. Set env var CAMERA_MODE=widefov to activate CAM-1 instead
+# (single camera, same head mount, no proximity cam, no Schmitt handoff).
+CAMERA_MODE = os.environ.get("CAMERA_MODE", "cam2").strip().lower()
+if CAMERA_MODE not in ("cam2", "widefov"):
+    raise ValueError(f"Unknown CAMERA_MODE={CAMERA_MODE!r} (expected 'cam2' or 'widefov')")
+
+# Single wide-FOV renderer, same head mount (CAM_HEAD_Z, CAM_FWD unchanged) as the
+# cam2 cameras. Geometry (docs/cam_opt1_widefov.md §2, H=CAM_HEAD_Z+pelvis≈1.34m):
+# solving d_near=H/tan(theta+phi)=0.30m for FOVY=70° (phi=35°) gives theta≈42.4°;
+# resulting d_far=H/tan(theta-phi)≈10.3m (theta>phi, so a real far cutoff exists,
+# comfortably beyond the 8-9m demo range). 640x480 matches the existing TP_W/TP_H so
+# the offscreen buffer sizing above (max(...,TP_W/TP_H)) already covers it with no
+# change needed there.
+WIDEFOV_W, WIDEFOV_H = 640, 480        # single renderer resolution
+WIDEFOV_FOVY  = 70.0                    # vertical FOV (degrees) — probe value (task brief)
+WIDEFOV_PITCH = 42.0                    # downward tilt solved for d_near~0.3m at FOVY=70
+
 # Third-person camera defaults (for video only)
 TP_W, TP_H   = 640, 480
 
@@ -133,10 +172,10 @@ def build_arena(scene_cfg: dict) -> mujoco.MjModel:
     # ---- Load robot spec ----
     spec = mujoco.MjSpec.from_file(G1_XML)
 
-    # Set offscreen buffer large enough for all cameras (ego, grounding, TP)
+    # Set offscreen buffer large enough for all cameras (ego, grounding, proximity, TP)
     try:
-        spec.visual.global_.offwidth  = max(EGO_W, GROUNDING_W, TP_W)
-        spec.visual.global_.offheight = max(EGO_H, GROUNDING_H, TP_H)
+        spec.visual.global_.offwidth  = max(EGO_W, GROUNDING_W, PROXIMITY_W, TP_W)
+        spec.visual.global_.offheight = max(EGO_H, GROUNDING_H, PROXIMITY_H, TP_H)
     except Exception:
         pass  # older mujoco — ignore
 
@@ -217,6 +256,18 @@ def build_arena(scene_cfg: dict) -> mujoco.MjModel:
     except Exception:
         pass
 
+    # ---- CAM-1 (Phase 2, toggle): widen the ACTUAL rendered FOVY ----
+    # cam_opt1_widefov.md Finding #1: MuJoCo's rendered FOVY for an mjCAMERA_FREE camera
+    # comes from model.vis.global_.fovy (model-wide), which cam2 mode never sets (stays
+    # at MuJoCo's compiled-in 45° default — exactly what grounding.EGO_FOVY_RENDERED
+    # already assumes). Only in widefov mode do we override it here, so cam2's rendered
+    # FOVY (and every cam2 intrinsics computation downstream) is completely untouched.
+    if CAMERA_MODE == 'widefov':
+        try:
+            spec.visual.global_.fovy = WIDEFOV_FOVY
+        except Exception:
+            pass
+
     # ---- Compile ----
     model = spec.compile()
 
@@ -256,7 +307,18 @@ def _set_ego_cam(cam: mujoco.MjvCamera, qpos: np.ndarray, yaw: float,
     dz = -math.sin(pitch_rad)
 
     cam.lookat[:] = [cx + dx, cy + dy, cz + dz]
-    cam.distance   = 0.001          # very close (nearly pinhole)
+    # P0 fix (2026-07-08): cam.distance was 0.001 ("nearly pinhole"), but MuJoCo's
+    # free camera places the eye at `lookat - distance*forward`. With lookat set to
+    # `origin + 1.0*forward_dir` above, the true eye was `origin + (1-distance)*forward_dir`
+    # -- i.e. it silently DRIFTED with pitch (drifted ~0.947m fwd / ~0.53m low at 32 deg).
+    # This is exactly why grounding.py needed the empirical, pitch-specific
+    # CAM_ROBOT_FORWARD_OFFSET_M=0.947 hack (valid only at 32 deg).
+    # Setting distance=1.0 makes (1-distance)=0, so the eye sits EXACTLY at
+    # `origin` (cx,cy,cz) regardless of pitch -- decoupling camera position from
+    # tilt. This generalizes to any pitch (needed for multi-cam / dynamic-tilt
+    # options) and lets CAM_ROBOT_FORWARD_OFFSET_M collapse to the constant
+    # CAM_FWD (recalibrated in grounding.py).
+    cam.distance   = 1.0
     cam.azimuth    = math.degrees(yaw)
     cam.elevation  = -pitch_deg
 
@@ -298,21 +360,45 @@ class ArenaRenderer:
     def __init__(self, model: mujoco.MjModel,
                  ego_w: int = EGO_W, ego_h: int = EGO_H,
                  grounding_w: int = GROUNDING_W, grounding_h: int = GROUNDING_H,
-                 tp_w: int = TP_W, tp_h: int = TP_H):
+                 proximity_w: int = PROXIMITY_W, proximity_h: int = PROXIMITY_H,
+                 tp_w: int = TP_W, tp_h: int = TP_H,
+                 widefov_w: int = WIDEFOV_W, widefov_h: int = WIDEFOV_H):
         self._model    = model
         self._ego_w    = ego_w
         self._ego_h    = ego_h
         self._grounding_w = grounding_w
         self._grounding_h = grounding_h
+        self._proximity_w = proximity_w
+        self._proximity_h = proximity_h
         self._ego_rend = mujoco.Renderer(model, ego_h, ego_w)
         # V2: dedicated grounding renderer at higher resolution
         # Reuse a single renderer (not created per-call) to avoid EGL context exhaustion
         self._gr_rend  = mujoco.Renderer(model, grounding_h, grounding_w)
+        # CAM-2 (Phase 1): dedicated proximity renderer, same pre-allocate-once pattern
+        # (no EGL context exhaustion — precedent from _gr_rend). Only ever rendered when
+        # the Schmitt-trigger handoff in inferencer.py has selected the proximity camera,
+        # so steady-state per-cycle cost is unchanged (one render per grounding cycle).
+        self._prox_rend = mujoco.Renderer(model, proximity_h, proximity_w)
         self._tp_rend  = mujoco.Renderer(model, tp_h, tp_w)
         self._egc      = mujoco.MjvCamera()
         self._egc.type = mujoco.mjtCamera.mjCAMERA_FREE
         self._gr_cam   = mujoco.MjvCamera()
         self._gr_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self._prox_cam = mujoco.MjvCamera()
+        self._prox_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+
+        # CAM-1 (Phase 2, toggle): additional wide-FOV renderer, built ONLY when
+        # CAMERA_MODE=='widefov'. Purely additive — every line above is constructed
+        # exactly as before regardless of mode, so cam2's renderer set (and EGL context
+        # count) is completely unaffected when the toggle is at its 'cam2' default.
+        self._widefov_w    = widefov_w
+        self._widefov_h    = widefov_h
+        self._widefov_rend = None
+        self._widefov_cam  = None
+        if CAMERA_MODE == 'widefov':
+            self._widefov_rend = mujoco.Renderer(model, widefov_h, widefov_w)
+            self._widefov_cam  = mujoco.MjvCamera()
+            self._widefov_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 
     def render_ego(self, data: mujoco.MjData, yaw: float,
                    render_depth: bool = True):
@@ -383,6 +469,85 @@ class ArenaRenderer:
         intr['pitch_deg'] = GROUNDING_PITCH
         return rgb, depth, intr
 
+    def render_proximity(self, data: mujoco.MjData, yaw: float,
+                         render_depth: bool = True):
+        """
+        CAM-2 (Phase 1): render the steep-pitch proximity camera, same head mount as
+        render_ego/render_grounding (only PROXIMITY_PITCH differs — no XML change, no
+        new offset calibration needed post-P0, see arena.py constants comment).
+
+        Covers ~0.22-1.81m (docs/cam_opt2_multicam.md geometry table), i.e. the final
+        close-range approach where the shallower ego/grounding cameras' target has
+        already fallen below the frame. Selected by the Schmitt-trigger handoff in
+        inferencer.py — NOT rendered every cycle, only when active_cam==PROXIMITY.
+
+        Returns
+        -------
+        rgb   : np.ndarray  shape (PROXIMITY_H,PROXIMITY_W,3)  uint8
+        depth : np.ndarray  shape (PROXIMITY_H,PROXIMITY_W)    float32   (metres) or None
+        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_proximity}
+        """
+        _set_ego_cam(self._prox_cam, data.qpos, yaw, pitch_deg=PROXIMITY_PITCH)
+
+        self._prox_rend.update_scene(data, self._prox_cam)
+        rgb = self._prox_rend.render().copy()
+
+        depth = None
+        if render_depth:
+            self._prox_rend.enable_depth_rendering()
+            self._prox_rend.update_scene(data, self._prox_cam)
+            depth = self._prox_rend.render().copy().astype(np.float32)
+            self._prox_rend.disable_depth_rendering()
+
+        from code.grounding import get_ego_intrinsics_rendered
+        intr = get_ego_intrinsics_rendered(self._proximity_w, self._proximity_h)
+        intr['pitch_deg']    = PROXIMITY_PITCH
+        # Flag consumed by grounding.ground() to activate the stricter self-body-rejection
+        # depth floor/geometry check (steeper pitch -> optical center closer to the robot's
+        # own chest, see docs/cam_opt2_multicam.md "Real risk" + docs/cam_p0.md ep14 finding).
+        intr['is_proximity'] = True
+        return rgb, depth, intr
+
+    def render_widefov(self, data: mujoco.MjData, yaw: float,
+                       render_depth: bool = True):
+        """
+        CAM-1 (Phase 2, toggle, docs/cam_opt1_widefov.md / docs/cam_p2.md): render the
+        single wide-FOV camera, same head mount as render_ego/render_grounding
+        (CAM_HEAD_Z, CAM_FWD unchanged), pitch=WIDEFOV_PITCH, FOVY=WIDEFOV_FOVY (the
+        actual rendered FOVY, set at build time via spec.visual.global_.fovy in
+        build_arena() — only when CAMERA_MODE=='widefov', so this method is only
+        meaningful/called in that mode; the renderer is None otherwise, see __init__).
+
+        No proximity camera, no handoff — this single render is the entire grounding
+        camera for CAM-1.
+
+        Returns
+        -------
+        rgb   : np.ndarray  shape (WIDEFOV_H,WIDEFOV_W,3)  uint8
+        depth : np.ndarray  shape (WIDEFOV_H,WIDEFOV_W)    float32   (metres) or None
+        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_widefov}
+        """
+        _set_ego_cam(self._widefov_cam, data.qpos, yaw, pitch_deg=WIDEFOV_PITCH)
+
+        self._widefov_rend.update_scene(data, self._widefov_cam)
+        rgb = self._widefov_rend.render().copy()
+
+        depth = None
+        if render_depth:
+            self._widefov_rend.enable_depth_rendering()
+            self._widefov_rend.update_scene(data, self._widefov_cam)
+            depth = self._widefov_rend.render().copy().astype(np.float32)
+            self._widefov_rend.disable_depth_rendering()
+
+        # Actual rendered FOVY (WIDEFOV_FOVY) fed straight into the standard pinhole
+        # intrinsics formula — this is exactly cam_opt1_widefov.md Finding #1's fix,
+        # scoped to the widefov path only (cam2's get_ego_intrinsics_rendered() hardcode
+        # of 45 deg is untouched).
+        intr = get_ego_intrinsics(self._widefov_w, self._widefov_h, WIDEFOV_FOVY)
+        intr['pitch_deg']  = WIDEFOV_PITCH
+        intr['is_widefov'] = True
+        return rgb, depth, intr
+
     def render_tp(self, data: mujoco.MjData, tp_cam: mujoco.MjvCamera):
         """Render third-person view (for video only)."""
         self._tp_rend.update_scene(data, tp_cam)
@@ -408,7 +573,10 @@ class ArenaRenderer:
     def close(self):
         self._ego_rend.close()
         self._gr_rend.close()
+        self._prox_rend.close()
         self._tp_rend.close()
+        if self._widefov_rend is not None:
+            self._widefov_rend.close()
 
 
 # ---------------------------------------------------------------------------

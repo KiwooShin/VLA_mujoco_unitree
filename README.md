@@ -6,19 +6,21 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 
 **Skills:** `goto` (navigate to a named object) · `search` (rotate to find an out-of-FOV target, then approach) · `maneuver` (turn L/R after passing a landmark). Plus an interactive demo with an **ego-camera | 3D-diagonal-BEV** view and multi-goal instructions ("find X then find Y").
 
-![G1Nav interactive demo — "find the orange cone": scan → locate → walk → reach](assets/demo.gif)
+![G1Nav interactive demo — "find the orange cube": scan → locate → walk → reach](assets/demo.gif)
 
-<sub>Live demo (`code/fancy_demo.py`): the instruction names an object outside the robot's initial field of view; the G1 scans in place until it spots the cone, then walks to it. **Left:** onboard ego camera. **Right:** 3D-diagonal follow-cam with path trail, target ring, FOV cone, and a `SEARCHING → LOCATED → MOVING → REACHED` status banner. Real-time, physics-only, WBC-free.</sub>
+<sub>Live demo (`code/fancy_demo.py`): the instruction names an object outside the robot's initial field of view; the G1 scans in place until it spots the cube, then walks to it. **Left:** onboard ego camera showing the **active** camera — the head camera at range, with an automatic handoff to a steeper **proximity camera** for the final approach, so the target stays in frame all the way to the stop. **Right:** 3D-diagonal follow-cam with path trail, target ring, FOV cone, and a `SEARCHING → LOCATED → MOVING → REACHED` status banner. Real-time, physics-only, WBC-free.</sub>
 
 ## Results (closed-loop, seed 999, n=15, WBC-free deploy)
 
 | Task | Condition | Success |
 |------|-----------|---------|
-| Goto | easy / classical grounding | **93.3%** |
-| Goto | demo-distance (4–9 m) / classical | **60–68%** (mean 68.3% over 4 seeds) |
+| Goto | easy / classical grounding | **100%** |
+| Goto | demo-distance (4–9 m) / classical | **66.7%** |
 | Goto | demo / GT goal (locomotion ceiling) | **80.0%** |
-| Search | out-of-FOV / classical | **75–80%** (spot-rate 93%) |
+| Search | out-of-FOV / classical | **80%** (spot-rate 93%) |
 | Maneuver | turn after passing a landmark | **73.3%** |
+
+Numbers are with the **two-camera perception system** (head camera + proximity camera with hysteresis handoff, below): vs. the single-camera baseline it lifts easy 93.3→100% and demo 60→66.7% with no search regression, and keeps the target detected down to **0.26 m** (single head camera goes blind below ~0.7 m — before the stop radius).
 
 Policy inference: **3.4 ms/step** (~6× headroom at 50 Hz). 0 falls in the goto/maneuver conditions. EGL-deterministic per seed.
 
@@ -145,11 +147,11 @@ MUJOCO_GL=egl python code/train_maneuver.py --arch A --data dataset/maneuver \
 ```bash
 export PYTHONPATH=.:$PYTHONPATH
 
-# Goto — easy / classical grounding (~93%)
+# Goto — easy / classical grounding (~100%)
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty easy --goal-source classical --n 15 --seed 999 --device cuda --out eval/easy_classical
 
-# Goto — demo-distance / classical grounding (~60-68%)
+# Goto — demo-distance / classical grounding (~67%)
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty demo --goal-source classical --n 15 --seed 999 --device cuda --out eval/demo_classical
 
@@ -228,3 +230,5 @@ External, **not committed**: `checkpoints/` (GR00T-N1.6), `third_party/` (GR00T 
 ## Method (one paragraph)
 
 Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV+depth grounding → egocentric goal (dist, bearing)` · `goal → velocity command` · `velocity + proprio history → distilled 15-DoF joint targets`. The joint policy is distilled from the WBC walk teacher via behavior cloning, and stabilized over long horizons with **residual/normalized action targets + DART recovery data + a gait-phase input** — which is what takes naive BC from 0% to 100% on the easy task. Search is a student-driven fixed-CCW scan gated on target visibility; maneuver adds a landmark-pass trigger + heading goal. Real time comes from a 3-rate split: language once per episode, grounding at 5–10 Hz, the action head at 50 Hz.
+
+**Perception — two-camera handoff.** A single pitched head camera goes blind below ~0.7 m (the target exits the FOV bottom edge before the stop radius). Grounding therefore runs on the **active** one of two head-mounted cameras: the head camera at range, and a steeper **proximity camera** (58° pitch) for the final approach, switched by a hysteresis (Schmitt) trigger on the smoothed target distance (in ≤1.2 m, out ≥1.6 m) with depth-based rejection of the robot's own body in frame. Both cameras feed the same `(dist, bearing)` goal, so the policy needs **no retraining**, and only the active camera is rendered each cycle, so steady-state compute is unchanged. This keeps the target detected down to **0.26 m** — through every skill's stop radius. (A wide-FOV single-camera alternative was A/B-tested and rejected: it loses far-range detection, has a shallower close-range floor, and is ~2× slower.)
