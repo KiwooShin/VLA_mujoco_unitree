@@ -67,6 +67,7 @@ from code.grounding import ground as classical_ground, _parse_instruction, get_e
 from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
                            NUM_ACTIONS, SIM_DT, CONTROL_DECIMATION, RESET_HEIGHT)
 from code.steer import steer as _steer_cmd
+from code.lock_mgmt import LockGate, ReacquisitionScan
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -654,6 +655,35 @@ class Inferencer:
         _cam_miss_count = 0            # consecutive misses on the active camera
         _video_frame_cache = None       # demo-viz: last labeled active-cam frame (video only)
 
+        # NX-2 (docs/rs1_lock_mgmt.md): shared lock-management gate (LOCK_M1..M5,
+        # each independently toggled via env var; M1/M3 default ON (opt-out),
+        # M2/M4/M5 default OFF (opt-in) per docs/nx2_final.md -- see code/lock_mgmt.py).
+        # With all 5 explicitly set to 0, every LockGate method call below is a
+        # provable no-op pass-through, so that legacy configuration is
+        # byte-identical-behavior by construction.
+        _lock_gate          = LockGate()
+        _using_rescan_sched = False   # True only while a M4/M5-triggered bounded
+                                       # rescan (ReacquisitionScan) is driving _scan_active,
+                                       # as opposed to the original H3 scan below.
+        _rescan_sched        = None
+
+        def _lock_drop_and_rescan():
+            """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
+            clear EMA/last-known-goal, and re-enter scan via NX-1's bounded
+            BidirectionalScanSchedule (never unbounded rotation -- see
+            code/lock_mgmt.py's ReacquisitionScan docstring for why this can't
+            just reuse the H3 scan's own absolute-step timeout)."""
+            nonlocal _goal_ema, _last_known_goal, _frames_since_detection
+            nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
+            _lock_gate.force_drop()
+            _goal_ema               = None
+            _last_known_goal        = None
+            _frames_since_detection = 0
+            _scan_active            = True
+            _using_rescan_sched     = True
+            _rescan_sched           = ReacquisitionScan(scan_rate=SCAN_RATE)
+            cached_goal_vec         = np.array([2.0, 1.0, 0.0], dtype=np.float32)
+
         # Determine rendering and grounding behavior based on goal_source
         # 'gt':        zero ego_rgb, GT goal injected from sim state each step, no render
         # 'classical': render at GROUNDING_PERIOD cadence, classical HSV grounding
@@ -798,58 +828,100 @@ class Inferencer:
                                 gr = gr2
                                 _active_cam = other_cam
                                 _cam_miss_count = 0
+                                # NX-2 mandatory carve-out (docs/rs1_lock_mgmt.md risk #2):
+                                # the fallback probe-adopt is a legitimate (dist,bearing)
+                                # discontinuity, not a track anomaly -- bypass M3/M4 for it.
+                                _lock_gate.mark_discontinuity()
                 else:
                     _cam_miss_count = 0
 
                 if not gr.not_visible:
-                    _frames_since_detection = 0
                     # Temporal smoothing (EMA) on detected goal — smooths out bearing jitter
                     raw_goal = gr.goal_vec.copy()
-                    if _goal_ema is None:
-                        _goal_ema = raw_goal.copy()
-                        _last_known_goal = raw_goal.copy()
-                    else:
-                        _goal_ema = _GOAL_EMA_ALPHA * raw_goal + (1.0 - _GOAL_EMA_ALPHA) * _goal_ema
-                        # Re-normalize cos/sin
-                        th = math.atan2(_goal_ema[2], _goal_ema[1])
-                        _goal_ema[1] = math.cos(th)
-                        _goal_ema[2] = math.sin(th)
-                        _last_known_goal = _goal_ema.copy()
-                    cached_goal_vec = _goal_ema.copy()
-                    # CAM-2 (Phase 1): Schmitt-trigger handoff on the EMA'd distance —
-                    # D_LO/D_HI straddle the 0.92-1.81m dual-visible band (docs/cam_p1.md),
-                    # so this only flips once per approach/retreat, not every cycle.
-                    # CAM-1 (Phase 2, toggle): no handoff in widefov mode (single camera,
-                    # _active_cam stays at its unused initial value) — gate is a no-op
-                    # for cam2 (default).
-                    if CAMERA_MODE != 'widefov':
-                        _ema_dist = float(_goal_ema[0])
-                        if _active_cam == 'GROUNDING' and _ema_dist < CAM_D_LO:
-                            _active_cam = 'PROXIMITY'
-                        elif _active_cam == 'PROXIMITY' and _ema_dist > CAM_D_HI:
-                            _active_cam = 'GROUNDING'
-                    # Exit scan mode when target is aligned (bearing < threshold).
-                    # Partial detections (bearing still large) keep scanning so the robot
-                    # continues rotating to better center the target in the image frame.
-                    if _scan_active:
-                        det_bearing_deg = abs(math.degrees(math.atan2(_goal_ema[2], _goal_ema[1])))
-                        if det_bearing_deg < SCAN_ALIGNED_THR_DEG:
-                            _scan_active = False
-                            if self.verbose:
-                                print(f"  [scan] ALIGNED at step={step}  "
-                                      f"yaw_err={math.degrees(math.atan2(_goal_ema[2],_goal_ema[1])):+.1f}°",
+                    # NX-2 (LOCK_M1/M2/M3, docs/rs1_lock_mgmt.md): gate the raw detection
+                    # BEFORE it's allowed to feed the EMA/last-known-goal. With all three
+                    # toggles off this is a provable pass-through (always True) -- see
+                    # code/lock_mgmt.py's LockGate.gate_detection docstring.
+                    _accept_hit = _lock_gate.gate_detection(
+                        float(raw_goal[0]), math.atan2(raw_goal[2], raw_goal[1]), gr.best_area)
+                    if _accept_hit:
+                        _frames_since_detection = 0
+                        if _goal_ema is None:
+                            _goal_ema = raw_goal.copy()
+                            _last_known_goal = raw_goal.copy()
+                        else:
+                            _goal_ema = _GOAL_EMA_ALPHA * raw_goal + (1.0 - _GOAL_EMA_ALPHA) * _goal_ema
+                            # Re-normalize cos/sin
+                            th = math.atan2(_goal_ema[2], _goal_ema[1])
+                            _goal_ema[1] = math.cos(th)
+                            _goal_ema[2] = math.sin(th)
+                            _last_known_goal = _goal_ema.copy()
+                        cached_goal_vec = _goal_ema.copy()
+                        # CAM-2 (Phase 1): Schmitt-trigger handoff on the EMA'd distance —
+                        # D_LO/D_HI straddle the 0.92-1.81m dual-visible band (docs/cam_p1.md),
+                        # so this only flips once per approach/retreat, not every cycle.
+                        # CAM-1 (Phase 2, toggle): no handoff in widefov mode (single camera,
+                        # _active_cam stays at its unused initial value) — gate is a no-op
+                        # for cam2 (default).
+                        if CAMERA_MODE != 'widefov':
+                            _ema_dist = float(_goal_ema[0])
+                            if _active_cam == 'GROUNDING' and _ema_dist < CAM_D_LO:
+                                _active_cam = 'PROXIMITY'
+                                # NX-2 carve-out: Schmitt flip is a legitimate discontinuity.
+                                _lock_gate.mark_discontinuity()
+                            elif _active_cam == 'PROXIMITY' and _ema_dist > CAM_D_HI:
+                                _active_cam = 'GROUNDING'
+                                _lock_gate.mark_discontinuity()
+                        # Exit scan mode when target is aligned (bearing < threshold).
+                        # Partial detections (bearing still large) keep scanning so the robot
+                        # continues rotating to better center the target in the image frame.
+                        if _scan_active:
+                            det_bearing_deg = abs(math.degrees(math.atan2(_goal_ema[2], _goal_ema[1])))
+                            if det_bearing_deg < SCAN_ALIGNED_THR_DEG:
+                                _scan_active = False
+                                if self.verbose:
+                                    print(f"  [scan] ALIGNED at step={step}  "
+                                          f"yaw_err={math.degrees(math.atan2(_goal_ema[2],_goal_ema[1])):+.1f}°",
+                                          flush=True)
+                            elif self.verbose:
+                                print(f"  [scan] Partial det step={step}  "
+                                      f"bearing={math.degrees(math.atan2(_goal_ema[2],_goal_ema[1])):+.1f}° "
+                                      f"(still scanning, thr={SCAN_ALIGNED_THR_DEG}°)",
                                       flush=True)
-                        elif self.verbose:
-                            print(f"  [scan] Partial det step={step}  "
-                                  f"bearing={math.degrees(math.atan2(_goal_ema[2],_goal_ema[1])):+.1f}° "
-                                  f"(still scanning, thr={SCAN_ALIGNED_THR_DEG}°)",
-                                  flush=True)
+                    else:
+                        # NX-2: gate rejected this detection -- treat this cycle like a miss.
+                        _frames_since_detection += 1
+                        if _last_known_goal is not None and _frames_since_detection <= HOLD_GOAL_HORIZON:
+                            cached_goal_vec = _last_known_goal.copy()
+                        elif _lock_gate.coast_expired(_frames_since_detection, HOLD_GOAL_HORIZON):
+                            if self.verbose:
+                                print(f"  [lock] M5 coast expired (gate-rejected) -> "
+                                      f"drop+rescan at step={step}", flush=True)
+                            _lock_drop_and_rescan()
                 else:
                     _frames_since_detection += 1
                     # Hold last-known goal if recently seen, else keep cached (straight-ahead initially)
                     if _last_known_goal is not None and _frames_since_detection <= HOLD_GOAL_HORIZON:
                         cached_goal_vec = _last_known_goal.copy()
-                    # else: keep whatever cached_goal_vec was (straight-ahead default or last ema)
+                    # V2 (unchanged when LOCK_M5 off): keep whatever cached_goal_vec was
+                    # (straight-ahead default or last ema) -- silent freeze forever.
+                    elif _lock_gate.coast_expired(_frames_since_detection, HOLD_GOAL_HORIZON):
+                        # NX-2 (LOCK_M5): bounded coast -> reroute to rescan instead of an
+                        # unbounded silent freeze.
+                        if self.verbose:
+                            print(f"  [lock] M5 coast expired -> drop+rescan at step={step}",
+                                  flush=True)
+                        _lock_drop_and_rescan()
+
+                # NX-2 (LOCK_M4, docs/rs1_lock_mgmt.md): divergence watchdog -- runs once per
+                # classical grounding cycle regardless of hit/miss/gate outcome above, using
+                # the resolved best-estimate distance for this cycle. Provable no-op when
+                # LOCK_M4 is off (see code/lock_mgmt.py).
+                _walking_toward_goal = (not _scan_active) and (float(cached_goal_vec[0]) > stop_r)
+                if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal):
+                    if self.verbose:
+                        print(f"  [lock] M4 divergence -> drop+rescan at step={step}", flush=True)
+                    _lock_drop_and_rescan()
 
             # Learned grounding (Arch A, goal_source='learned', trained grounding head)
             # Runs at GROUNDING_PERIOD cadence with EMA smoothing.
@@ -893,7 +965,65 @@ class Inferencer:
             # sweeps ±90° arc covering targets at any initial bearing.
             # Timeout: after SCAN_TIMEOUT steps, exit scan and use default cached_goal_vec.
             if _scan_active and _need_classical_render:
-                if step >= SCAN_TIMEOUT:
+                # NX-2 (LOCK_M4/M5): a lock-drop-triggered rescan uses NX-1's bounded
+                # BidirectionalScanSchedule (via ReacquisitionScan) instead of the H3
+                # pattern below, because H3's SCAN_TIMEOUT check is keyed on the
+                # EPISODE's absolute `step` -- re-arming it mid-episode would
+                # immediately time out (step already >> SCAN_TIMEOUT=200). This branch
+                # is ONLY ever taken after a M4/M5 trigger (both individually toggled,
+                # default off); with those off, `_using_rescan_sched` is never True and
+                # the `else` (original, byte-identical H3 logic) always runs.
+                if _using_rescan_sched:
+                    scan_wz = _rescan_sched.step(yaw)
+                    if scan_wz is None:
+                        _scan_active        = False
+                        _using_rescan_sched = False
+                        if self.verbose:
+                            print(f"  [lock][rescan] TIMEOUT at step={step}, "
+                                  f"falling back to default goal", flush=True)
+                    else:
+                        prop_now = _build_proprio(data_mj, prev_action)
+                        if _use_phase:
+                            q_lb_now = data_mj.qpos[7:22].copy()
+                            ph_now   = _phase_tracker.update(q_lb_now)
+                            prop_now = np.concatenate([prop_now, ph_now])
+                        proprio_hist.append(prop_now)
+                        prop_arr = np.stack(list(proprio_hist), axis=0)
+                        prop_t   = torch.from_numpy(prop_arr).unsqueeze(0).to(self.device)
+                        img_t_scan = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE,
+                                                 dtype=torch.float32, device=self.device)
+                        scan_goal_t = torch.from_numpy(cached_goal_vec).unsqueeze(0).to(self.device)
+                        scan_vel_cmd = np.array([0.0, 0.0, scan_wz], dtype=np.float32)
+                        scan_vel_t   = torch.from_numpy(scan_vel_cmd).unsqueeze(0).to(self.device)
+                        with torch.no_grad():
+                            out_scan = self.model(
+                                ego_rgb   = img_t_scan,
+                                lang_emb  = lang_t,
+                                proprio_h = prop_t,
+                                gt_goal   = scan_goal_t,
+                                gt_vel    = scan_vel_t,
+                            )
+                        actions_scan = out_scan['action'].cpu().numpy().squeeze(0)
+                        raw_action_scan = actions_scan[0]
+                        if _use_residual:
+                            scan_target_dof = _da_deflt + raw_action_scan * _da_std + _da_mean
+                        else:
+                            scan_target_dof = raw_action_scan
+                        for _ in range(CONTROL_DECIMATION):
+                            _apply_student_pd(data_mj, scan_target_dof, nj)
+                            mujoco.mj_step(model_mj, data_mj)
+                        prev_action = scan_target_dof.copy()
+                        _all_target_dofs.append(prev_action.copy())
+                        steps_done = step + 1
+                        t1 = time.perf_counter()
+                        step_times.append((t1 - t0) * 1000.0)
+                        if render_video and rgb_video is not None:
+                            frames_ego.append(rgb_video.copy())
+                            if render_tp:
+                                renderer.update_tp_cam(tp_cam, data_mj)
+                                frames_tp.append(renderer.render_tp(data_mj, tp_cam).copy())
+                        continue   # skip student forward pass (already done above)
+                elif step >= SCAN_TIMEOUT:
                     _scan_active = False
                     if self.verbose:
                         print(f"  [scan] TIMEOUT at step={step}, falling back to default goal", flush=True)

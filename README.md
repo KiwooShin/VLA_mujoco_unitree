@@ -17,7 +17,7 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 | Goto | easy / classical grounding | **100%** |
 | Goto | demo-distance (4–9 m) / classical | **66.7%** |
 | Goto | demo / GT goal (locomotion ceiling) | **80.0%** |
-| Search | out-of-FOV / classical | **80%** (spot-rate 93%) |
+| Search | out-of-FOV / classical | **93.3%** (spot-rate 100%) |
 | Maneuver | turn after passing a landmark | **73.3%** |
 
 Numbers are with the **two-camera perception system** (head camera + proximity camera with hysteresis handoff, below): vs. the single-camera baseline it lifts easy 93.3→100% and demo 60→66.7% with no search regression, and keeps the target detected down to **0.26 m** (single head camera goes blind below ~0.7 m — before the stop radius).
@@ -160,7 +160,7 @@ MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.p
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty demo --goal-source gt --n 15 --seed 999 --device cuda --no-render --out eval/demo_gt
 
-# Search — out-of-FOV target (~80%); reuses the goto checkpoint (no search-specific training)
+# Search — out-of-FOV target (~93%); reuses the goto checkpoint (no search-specific training)
 MUJOCO_GL=egl python code/eval_search.py --checkpoint checkpoint/goto_best.pt --n 15 --seed 999 --device cuda --out eval/search
 
 # Maneuver (~73%)
@@ -230,6 +230,6 @@ External, **not committed**: `checkpoints/` (GR00T-N1.6), `third_party/` (GR00T 
 
 ## Method (one paragraph)
 
-Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV+depth grounding → egocentric goal (dist, bearing)` · `goal → velocity command` · `velocity + proprio history → distilled 15-DoF joint targets`. The joint policy is distilled from the WBC walk teacher via behavior cloning, and stabilized over long horizons with **residual/normalized action targets + DART recovery data + a gait-phase input** — which is what takes naive BC from 0% to 100% on the easy task. Search is a student-driven fixed-CCW scan gated on target visibility; maneuver adds a landmark-pass trigger + heading goal. Real time comes from a 3-rate split: language once per episode, grounding at 5–10 Hz, the action head at 50 Hz.
+Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV+depth grounding → egocentric goal (dist, bearing)` · `goal → velocity command` · `velocity + proprio history → distilled 15-DoF joint targets`. The joint policy is distilled from the WBC walk teacher via behavior cloning, and stabilized over long horizons with **residual/normalized action targets + DART recovery data + a gait-phase input** — which is what takes naive BC from 0% to 100% on the easy task. Search is a student-driven **bounded bidirectional scan** (yaw triangle-wave with stand dwells between legs — prolonged continuous rotation is out-of-distribution for the walk policy and was the root cause of all search falls); maneuver adds a landmark-pass trigger + heading goal. Grounding locks are hardened by a blob area-quality floor and an innovation-gated lock replacement (`code/lock_mgmt.py`). Real time comes from a 3-rate split: language once per episode, grounding at 5–10 Hz, the action head at 50 Hz.
 
 **Perception — two-camera handoff.** A single pitched head camera goes blind below ~0.7 m (the target exits the FOV bottom edge before the stop radius). Grounding therefore runs on the **active** one of two head-mounted cameras: the head camera at range, and a steeper **proximity camera** (58° pitch) for the final approach, switched by a hysteresis (Schmitt) trigger on the smoothed target distance (in ≤1.2 m, out ≥1.6 m) with depth-based rejection of the robot's own body in frame. Both cameras feed the same `(dist, bearing)` goal, so the policy needs **no retraining**, and only the active camera is rendered each cycle, so steady-state compute is unchanged. This keeps the target detected down to **0.26 m** — through every skill's stop radius. (A wide-FOV single-camera alternative was A/B-tested and rejected: it loses far-range detection, has a shallower close-range floor, and is ~2× slower.)

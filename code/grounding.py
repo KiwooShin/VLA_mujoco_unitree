@@ -499,6 +499,20 @@ class GroundingResult:
     not_visible: bool          # True when target not detected
     mask:        Optional[np.ndarray] = field(default=None, repr=False)
     bbox:        Optional[tuple]      = field(default=None, repr=False)  # (x,y,w,h)
+    # NX-2 (docs/rs1_lock_mgmt.md M1): raw contour area (px^2) of the accepted blob,
+    # i.e. the SAME `best_area` that feeds `conf_area` in the confidence formula
+    # below. Purely additive field (default None, always passed by keyword at every
+    # call site below) -- zero change to any other returned value or to any existing
+    # caller that doesn't read it. Exposed because an empirical check (NX-2
+    # instrumentation, see docs/nx2_impl.md) showed the bbox w*h proxy suggested in
+    # the design brief is NOT a reliable stand-in for true contour area: a thin/
+    # irregular sliver (the exact ep0/ep5 failure mode) can have a large bounding
+    # box (low fill-ratio) while its true contour area stays tiny -- which is
+    # precisely why conf_area saturates low for it in the first place. Gating on
+    # this field directly (LOCK_M1) targets the root cause exactly; gating on bbox
+    # w*h would not have reliably distinguished the two populations (verified
+    # numerically, see docs/nx2_impl.md).
+    best_area:   Optional[float]      = field(default=None, repr=False)
 
     @property
     def goal_vec(self) -> np.ndarray:
@@ -805,6 +819,7 @@ def ground(
         not_visible = False,
         mask        = blob_mask if return_mask else None,
         bbox        = (x, y, w, h),
+        best_area   = best_area,
     )
 
 

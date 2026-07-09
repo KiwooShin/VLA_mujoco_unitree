@@ -71,7 +71,12 @@ GOTO_CKPT_DEFAULT   = str(_REPO / "checkpoint" / "goto_best.pt")
 KEYFRAME_PATH       = str(_REPO / "checkpoint" / "stand_keyframe.npz")
 FANCY_OUT_DIR       = str(_REPO / "eval" / "fancy_demo")
 WEB_PORT            = 5001     # different port from demo.py (5000) to avoid conflict
-MAXSTEPS_FANCY      = 1400     # hard cap per episode
+MAXSTEPS_FANCY      = 2000     # hard cap per episode (NX-1: bumped from 1400 to match
+                                # code/eval_search.py's MAXSTEPS_SEARCH -- the
+                                # bidirectional bounded scan, code/scan_sched.py, can
+                                # spend more total steps than the old fixed-CCW scan
+                                # before spotting an unfavorable-side target; see
+                                # docs/nx1_scan.md)
 BEV_W, BEV_H       = 640, 480  # BEV camera resolution
 EGO_W, EGO_H       = 320, 240  # ego camera resolution (native)
 STREAM_W            = BEV_W + EGO_W  # side-by-side width
@@ -466,7 +471,8 @@ def run_fancy_rollout(
     """
     Search-then-goto rollout with ego|BEV side-by-side frames + 4 overlays.
 
-    Always uses SEARCH behavior (student-driven CCW scan until target spotted).
+    Always uses SEARCH behavior (student-driven bidirectional bounded scan,
+    code/scan_sched.py, until target spotted — see docs/nx1_scan.md).
     Returns dict: success, spotted, scan_steps, steps, final_dist, fell, video_path
     """
     import cv2
@@ -484,6 +490,8 @@ def run_fancy_rollout(
     from code.grounding import ground as classical_ground, get_ego_intrinsics_rendered
     from code.steer import steer as _steer_cmd
     from code.eval_search import STOP_R_SEARCH, SCAN_ALIGNED_THR_DEG
+    from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
+                                  SCAN_DWELL_STEPS, SCAN_TIMEOUT as _SCAN_TIMEOUT_DEFAULT)
 
     # --- Extract scene info ---
     objects      = scene_cfg['objects']
@@ -581,11 +589,15 @@ def run_fancy_rollout(
 
     lang_t = torch.zeros(1, 2048, device=inf.device)
 
-    # Scan state
+    # Scan state — NX-1 bidirectional bounded-rotation sweep (same schedule as
+    # code/eval_search.py, docs/nx1_scan.md); replaces the old fixed-CCW-only
+    # scan (up to 600 continuous steps) that was the diagnosed root cause of
+    # the search skill's falls (docs/fa1_failures.md #1 fix). See
+    # code/scan_sched.py for the derivation.
     cached_goal_vec  = np.array([2.0, 1.0, 0.0], dtype=np.float32)
     last_grounding_step = -999
     _scan_active     = True
-    SCAN_TIMEOUT     = 600
+    SCAN_TIMEOUT     = _SCAN_TIMEOUT_DEFAULT   # 900: safety-net cap
     SCAN_RATE        = 0.6
     SCAN_DT          = SIM_DT * CONTROL_DECIMATION
     SCAN_ALIGNED_THR = _math.radians(SCAN_ALIGNED_THR_DEG)
@@ -595,6 +607,9 @@ def run_fancy_rollout(
     _frames_since_det = 0
     HOLD_GOAL_HORIZON = 100
     _scan_yaw_delta  = 0.0
+    _scan_sched      = BidirectionalScanSchedule(scan_rate=SCAN_RATE,
+                                                  leg_deg=SCAN_LEG_DEG,
+                                                  dwell_steps=SCAN_DWELL_STEPS)
 
     # CAM-2 (docs/cam_p1.md, adopted champion): Schmitt-trigger handoff between the
     # GROUNDING camera (26° pitch, far/mid range) and the PROXIMITY camera (58° pitch,
@@ -829,7 +844,7 @@ def run_fancy_rollout(
                 print(f"  [fancy] SCAN TIMEOUT step={step}", flush=True)
             else:
                 scan_steps += 1
-                scan_wz = SCAN_RATE
+                scan_wz = _scan_sched.step(yaw)   # bounded CCW/CW schedule, dwells at 0.0
                 _scan_yaw_delta += scan_wz * SCAN_DT
 
                 prop_now = _build_proprio(data_mj, prev_action)

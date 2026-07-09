@@ -1,13 +1,21 @@
 """
 eval_search.py — Closed-loop evaluation for the SEARCH skill.
 
-The search skill = student-driven CCW scan (fixed direction, WBC-free) until the
-target enters the FOV (classical grounding detects it), then GOTO.
+The search skill = student-driven bidirectional bounded scan (WBC-free) until
+the target enters the FOV (classical grounding detects it), then GOTO.
+NX-1 (docs/nx1_scan.md, docs/fa1_failures.md #1 fix): the scan alternates
+CCW/CW in ~150°-bounded legs with stand dwells between them (code/scan_sched.py)
+instead of a fixed single CCW direction — caps every continuous rotation
+segment well inside the in-distribution range, eliminating the 3 falls caused
+by "wrong-side" targets needing a near-full continuous rotation under the
+old fixed-CCW scan.
 
 This is assembled PURELY behaviorally — the existing Inferencer with goal_source='classical'
-already implements the full search pipeline via the H3 scan-and-acquire mechanism:
+already implements a (differently-bounded, ±90°) scan-and-acquire mechanism for the demo
+skill's own in-rollout scan (H3); this file's standalone rollout is search-specific:
   1. target starts OUT of initial FOV  → grounding.not_visible=True → scan_active=True
-  2. student-driven scan (inject wz>0 into action head, WBC-free) while checking grounding
+  2. student-driven bounded bidirectional scan (inject wz into action head, WBC-free)
+     while checking grounding every cycle
   3. when target detected AND bearing < 40°  → scan_active=False → GOTO begins
   4. classical HSV grounding guides approach → stop within STOP_R
 
@@ -56,7 +64,17 @@ sys.path.insert(0, str(_REPO))
 # Constants
 # ---------------------------------------------------------------------------
 EVAL_SEED       = 999
-MAXSTEPS_SEARCH = 1400           # hard cap (same as demo preset)
+# NX-1: bumped from 1400 (the old "same as demo preset" value) -- the bidirectional
+# bounded scan (code/scan_sched.py) caps every continuous rotation segment safely,
+# but can spend more TOTAL steps finding an unfavorable-side target than the old
+# fixed-CCW scan did in its common case (it now always visits up to ~3*SCAN_LEG_DEG
+# of yaw before giving up, vs. sometimes finding a favorable-side target almost
+# immediately). SCAN_TIMEOUT=1150 (scan_sched.py) alone left too little of the
+# 1400 budget for the approach phase on several previously-passing episodes
+# (e.g. ep0: spotted at step 890, only 510 left, final_dist=0.51 -- one hair
+# outside STOP_R_SEARCH). 2000 gives ~850 steps of approach headroom even in the
+# worst observed case. See docs/nx1_scan.md.
+MAXSTEPS_SEARCH = 2000           # hard cap (was 1400 pre-NX-1)
 STOP_R_SEARCH   = 0.5            # slightly lenient stop radius
 N_RENDER        = 3              # max videos to render
 GOTO_CKPT       = str(_REPO / "checkpoint" / "goto_best.pt")
@@ -284,6 +302,9 @@ def _run_search_rollout(
                                NUM_ACTIONS, SIM_DT as _SIM_DT, CONTROL_DECIMATION)
     from code.grounding import ground as classical_ground, get_ego_intrinsics_rendered
     from code.steer import steer as _steer_cmd
+    from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
+                                  SCAN_DWELL_STEPS, SCAN_TIMEOUT as _SCAN_TIMEOUT_DEFAULT)
+    from code.lock_mgmt import LockGate, ReacquisitionScan
 
     # --- Extract scene info ---
     objects      = scene_cfg['objects']
@@ -380,23 +401,68 @@ def _run_search_rollout(
     # Lang embedding (zeros — same as inferencer default)
     lang_t = torch.zeros(1, 2048, device=inf.device)
 
-    # Scan state — fixed CCW at 0.6 rad/s (same as H3; stable and battle-tested)
-    # dt = 0.02s/step (CONTROL_DECIMATION=2 @ SIM_DT=0.01s)
-    # 0.6 rad/s × 0.02s = 0.012 rad/step
-    # SCAN_TIMEOUT=600 steps → 600×0.012 = 7.2 rad ≈ 413° > 360° — full sweep guaranteed
+    # Scan state — NX-1 bidirectional bounded-rotation sweep (docs/nx1_scan.md,
+    # docs/fa1_failures.md #1 fix). Replaces the old fixed-CCW-only scan (up to
+    # 600 continuous steps / ~413°), which forced "wrong-side" targets through
+    # a near-full continuous rotation — exactly the 3 falls in
+    # eval/p4_gate_search_rerun (ep5/7/8, 550-600 continuous steps, OOD per
+    # docs/rot_dart.md). The new schedule caps every continuous same-direction
+    # rotation at SCAN_LEG_DEG=150° (~218 steps, well inside the ~470-step/
+    # ~323° in-distribution ceiling) with a stand-still dwell between legs, and
+    # alternates CCW/CW so a target on either side is found by ITS favorable
+    # direction instead of requiring the long way around. See code/scan_sched.py
+    # for the full derivation (150° per leg is the minimum needed for 360°
+    # bearing coverage given SCAN_ALIGNED_THR_DEG=40°).
     cached_goal_vec = np.array([2.0, 1.0, 0.0], dtype=np.float32)
     last_grounding_step = -999
     _scan_active    = True
     _scan_yaw_delta = 0.0
-    SCAN_TIMEOUT    = 600        # 600 steps @ 0.6 rad/s covers >360° for any target bearing
+    SCAN_TIMEOUT    = _SCAN_TIMEOUT_DEFAULT   # 900: safety-net cap; nominal full
+                                               # bidirectional coverage pass completes
+                                               # in ~727 steps (see scan_sched.py)
     SCAN_RATE       = 0.6        # rad/s — same as H3 goto scan (trained, stable)
     SCAN_DT         = SIM_DT * CONTROL_DECIMATION
     SCAN_ALIGNED_THR = _math.radians(SCAN_ALIGNED_THR_DEG)
+    _scan_sched     = BidirectionalScanSchedule(scan_rate=SCAN_RATE,
+                                                 leg_deg=SCAN_LEG_DEG,
+                                                 dwell_steps=SCAN_DWELL_STEPS)
     _goal_ema       = None
     _GOAL_EMA_ALPHA = 0.4
     _last_known_goal = None
     _frames_since_det = 0
     HOLD_GOAL_HORIZON = 100
+
+    # NX-2 (docs/rs1_lock_mgmt.md): shared lock-management gate (LOCK_M1..M5,
+    # independently toggled via env var; M1/M3 default ON (opt-out), M2/M4/M5
+    # default OFF (opt-in) per docs/nx2_final.md -- see code/lock_mgmt.py).
+    # search has no CAM-2 Schmitt handoff / fallback probe (single grounding
+    # camera only), so unlike inferencer.py this call site never calls
+    # `mark_discontinuity()` -- M3/M4 always apply their full gate here.
+    _lock_gate          = LockGate()
+    _using_rescan_sched = False   # True only while a M4/M5-triggered bounded
+                                   # rescan (ReacquisitionScan) is driving _scan_active,
+                                   # as opposed to the initial BidirectionalScanSchedule
+                                   # sweep (_scan_sched) above.
+    _rescan_sched        = None
+
+    def _lock_drop_and_rescan():
+        """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
+        clear EMA/last-known-goal, and re-enter scan via a FRESH
+        ReacquisitionScan. Not the same `_scan_sched` instance used for the
+        initial scan above: that scan's own outer SCAN_TIMEOUT check is keyed
+        on the episode's ABSOLUTE step, so re-arming it mid-episode would
+        immediately time out (see code/lock_mgmt.py's ReacquisitionScan
+        docstring)."""
+        nonlocal _goal_ema, _last_known_goal, _frames_since_det
+        nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
+        _lock_gate.force_drop()
+        _goal_ema           = None
+        _last_known_goal    = None
+        _frames_since_det   = 0
+        _scan_active        = True
+        _using_rescan_sched = True
+        _rescan_sched       = ReacquisitionScan(scan_rate=SCAN_RATE)
+        cached_goal_vec      = np.array([2.0, 1.0, 0.0], dtype=np.float32)
 
     # Search-specific tracking
     spotted     = False    # set True when scan_active first becomes False
@@ -452,43 +518,127 @@ def _run_search_rollout(
             last_grounding_step = step
 
             if not gr.not_visible:
-                _frames_since_det = 0
                 raw_goal = gr.goal_vec.copy()
-                if _goal_ema is None:
-                    _goal_ema = raw_goal.copy()
-                    _last_known_goal = raw_goal.copy()
-                else:
-                    _goal_ema = _GOAL_EMA_ALPHA * raw_goal + (1.0 - _GOAL_EMA_ALPHA) * _goal_ema
-                    th = _math.atan2(_goal_ema[2], _goal_ema[1])
-                    _goal_ema[1] = _math.cos(th)
-                    _goal_ema[2] = _math.sin(th)
-                    _last_known_goal = _goal_ema.copy()
-                cached_goal_vec = _goal_ema.copy()
+                # NX-2 (LOCK_M1/M2/M3, docs/rs1_lock_mgmt.md): gate the raw detection
+                # before it's allowed to feed the EMA/last-known-goal. Provable
+                # pass-through (always True) with all three toggles off.
+                _accept_hit = _lock_gate.gate_detection(
+                    float(raw_goal[0]), _math.atan2(raw_goal[2], raw_goal[1]), gr.best_area)
+                if _accept_hit:
+                    _frames_since_det = 0
+                    if _goal_ema is None:
+                        _goal_ema = raw_goal.copy()
+                        _last_known_goal = raw_goal.copy()
+                    else:
+                        _goal_ema = _GOAL_EMA_ALPHA * raw_goal + (1.0 - _GOAL_EMA_ALPHA) * _goal_ema
+                        th = _math.atan2(_goal_ema[2], _goal_ema[1])
+                        _goal_ema[1] = _math.cos(th)
+                        _goal_ema[2] = _math.sin(th)
+                        _last_known_goal = _goal_ema.copy()
+                    cached_goal_vec = _goal_ema.copy()
 
-                # Exit scan when aligned
-                if _scan_active:
-                    det_bearing = abs(_math.atan2(_goal_ema[2], _goal_ema[1]))
-                    if det_bearing < SCAN_ALIGNED_THR:
-                        _scan_active = False
-                        spotted = True
-                        print(f"  [search] SPOTTED at step={step}  bearing={_math.degrees(det_bearing):.1f}°",
-                              flush=True)
+                    # Exit scan when aligned
+                    if _scan_active:
+                        det_bearing = abs(_math.atan2(_goal_ema[2], _goal_ema[1]))
+                        if det_bearing < SCAN_ALIGNED_THR:
+                            _scan_active = False
+                            spotted = True
+                            print(f"  [search] SPOTTED at step={step}  bearing={_math.degrees(det_bearing):.1f}°",
+                                  flush=True)
+                else:
+                    # NX-2: gate rejected this detection -- treat this cycle like a miss.
+                    _frames_since_det += 1
+                    if _last_known_goal is not None and _frames_since_det <= HOLD_GOAL_HORIZON:
+                        cached_goal_vec = _last_known_goal.copy()
+                    elif _lock_gate.coast_expired(_frames_since_det, HOLD_GOAL_HORIZON):
+                        print(f"  [lock] M5 coast expired (gate-rejected) -> "
+                              f"drop+rescan at step={step}", flush=True)
+                        _lock_drop_and_rescan()
             else:
                 _frames_since_det += 1
                 if _last_known_goal is not None and _frames_since_det <= HOLD_GOAL_HORIZON:
                     cached_goal_vec = _last_known_goal.copy()
+                elif _lock_gate.coast_expired(_frames_since_det, HOLD_GOAL_HORIZON):
+                    # NX-2 (LOCK_M5): bounded coast -> reroute to rescan instead of an
+                    # unbounded silent freeze.
+                    print(f"  [lock] M5 coast expired -> drop+rescan at step={step}", flush=True)
+                    _lock_drop_and_rescan()
 
-        # Scan mode: student-driven FIXED-CCW rotation (same as H3 goto scan)
-        # Observable (memoryless per-frame visibility check), WBC-free, SCAN_RATE=0.6 rad/s
-        # SCAN_TIMEOUT=600 → covers >360° — any target at any bearing will be swept past
+            # NX-2 (LOCK_M4): divergence watchdog -- runs once per grounding cycle
+            # regardless of hit/miss/gate outcome above. Provable no-op when off.
+            _walking_toward_goal = (not _scan_active) and (float(cached_goal_vec[0]) > stop_r)
+            if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal):
+                print(f"  [lock] M4 divergence -> drop+rescan at step={step}", flush=True)
+                _lock_drop_and_rescan()
+
+        # Scan mode: NX-1 bidirectional bounded-rotation sweep (see setup above).
+        # Observable (memoryless per-frame visibility check), WBC-free.
+        # SCAN_TIMEOUT=900 is a safety-net cap — the schedule itself normally
+        # exits (spotted) well before that.
         if _scan_active:
-            if step >= SCAN_TIMEOUT:
+            if _using_rescan_sched:
+                # NX-2 (LOCK_M4/M5): a lock-drop-triggered rescan uses a FRESH
+                # ReacquisitionScan (local step counter) rather than re-arming
+                # `_scan_sched`/`SCAN_TIMEOUT` above, which is keyed on the episode's
+                # absolute step and would immediately time out mid-episode.
+                scan_wz = _rescan_sched.step(yaw)
+                if scan_wz is None:
+                    _scan_active        = False
+                    _using_rescan_sched = False
+                    print(f"  [lock][rescan] TIMEOUT at step={step}, no target spotted", flush=True)
+                else:
+                    scan_steps += 1
+                    prop_now = _build_proprio(data_mj, prev_action)
+                    if _use_phase:
+                        ph = _phase_tracker.update(data_mj.qpos[7:22].copy())
+                        prop_now = np.concatenate([prop_now, ph])
+                    proprio_hist.append(prop_now)
+                    prop_arr = np.stack(list(proprio_hist), axis=0)
+                    prop_t   = torch.from_numpy(prop_arr).unsqueeze(0).to(inf.device)
+
+                    img_t_scan = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32,
+                                             device=inf.device)
+                    scan_goal_t = torch.from_numpy(cached_goal_vec).unsqueeze(0).to(inf.device)
+                    scan_vel_t  = torch.tensor([[0.0, 0.0, scan_wz]], dtype=torch.float32,
+                                               device=inf.device)
+
+                    with torch.no_grad():
+                        out_scan = inf.model(
+                            ego_rgb   = img_t_scan,
+                            lang_emb  = lang_t,
+                            proprio_h = prop_t,
+                            gt_goal   = scan_goal_t,
+                            gt_vel    = scan_vel_t,
+                        )
+
+                    raw_scan = out_scan['action'].cpu().numpy().squeeze(0)[0]
+                    if _use_residual:
+                        target_dof = _da_deflt + raw_scan * _da_std + _da_mean
+                    else:
+                        target_dof = raw_scan
+
+                    for _ in range(CONTROL_DECIMATION):
+                        _apply_student_pd(data_mj, target_dof, nj)
+                        mujoco.mj_step(model_mj, data_mj)
+
+                    prev_action = target_dof.copy()
+                    _all_target_dofs.append(prev_action.copy())
+                    steps_done = step + 1
+
+                    if render_video and rgb_video is not None:
+                        frames_ego.append(rgb_video.copy())
+                        renderer.update_tp_cam(tp_cam, data_mj)
+                        frames_tp.append(renderer.render_tp(data_mj, tp_cam).copy())
+
+                    t1 = time.perf_counter()
+                    step_times.append((t1 - t0) * 1000.0)
+                    continue   # skip normal student step
+            elif step >= SCAN_TIMEOUT:
                 _scan_active = False   # timeout — fallback to default goal, not spotted
                 print(f"  [search] SCAN TIMEOUT at step={step}, no target spotted", flush=True)
             else:
                 scan_steps += 1
-                # Fixed CCW at constant rate (simple, observable, covers full 360°)
-                scan_wz = SCAN_RATE   # always CCW (wz > 0)
+                scan_wz = _scan_sched.step(yaw)   # bounded CCW/CW schedule, dwells at 0.0
                 _scan_yaw_delta += scan_wz * SCAN_DT
 
                 # Student forward pass with injected wz
