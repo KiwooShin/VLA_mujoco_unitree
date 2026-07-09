@@ -130,13 +130,14 @@ MUJOCO_GL=egl python code/train_dart_phase.py --arch A --data dataset/dart_combi
     --resume-ckpt runs/dart_phase_A/model_best.pt --out runs/demo_dart_A \
     --epochs 20 --batch 64 --lr 1e-4 --reset-epoch --swing-weight 2.0 --device cuda
 
-# Maneuver policy — fine-tune from the goto checkpoint
-MUJOCO_GL=egl python code/train_maneuver.py --arch A --data dataset/maneuver \
+# Maneuver policy — fine-tune from the goto checkpoint, on maneuver data MIXED with the
+# goto set (dart_combined_v2) so the goto skill isn't forgotten
+MUJOCO_GL=egl python code/train_maneuver.py --arch A --data dataset/maneuver dataset/dart_combined_v2 \
     --resume-ckpt runs/demo_dart_A/epoch_0003.pt --out runs/maneuver_A \
     --epochs 10 --batch 128 --lr 5e-5 --device cuda
 ```
 
-> **Select checkpoints by closed-loop success, not offline val-loss** (the two diverge). For goto use `runs/demo_dart_A/epoch_0003.pt`; for maneuver use `runs/maneuver_A/epoch_0002.pt`. Copy the chosen ones to `checkpoint/goto_best.pt` and `checkpoint/maneuver_best.pt` (the demo/eval scripts load those by default).
+> **Select checkpoints by closed-loop success, not offline val-loss** (the two diverge — in our maneuver runs the val-loss minimum is ~27pp worse in closed loop than the behavioral peak, which lands in the first ~3 epochs). For goto use `runs/demo_dart_A/epoch_0003.pt`; for maneuver, sweep the early epochs with `eval_maneuver.py` and take the closed-loop best (epoch 2 in the released run; a from-scratch reproduction peaked at epoch 3, same 73.3%). Copy the chosen ones to `checkpoint/goto_best.pt` and `checkpoint/maneuver_best.pt` (the demo/eval scripts load those by default).
 
 ---
 
