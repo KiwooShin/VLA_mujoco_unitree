@@ -26,6 +26,9 @@ imageio==2.37.3
 imageio-ffmpeg==0.6.0
 albumentations==1.4.18
 gymnasium==1.2.2
+PyYAML==6.0.3           # code/teacher.py reads g1_gear_wbc.yaml directly; on every
+                         # gen_*/train_*/eval_*/demo entry point. Previously only
+                         # resolved transitively via omegaconf's own PyYAML dependency.
 
 # --- Data / utils / demo UI ---
 pandas==2.2.3

@@ -63,7 +63,7 @@ conda create -n g1nav -c conda-forge python=3.10 git-lfs pip -y
 conda activate g1nav
 
 # 2. Clone GR00T at the N1.6 release tag (N1.7 main breaks compatibility) and install editable
-git clone --branch n1.6.1-release https://github.com/isaac-sim/Isaac-GR00T.git third_party/Isaac-GR00T
+git clone --branch n1.6.1-release https://github.com/NVIDIA/Isaac-GR00T.git third_party/Isaac-GR00T
 pip install -e third_party/Isaac-GR00T --extra-index-url https://download.pytorch.org/whl/cu128
 
 # 3. torch (CUDA 12.8) + flash-attn
@@ -164,7 +164,7 @@ MUJOCO_GL=egl python code/eval_nx6_heatmap.py --ckpt runs/nx6_heatmap_A/model_be
 
 ## Evaluation (closed-loop, seed 999)
 
-`eval_closedloop.py` uses `--checkpoint`, `--n`, `--goal-source {classical,gt}`, `--difficulty {easy,demo}`, `--seed`, `--device`. (No GR00T is loaded at eval time — the language embedding is zeroed; navigation is driven by the grounding goal.)
+`eval_closedloop.py` uses `--checkpoint`, `--n`, `--goal-source {learned,classical,gt}`, `--difficulty {easy,demo}`, `--seed`, `--device`. (No GR00T is loaded at eval time — the language embedding is zeroed; navigation is driven by the grounding goal.) `--goal-source learned` is what reproduces the bolded "Learned grounding" column in the results table above — it needs the optional detector checkpoint trained (see the "Learned grounding detector" section above); without it, it gracefully falls back to the classical grounder with a log line, same as `--goal-source classical`.
 
 ```bash
 export PYTHONPATH=.:$PYTHONPATH
@@ -173,7 +173,11 @@ export PYTHONPATH=.:$PYTHONPATH
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty easy --goal-source classical --n 15 --seed 999 --device cuda --out eval/easy_classical
 
-# Goto — demo-distance (~93% with the trained detector; ~67% classical fallback)
+# Goto — demo-distance, learned grounding (~93%; needs the trained detector checkpoint above)
+MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
+    --difficulty demo --goal-source learned --n 15 --seed 999 --device cuda --out eval/demo_learned
+
+# Goto — demo-distance, classical fallback (~67%; works out of the box, no detector needed)
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty demo --goal-source classical --n 15 --seed 999 --device cuda --out eval/demo_classical
 
@@ -231,7 +235,7 @@ VLA_mujoco_unitree/
 ├── requirements.txt
 ├── .gitignore
 ├── assets/demo.gif             # the README demo clip
-└── code/                       # source (38 files)
+└── code/                       # source (37 files, incl. __init__.py)
     ├── teacher.py              # WBC teacher wrapper (training-only)
     ├── arena.py  scene.py  steer.py  maneuver_scene.py  maneuver_expert.py
     ├── gen_dataset.py  gen_dart_dataset.py  gen_maneuver_dataset.py  gen_stand_keyframe.py  groot_lang.py
