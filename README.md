@@ -6,9 +6,9 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 
 **Skills:** `goto` (navigate to a named object) · `search` (rotate to find an out-of-FOV target, then approach) · `maneuver` (turn L/R after passing a landmark). Plus an interactive demo with an **ego-camera | 3D-diagonal-BEV** view and multi-goal instructions ("find X then find Y").
 
-![G1Nav interactive demo — "find the orange cube": scan → locate → walk → reach](assets/demo.gif)
+![G1Nav interactive demo — "find the red cube": scan with reversal → locate at 6.8 m → walk past a same-color decoy → reach](assets/demo.gif)
 
-<sub>Live demo (`code/fancy_demo.py`): the instruction names an object outside the robot's initial field of view; the G1 scans in place until it spots the cube, then walks to it. **Left:** onboard ego camera showing the **active** camera — the head camera at range, with an automatic handoff to a steeper **proximity camera** for the final approach, so the target stays in frame all the way to the stop. **Right:** 3D-diagonal follow-cam with path trail, target ring, FOV cone, and a `SEARCHING → LOCATED → MOVING → REACHED` status banner. Real-time, physics-only, WBC-free.</sub>
+<sub>Live demo (`code/fancy_demo.py`), full default stack: the instruction names an object 6.8 m away outside the robot's initial field of view; the G1 runs its bounded bidirectional scan (direction reversal visible), spots the cube, then walks to it — passing a **same-color decoy ball 0.37 m off its path** (the learned detector keeps the lock on the *cube* with both red objects in frame; obstacle avoidance skirts the decoy). **Left:** onboard ego camera showing the **active** camera — head camera at range, automatic handoff to a steeper **proximity camera** for the final approach, so the target stays in frame all the way to the stop. **Right:** 3D-diagonal follow-cam with path trail, target ring, FOV cone, and a `SEARCHING → LOCATED → MOVING → REACHED` status banner. Real-time, physics-only, WBC-free.</sub>
 
 ## Results (closed-loop, seed 999, n=15, WBC-free deploy)
 
@@ -18,7 +18,7 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 | Goto | demo-distance (4–9 m) | **86.7%** | 66.7% |
 | Goto | demo / GT goal (locomotion reference) | — | 80.0% |
 | Search | out-of-FOV target | **100%** | 100% |
-| Maneuver | turn after passing a landmark | **73.3%** | 73.3% |
+| Maneuver | turn after passing a landmark | **66.7–73.3%** (run-to-run band) | same |
 
 The full system stacks three perception/navigation layers on the distilled walk policy, each adopted only after per-episode no-regression gates:
 - **Two-camera handoff** (head + steeper proximity camera): keeps the target detected down to **0.26 m**; a single head camera goes blind below ~0.7 m, before the stop radius.
