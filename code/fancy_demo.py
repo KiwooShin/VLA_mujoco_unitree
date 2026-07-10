@@ -49,6 +49,7 @@ import collections
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -1055,45 +1056,185 @@ def run_fancy_rollout(
 # FD2: Multi-goal rollout — sequential sub-goals with shared BEV view
 # ---------------------------------------------------------------------------
 
-def _parse_multi_goal_fancy(instruction: str) -> List[dict]:
-    """
-    Simple rule-based multi-goal parser for fancy_demo.
-    Splits on "then" conjunctions, extracts (color, shape) per part.
-    Returns list of dicts: [{color, shape, prompt_part}, ...]
+# NX-15: Live instruction parsing + scene resolution — the ONE shared function
+# used by BOTH _terminal_loop() and the Flask /execute handler (_do_rollout()).
+# Fixes docs/dr1_demo_reliability.md's headline finding: previously neither live
+# path parsed the typed instruction at all (target always came from
+# scene_cfg['target_index']), and this file's only parser, _parse_multi_goal_fancy()
+# (below), was dead code never called from any live entry point.
+#
+# _parse_multi_goal_fancy()'s clause-splitting regex (then / and-then / after-that /
+# next) is reused verbatim and kept under its original name/signature for backward
+# compat. Its "does this word belong to the known COLORS/SHAPES set" philosophy is
+# generalized from an adjacent-pair regex to a whole-clause word scan
+# (_extract_goal_hint) so word order ("the ball that is red"), inserted adjectives
+# ("the reddish ball" — doesn't false-match "red" thanks to \b), and "-colored"
+# phrasing all resolve instead of silently returning []. Ambiguity handling
+# (_resolve_goal_to_index) mirrors demo.py's Planner._resolve_referent(): unique
+# (color, shape) match -> go; multiple candidates -> score by how many of the
+# OTHER words in the clause match each candidate's attributes, tie -> one-line
+# clarification question; zero candidates -> "no <X> in this scene" + inventory.
 
-    Uses same regex as demo.py Planner but simpler (no scene resolution).
-    """
-    import re
+_ALL_COLORS = ["red", "yellow", "blue", "green", "orange", "purple", "cyan"]
+_ALL_SHAPES = RELIABLE_SHAPES  # ["ball", "cube", "cylinder", "cone"] -- full shape set
 
-    COLORS_KNOWN = {"red", "orange", "yellow", "purple", "green", "blue", "cyan"}
-    SHAPES_KNOWN = {"ball", "cube", "cylinder", "cone"}
 
-    # Split on "then" / "and then" / "after that" etc.
+def _split_multi_goal_parts(instruction: str) -> List[str]:
+    """Split a compound instruction on then/and-then/after-that/next conjunctions.
+    Same regex as demo.py's Planner.parse() / the original _parse_multi_goal_fancy()."""
     parts = re.split(
         r'\bthen\b|,\s*then\s*|\band\s+then\b|\band\s+after\s+that\b'
         r'|\bafter\s+that\b|\bafterwards\b|\bnext\b',
         instruction, flags=re.IGNORECASE
     )
-    parts = [p.strip() for p in parts if p.strip()]
+    return [p.strip() for p in parts if p.strip()]
 
+
+def _extract_goal_hint(part: str) -> dict:
+    """
+    Extract a best-effort (color, shape) hint from one instruction clause.
+
+    Scans the whole clause for known color/shape words (order-independent --
+    handles "red ball", "the ball that is red", "red-colored ball", etc.) rather
+    than requiring the two words to be adjacent. `color`/`shape` are set only
+    when exactly one candidate word of that kind is present in the clause;
+    `colors_mentioned`/`shapes_mentioned` keep the full sets for ambiguity
+    scoring (see _resolve_goal_to_index).
+    """
+    part_l = part.lower()
+    colors_mentioned = {c for c in _ALL_COLORS if re.search(r'\b' + c + r'\b', part_l)}
+    shapes_mentioned = {s for s in _ALL_SHAPES if re.search(r'\b' + s + r'\b', part_l)}
+    color = next(iter(colors_mentioned)) if len(colors_mentioned) == 1 else None
+    shape = next(iter(shapes_mentioned)) if len(shapes_mentioned) == 1 else None
+    return {
+        "color": color, "shape": shape,
+        "colors_mentioned": colors_mentioned, "shapes_mentioned": shapes_mentioned,
+        "prompt_part": part.strip(),
+    }
+
+
+def _parse_multi_goal_fancy(instruction: str) -> List[dict]:
+    """
+    Rule-based multi-goal parser for fancy_demo (kept under its original name and
+    signature for backward compat). Splits on "then" conjunctions, extracts
+    (color, shape) per part. Returns list of dicts: [{color, shape, prompt_part}, ...]
+
+    NX-15: now implemented on top of _split_multi_goal_parts()/_extract_goal_hint()
+    (the shared internals also used by resolve_live_instruction() below) instead of
+    its own standalone regex -- same public contract as before.
+    """
     goals = []
-    for part in parts:
-        part_l = part.lower()
-        # Match: [verb] [the] {color} {shape}
-        m = re.search(r'([a-z]+)\s+(ball|cube|cylinder|cone)', part_l)
-        if m:
-            c, s = m.group(1), m.group(2)
-            if c in COLORS_KNOWN:
-                goals.append({"color": c, "shape": s, "prompt_part": part.strip()})
-                continue
-        # Match: {shape} [of] {color}
-        m2 = re.search(r'(ball|cube|cylinder|cone).*?([a-z]+)', part_l)
-        if m2:
-            s, c = m2.group(1), m2.group(2)
-            if c in COLORS_KNOWN:
-                goals.append({"color": c, "shape": s, "prompt_part": part.strip()})
-
+    for part in _split_multi_goal_parts(instruction):
+        hint = _extract_goal_hint(part)
+        if hint["color"] or hint["shape"]:
+            goals.append({"color": hint["color"], "shape": hint["shape"],
+                           "prompt_part": hint["prompt_part"]})
     return goals
+
+
+def _resolve_goal_to_index(hint: dict, objects: List[dict]) -> tuple:
+    """
+    Resolve one (color, shape) hint against the current scene's object list.
+
+    Returns (obj_idx, clarify_question):
+      (idx, None)   -- unambiguous match (or unique best-attribute-match winner)
+      (None, msg)   -- ambiguous, msg is a one-line clarification question
+      (None, None)  -- no matching object in the scene
+    """
+    color, shape = hint["color"], hint["shape"]
+    if color is None and shape is None:
+        return None, None
+
+    candidates = [
+        i for i, o in enumerate(objects)
+        if (color is None or o["color_name"] == color)
+        and (shape is None or o["shape_name"] == shape)
+    ]
+    if len(candidates) == 1:
+        return candidates[0], None
+    if not candidates:
+        return None, None
+
+    # Ambiguous (e.g. "the ball" with two balls in the scene): pick the
+    # candidate matching more of the OTHER words mentioned in the clause;
+    # only ask for clarification if that still leaves a tie.
+    colors_m, shapes_m = hint["colors_mentioned"], hint["shapes_mentioned"]
+    scored = [
+        (int(objects[i]["color_name"] in colors_m) + int(objects[i]["shape_name"] in shapes_m), i)
+        for i in candidates
+    ]
+    best = max(sc for sc, _ in scored)
+    tied = [i for sc, i in scored if sc == best]
+    if len(tied) == 1:
+        return tied[0], None
+
+    descs = ", ".join(
+        f"{objects[i]['color_name']} {objects[i]['shape_name']} (at {objects[i]['dist_from_robot']:.1f}m)"
+        for i in tied
+    )
+    return None, f"Multiple matching objects found: {descs}. Which one? (say the color and the shape)"
+
+
+def resolve_live_instruction(instruction: str, scene_cfg: dict) -> dict:
+    """
+    NX-15: THE single shared instruction -> target resolver for both live entry
+    points (_terminal_loop, Flask /execute). Never used by the scripted/headless
+    entry points (run_smoke(), showcase/recording APIs), which continue to pass
+    explicit scene_cfg['target_index'] values untouched -- that default remains
+    ONLY the fallback for entry points that explicitly pass an index.
+
+    Returns a dict:
+      mode:            "single" | "multi" | "clarify" | "no_match" | "no_parse"
+      target_indices:  list[int]   resolved object indices, in goal order
+      goals:           list[{"color","shape","prompt_part"}]  resolved goal specs
+                        (color/shape are the ACTUAL matched object's attributes,
+                        not just the raw parsed hint)
+      message:         str or None  (clarify question / no-match / no-parse text)
+    """
+    objects = (scene_cfg or {}).get("objects", [])
+    if not objects:
+        return dict(mode="no_match", target_indices=[], goals=[],
+                     message="No scene loaded yet.")
+
+    parts = _split_multi_goal_parts(instruction)
+    if not parts:
+        return dict(mode="no_parse", target_indices=[], goals=[], message=(
+            "I didn't understand that instruction. Try things like "
+            "'find the red ball' or 'go to the orange cube'."
+        ))
+
+    hints = [_extract_goal_hint(p) for p in parts]
+
+    for h in hints:
+        if h["color"] is None and h["shape"] is None:
+            return dict(mode="no_parse", target_indices=[], goals=[], message=(
+                f"I didn't understand '{h['prompt_part']}'. Try things like "
+                f"'find the red ball' or 'go to the orange cube'."
+            ))
+
+    resolved = [_resolve_goal_to_index(h, objects) for h in hints]
+
+    for idx, clarify in resolved:
+        if clarify:
+            return dict(mode="clarify", target_indices=[], goals=[], message=clarify)
+
+    for (idx, _clarify), h in zip(resolved, hints):
+        if idx is None:
+            inv = ", ".join(f"{o['color_name']} {o['shape_name']}" for o in objects)
+            c   = h["color"] or "?"
+            s   = h["shape"] or "object"
+            return dict(mode="no_match", target_indices=[], goals=[], message=(
+                f"No {c} {s} in this scene; scene has: {inv}"
+            ))
+
+    target_indices = [idx for idx, _ in resolved]
+    goals = [
+        {"color": objects[idx]["color_name"], "shape": objects[idx]["shape_name"],
+         "prompt_part": h["prompt_part"]}
+        for (idx, _), h in zip(resolved, hints)
+    ]
+    mode = "multi" if len(target_indices) > 1 else "single"
+    return dict(mode=mode, target_indices=target_indices, goals=goals, message=None)
 
 
 def run_fancy_rollout_multi(
@@ -1820,8 +1961,10 @@ _HTML_FANCY = """<!DOCTYPE html>
       placeholder="e.g. 'find the red ball' / 'go to the orange cube'"></textarea>
     <button onclick="sendInstr()">Execute</button>
     <button onclick="newScene()">New Scene</button>
-    <p class="tip">Use 'find' / 'look for' / 'search' to trigger search-then-goto.
-      Only reliable colors (red/orange/yellow/purple) are in the scene.</p>
+    <p class="tip">Name the object you want, e.g. 'find the red ball' -- the robot
+      pursues exactly that object. Ambiguous instructions (e.g. 'the ball' with two
+      balls) get a one-line clarification; unmatched ones list the scene's objects.
+      Chain goals: 'find the red ball then find the yellow cube'.</p>
     <hr/>
 
     <h3>Last Result</h3>
@@ -1873,7 +2016,11 @@ function sendInstr() {
     body: JSON.stringify({instruction: txt})
   }).then(r => r.json()).then(d => {
     if (d.error) { addLog('Error: ' + d.error, 'log-fail'); executing = false; }
-    else { addLog('Launched: ' + txt, 'log-bot'); }
+    else if (d.clarify) { addLog('Bot: ' + d.clarify, 'log-bot'); executing = false; }
+    else {
+      const tgt = (d.targets && d.targets.length) ? (' -> ' + d.targets.join(' then ')) : '';
+      addLog('Launched: ' + txt + tgt, 'log-bot');
+    }
   }).catch(() => { executing = false; });
 }
 
@@ -1958,18 +2105,23 @@ def _start_fancy_web_ui(
     _exec_thread = [None]
 
     def _scene_desc():
+        # NX-15: no more "<TARGET" marker -- the sampler's target_index is only a
+        # fallback default for scripted/headless callers; in live mode the real
+        # target is whatever object the typed instruction resolves to, so marking
+        # one object as THE target here would be misleading again.
         if scene_manager._scene_cfg is None:
             return "(no scene)"
         objs = scene_manager._scene_cfg["objects"]
-        tgt_idx = scene_manager._scene_cfg.get("target_index", 0)
         lines = []
         for i, o in enumerate(objs):
-            mark = " <TARGET" if i == tgt_idx else ""
             lines.append(f"  [{i}] {o['color_name']:7s} {o['shape_name']:8s}  "
-                         f"dist={o['dist_from_robot']:.2f}m{mark}")
+                         f"dist={o['dist_from_robot']:.2f}m")
         return "\n".join(lines)
 
-    def _do_rollout(instruction: str):
+    def _do_rollout(instruction: str, parsed: dict):
+        """Run the rollout for an already-parsed+resolved instruction (see the
+        /execute route below, which does the NX-15 parsing/resolution
+        synchronously before launching this thread)."""
         scene_cfg = scene_manager._scene_cfg
         if scene_cfg is None:
             with _status_lock:
@@ -1977,9 +2129,7 @@ def _start_fancy_web_ui(
                 _status_state['result'] = {'success': False, 'failure_tag': 'no_scene', 'steps': 0}
             return
 
-        # Parse prompt → target color/shape
-        tgt_obj  = scene_cfg['objects'][scene_cfg['target_index']]
-        prompt   = instruction
+        prompt = instruction
 
         with _status_lock:
             _status_state['state']  = STATE_SEARCHING
@@ -1997,15 +2147,32 @@ def _start_fancy_web_ui(
         vid_path = os.path.join(out_dir, f"fancy_ep_{int(time.time())}.mp4")
 
         try:
-            result = run_fancy_rollout(
-                inf=inf,
-                scene_cfg=scene_cfg,
-                prompt=prompt,
-                maxsteps=maxsteps,
-                render_video=render_video,
-                video_path=vid_path,
-                frame_callback=_cb,
-            )
+            if parsed["mode"] == "multi":
+                result = run_fancy_rollout_multi(
+                    inf=inf,
+                    goals=parsed["goals"],
+                    scene_cfg=scene_cfg,
+                    maxsteps=maxsteps,
+                    render_video=render_video,
+                    video_path=vid_path,
+                    frame_callback=_cb,
+                )
+            else:
+                # NX-15: target comes from the resolved instruction, not the
+                # sampler's default scene_cfg['target_index']. scene_cfg itself
+                # is left untouched (a copy carries the override) so any other
+                # reader of scene_manager._scene_cfg still sees the sampler default.
+                resolved_scene = dict(scene_cfg)
+                resolved_scene["target_index"] = parsed["target_indices"][0]
+                result = run_fancy_rollout(
+                    inf=inf,
+                    scene_cfg=resolved_scene,
+                    prompt=prompt,
+                    maxsteps=maxsteps,
+                    render_video=render_video,
+                    video_path=vid_path,
+                    frame_callback=_cb,
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -2013,10 +2180,17 @@ def _start_fancy_web_ui(
 
         with _status_lock:
             _status_state['state']  = STATE_REACHED if result.get('success') else STATE_FAILED
-            _status_state['result'] = result
+            # keep only JSON-serializable scalars: the raw result dict can hold
+            # np.ndarrays, which make /status throw until the auto-reset below
+            _status_state['result'] = {
+                k: (v.item() if hasattr(v, 'item') and getattr(v, 'ndim', 1) == 0 else v)
+                for k, v in result.items()
+                if isinstance(v, (bool, int, float, str, type(None)))
+                or (hasattr(v, 'item') and getattr(v, 'ndim', 1) == 0)
+            }
             _status_state['dist']   = result.get('final_dist')
 
-        print(f"[fancy_web] rollout done: {result.get('failure_tag')}  "
+        print(f"[fancy_web] rollout done: {result.get('failure_tag', result.get('success'))}  "
               f"video={result.get('video_path')}", flush=True)
 
         # Auto new scene after brief pause
@@ -2051,10 +2225,31 @@ def _start_fancy_web_ui(
         if not instruction:
             return jsonify({"error": "empty instruction"}), 400
 
-        t = threading.Thread(target=_do_rollout, args=(instruction,), daemon=True)
+        scene_cfg = scene_manager._scene_cfg
+        if scene_cfg is None:
+            return jsonify({"error": "no scene loaded"}), 400
+
+        # NX-15: parse + resolve the instruction against the CURRENT scene
+        # synchronously, before launching the rollout thread, so ambiguous/
+        # no-match/no-parse instructions get an immediate response over the
+        # same /execute channel the UI already reads (see sendInstr() JS above)
+        # instead of silently driving the wrong (or a pre-picked) object.
+        parsed = resolve_live_instruction(instruction, scene_cfg)
+        if parsed["mode"] == "clarify":
+            with _status_lock:
+                _status_state['prompt'] = instruction
+            return jsonify({"launched": False, "clarify": parsed["message"]})
+        if parsed["mode"] in ("no_parse", "no_match"):
+            with _status_lock:
+                _status_state['prompt'] = instruction
+            return jsonify({"launched": False, "error": parsed["message"]})
+
+        t = threading.Thread(target=_do_rollout, args=(instruction, parsed), daemon=True)
         _exec_thread[0] = t
         t.start()
-        return jsonify({"launched": True, "instruction": instruction})
+        targets = [f"{g['color']} {g['shape']}" for g in parsed["goals"]]
+        return jsonify({"launched": True, "instruction": instruction,
+                         "mode": parsed["mode"], "targets": targets})
 
     @app.route("/status")
     def status():
@@ -2448,7 +2643,9 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
     """Simple terminal loop."""
     print("\n" + "=" * 60, flush=True)
     print("G1Nav Fancy Demo — Terminal Mode", flush=True)
-    print("Type 'find the red ball' / 'new' / 'quit'", flush=True)
+    print("Name the object you want, e.g. 'find the red ball'.", flush=True)
+    print("Multi-goal: 'find the red ball then find the yellow cube'.", flush=True)
+    print("Type 'new' / 'quit'", flush=True)
     print("=" * 60 + "\n", flush=True)
 
     ep_num = 0
@@ -2456,12 +2653,12 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
 
     while True:
         scene_cfg = scene_mgr._scene_cfg
-        tgt = scene_cfg['objects'][scene_cfg['target_index']]
+        # NX-15: no "<TARGET" marker -- which object gets pursued is now decided
+        # by what the user types, not by the sampler's default target_index.
         print(f"Scene objects:", flush=True)
         for i, o in enumerate(scene_cfg['objects']):
-            mark = " <TARGET" if i == scene_cfg['target_index'] else ""
             print(f"  [{i}] {o['color_name']} {o['shape_name']}  "
-                  f"dist={o['dist_from_robot']:.2f}m{mark}", flush=True)
+                  f"dist={o['dist_from_robot']:.2f}m", flush=True)
 
         try:
             user = input("\nfancy> ").strip()
@@ -2476,34 +2673,65 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
             scene_mgr.new_scene()
             continue
 
-        # Use prompt as-is; target from scene
-        prompt = user
+        # NX-15: parse instruction -> resolve against the CURRENT scene's objects
+        parsed = resolve_live_instruction(user, scene_cfg)
+        if parsed["mode"] in ("no_parse", "no_match", "clarify"):
+            print(f"\nBot: {parsed['message']}\n", flush=True)
+            continue
+
         ep_num += 1
         vid_path = None
         if render_video:
             os.makedirs(out_dir, exist_ok=True)
             vid_path = os.path.join(out_dir, f"fancy_ep{ep_num:03d}.mp4")
 
-        print(f"\nExecuting: '{prompt}' ...", flush=True)
+        tgt_desc = ' then '.join(f"{g['color']} {g['shape']}" for g in parsed["goals"])
+        print(f"\nExecuting: '{user}' -> target: {tgt_desc}", flush=True)
         t0 = time.time()
         try:
-            result = run_fancy_rollout(
-                inf=inf,
-                scene_cfg=scene_cfg,
-                prompt=prompt,
-                maxsteps=maxsteps,
-                render_video=render_video,
-                video_path=vid_path,
-            )
+            if parsed["mode"] == "multi":
+                result = run_fancy_rollout_multi(
+                    inf=inf,
+                    goals=parsed["goals"],
+                    scene_cfg=scene_cfg,
+                    maxsteps=maxsteps,
+                    render_video=render_video,
+                    video_path=vid_path,
+                )
+            else:
+                # NX-15: target comes from the resolved instruction; scene_cfg
+                # itself is left untouched (a copy carries the override) so the
+                # scene manager's own state (incl. its default target_index,
+                # unused here) is unaffected.
+                resolved_scene = dict(scene_cfg)
+                resolved_scene["target_index"] = parsed["target_indices"][0]
+                result = run_fancy_rollout(
+                    inf=inf,
+                    scene_cfg=resolved_scene,
+                    prompt=user,
+                    maxsteps=maxsteps,
+                    render_video=render_video,
+                    video_path=vid_path,
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()
             result = {'success': False, 'failure_tag': 'error'}
         dt = time.time() - t0
 
-        status = "SUCCESS" if result.get('success') else f"FAILED ({result.get('failure_tag')})"
-        print(f"\nResult: {status}  steps={result.get('steps',0)}  "
-              f"dist={result.get('final_dist',0):.3f}m  wall={dt:.1f}s", flush=True)
+        if parsed["mode"] == "multi":
+            status = "SUCCESS" if result.get('success') else "FAILED"
+            print(f"\nResult: {status}  total_steps={result.get('total_steps',0)}  wall={dt:.1f}s", flush=True)
+            for gi, sr in enumerate(result.get("goal_results", [])):
+                g_ok = "OK" if sr.get("success") else f"FAIL({sr.get('failure_tag','?')})"
+                g = parsed["goals"][gi] if gi < len(parsed["goals"]) else {"color": "?", "shape": "?"}
+                print(f"  sub-goal {gi+1}: {g['color']} {g['shape']}  "
+                      f"{g_ok}  dist={sr.get('final_dist',0):.3f}m", flush=True)
+        else:
+            status = "SUCCESS" if result.get('success') else f"FAILED ({result.get('failure_tag')})"
+            print(f"\nResult: {status}  steps={result.get('steps',0)}  "
+                  f"dist={result.get('final_dist',0):.3f}m  wall={dt:.1f}s", flush=True)
+
         if result.get('video_path'):
             print(f"Video: {result['video_path']}", flush=True)
             vid_paths.append(result['video_path'])
