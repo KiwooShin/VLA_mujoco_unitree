@@ -15,14 +15,14 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 | Task | Condition | Learned grounding (default) | Classical grounding (fallback) |
 |------|-----------|------|------|
 | Goto | easy | **100%** | 100% |
-| Goto | demo-distance (4–9 m) | **86.7%** | 66.7% |
+| Goto | demo-distance (4–9 m) | **93.3%** | 66.7% |
 | Goto | demo / GT goal (locomotion reference) | — | 80.0% |
 | Search | out-of-FOV target | **100%** | 100% |
 | Maneuver | turn after passing a landmark | **66.7–73.3%** (run-to-run band) | same |
 
 The full system stacks three perception/navigation layers on the distilled walk policy, each adopted only after per-episode no-regression gates:
 - **Two-camera handoff** (head + steeper proximity camera): keeps the target detected down to **0.26 m**; a single head camera goes blind below ~0.7 m, before the stop radius.
-- **Learned grounding** (`GROUND_NET`, default when its checkpoint is present; classical HSV+depth otherwise): a 0.9M-param query-conditioned heatmap detector trained from scratch on MuJoCo-segmentation-labeled frames. It eliminates the classical grounder's confident false locks at 4–9 m (hue-similar walls, same-color twin distractors) — demo-distance 66.7% → **86.7%**, above even the classical stack's 80% GT-goal reference; the two residual failures are one never-visible target and one compound episode that fails under GT goals too.
+- **Learned grounding** (`GROUND_NET`, default when its checkpoint is present; classical HSV+depth otherwise): a 0.9M-param query-conditioned heatmap detector trained from scratch on MuJoCo-segmentation-labeled frames. It eliminates the classical grounder's confident false locks at 4–9 m (hue-similar walls, same-color twin distractors) — demo-distance 66.7% → 86.7%, above even the classical stack's 80% GT-goal reference. A realized-yaw fix to the initial scan (the commanded ±90° sweep only physically realized ~±62°) then recovered a target sitting just past the old coverage edge — **93.3%**; the single residual episode is a compound failure that also fails under ground-truth goals.
 - **Local obstacle avoidance** (`AVOID`, default on): depth-corridor repulsion at grounding cadence (no extra renders), target- and floor-exempt. Fixes physical path collisions the straight-line steerer couldn't survive — search 93.3% → **100%**.
 
 Policy inference: **3.4 ms/step** (~6× headroom at 50 Hz). 0 falls in the goto/maneuver conditions. EGL-deterministic per seed.
@@ -173,7 +173,7 @@ export PYTHONPATH=.:$PYTHONPATH
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty easy --goal-source classical --n 15 --seed 999 --device cuda --out eval/easy_classical
 
-# Goto — demo-distance (~87% with the trained detector; ~67% classical fallback)
+# Goto — demo-distance (~93% with the trained detector; ~67% classical fallback)
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty demo --goal-source classical --n 15 --seed 999 --device cuda --out eval/demo_classical
 
@@ -258,4 +258,4 @@ Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV
 
 **Perception — two-camera handoff.** A single pitched head camera goes blind below ~0.7 m (the target exits the FOV bottom edge before the stop radius). Grounding therefore runs on the **active** one of two head-mounted cameras: the head camera at range, and a steeper **proximity camera** (58° pitch) for the final approach, switched by a hysteresis (Schmitt) trigger on the smoothed target distance (in ≤1.2 m, out ≥1.6 m) with depth-based rejection of the robot's own body in frame. Both cameras feed the same `(dist, bearing)` goal, so the policy needs **no retraining**, and only the active camera is rendered each cycle, so steady-state compute is unchanged. This keeps the target detected down to **0.26 m** — through every skill's stop radius. (A wide-FOV single-camera alternative was A/B-tested and rejected: it loses far-range detection, has a shallower close-range floor, and is ~2× slower.)
 
-**Why a learned detector.** The classical grounder's demo-distance ceiling (66.7% vs 80% under ground-truth goals) is a discrimination limit: at 4–9 m among hue-similar walls, some false HSV+depth locks are geometrically indistinguishable from true ones — we falsified area-, physical-size-, depth-continuity-, shape-, and odometric-coherence-based rejection, each with traced per-episode root causes, before concluding only appearance learning could separate them. The learned detector confirmed that diagnosis (86.7%, zero confident false locks on the previously-failing episodes). The final piece was **obstacle avoidance**: with accurate grounding the robot walks perfectly straight lines — straight into off-path obstacles the classical stack happened to weave around thanks to its own bearing noise. Depth-corridor repulsion fixed those collisions (search 100%) and only then did the learned-grounding stack clear its adoption gate.
+**Why a learned detector.** The classical grounder's demo-distance ceiling (66.7% vs 80% under ground-truth goals) is a discrimination limit: at 4–9 m among hue-similar walls, some false HSV+depth locks are geometrically indistinguishable from true ones — we falsified area-, physical-size-, depth-continuity-, shape-, and odometric-coherence-based rejection, each with traced per-episode root causes, before concluding only appearance learning could separate them. The learned detector confirmed that diagnosis (zero confident false locks on the previously-failing episodes). The final piece was **obstacle avoidance**: with accurate grounding the robot walks perfectly straight lines — straight into off-path obstacles the classical stack happened to weave around thanks to its own bearing noise. Depth-corridor repulsion fixed those collisions (search 100%) and only then did the learned-grounding stack clear its adoption gate.

@@ -96,11 +96,14 @@ GOTO_CKPT     = str(_GOTO_CKPT_PINNED)     if _GOTO_CKPT_PINNED.exists()     els
                 str(GOTO_CKPT_EP3)          if GOTO_CKPT_EP3.exists()         else str(GOTO_CKPT_BEST))
 MANEUVER_CKPT = str(_MANEUVER_CKPT_PINNED) if _MANEUVER_CKPT_PINNED.exists() else str(MANEUVER_CKPT)
 
-# H1 refresh: demo-distance goto uses 1400 steps (4-9m walks at ~50Hz)
+# H1 refresh: demo-distance goto uses 1700 steps (4-9m walks at ~50Hz)
 # V2/V3 demo-distance grounding (26° cam, 480x360, depth-FG rescue) wired in inferencer.py.
 # Default difficulty = 'demo' to showcase 4-9m LONG walks (key demo deliverable).
-MAXSTEPS_GOTO     = 1400  # demo preset: 1400 steps for 4-9m walks (was 600 for easy only)
-MAXSTEPS_MANEUVER = 1400
+# NX-10 (docs/nx10_scan_fix.md): bumped 1400 -> 1700, matching code/eval_closedloop.py's
+# MAXSTEPS['demo'] -- the widened H3 scan (BidirectionalScanSchedule, realized-yaw
+# tracking) needs more absolute-step budget for unfavorable-direction bearings.
+MAXSTEPS_GOTO     = 1700  # demo preset: 1700 steps for 4-9m walks (was 1400 pre-NX-10)
+MAXSTEPS_MANEUVER = 1400  # unchanged -- maneuver has its own separate rollout loop (nx9_avoid.md §8)
 DEMO_OUT_DIR = _REPO / "eval/demo"
 WEB_PORT     = 5000
 

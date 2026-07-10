@@ -61,7 +61,15 @@ N_RENDER_EPS = 3     # number of episodes to render to video
 
 MAXSTEPS = {
     'easy': 600,
-    'demo': 1400,
+    # NX-10 (docs/nx10_scan_fix.md): bumped 1400 -> 1700. inferencer.py's H3 initial
+    # scan now uses NX-1's BidirectionalScanSchedule (165° legs, realized-yaw
+    # tracking) instead of an assumed-realized-rate step count, fixing the
+    # scan-coverage bug that made demo ep2's target (-73.8° bearing) structurally
+    # unreachable -- but an unfavorable-direction bearing now takes ~850 realized
+    # steps to clear the scan (vs. the old ~200-step budget), leaving too little of
+    # the old 1400-step cap for the walk-in. Same tradeoff NX-1 made for
+    # MAXSTEPS_SEARCH (1400 -> 2000) when adopting the same shared schedule.
+    'demo': 1700,
 }
 
 

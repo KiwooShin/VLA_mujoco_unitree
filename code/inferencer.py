@@ -18,7 +18,10 @@ Three-rate design (per ADR-001):
   - Action head: 50 Hz (every control step).
 
 Action chunking: if chunk_H>1, temporal ensembling (ACT-style).
-MAXSTEPS hard cap: easy=600, demo=1400.
+MAXSTEPS hard cap: easy=600, demo=1700 (NX-10: was 1400; bumped alongside the H3 scan's
+widened realized coverage -- see docs/nx10_scan_fix.md). `maxsteps` is a caller-supplied
+`rollout()` argument, not hardcoded here -- see code/eval_closedloop.py's `MAXSTEPS` dict
+and code/demo.py's `MAXSTEPS_GOTO` for the two callers this file's docstring tracks.
 
 Goal source (Arch A only) — controls how the goal (dist, cosθ, sinθ) is sourced:
   - 'learned'   : grounding head's own predicted goal from vision+language (default deploy)
@@ -69,6 +72,7 @@ from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
 from code.steer import steer as _steer_cmd
 from code.lock_mgmt import LockGate, ReacquisitionScan
 from code import avoid as _avoid
+from code.scan_sched import BidirectionalScanSchedule, SCAN_DWELL_STEPS as _H3_DWELL_STEPS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -682,13 +686,65 @@ class Inferencer:
         last_grounding_step = -999
         # Scan-and-acquire state
         _scan_active         = True      # True until target centered in frame
-        _scan_yaw_delta      = 0.0       # cumulative yaw scanned (rad)
-        # Scan budget: right 0→90° then left 90°→−90° then right again — full ±90° coverage.
-        # 90°/0.6 rad/s / 0.02 dt = 75 steps per quarter. So 225 steps covers ±90°.
-        # Keep it at 200 steps max (4s at 50Hz) to avoid wasting too much time.
-        SCAN_TIMEOUT         = 200       # max steps in scan mode
-        SCAN_RATE            = 0.6       # rad/s scan rate
+        _scan_yaw_delta      = 0.0       # cumulative yaw scanned (rad) -- diagnostic only,
+                                          # no longer drives the schedule (see below)
+        # NX-10 (docs/fa2_residuals.md, docs/nx10_scan_fix.md): the old H3 scan assumed the
+        # commanded SCAN_RATE was fully realized (step_count * rate * dt) to bound a ±90°
+        # right/left/right sweep (75/125/0 step split over a 200-step budget) -- but the
+        # student-driven turn only realizes a fraction of the commanded rate in practice, so
+        # the fixed step budget only ever swept a REALIZED ~-61°/+64° arc (confirmed by
+        # instrumented replay), not the intended ±90°, leaving demo ep2's target (bearing
+        # -73.8°) structurally unreachable by the scan regardless of detector quality --
+        # 0/140 raw detector calls ever saw the target in frame. Fix: reuse NX-1's
+        # BidirectionalScanSchedule (code/scan_sched.py) -- the SAME already-validated shared
+        # CLASS eval_search.py/fancy_demo.py use -- which tracks the robot's ACTUAL
+        # accumulated yaw (integrated from real per-step yaw readings, not assumed from
+        # step*rate) so each leg always completes its full REAL angular sweep regardless of
+        # realized-rate drift, self-correcting exactly like the search-skill fix did for its
+        # own rotation-coverage bug.
+        #
+        # `H3_LEG_DEG` is deliberately NOT eval_search's own `SCAN_LEG_DEG` (=165, code/
+        # scan_sched.py) -- the dwell length `_H3_DWELL_STEPS`=45 IS reused as-is (that part
+        # of the shared constants was never implicated). First attempt used 165° legs
+        # directly, and it DID fix ep2/ep4's coverage, but the
+        # full n=15 re-gate surfaced a NEW regression: ep9 (bearing -39.7°, a previously-
+        # passing episode) started FALLING (reproducible, not noise) ~480 steps in, partway
+        # through the unfavorable-direction leg0(full 165°)+dwell+leg1(full 165° return)
+        # sequence -- a realized single-leg rotation of ~375 steps, uncomfortably close to
+        # the ~470-step/~323° continuous-rotation OOD ceiling docs/rot_dart.md /
+        # docs/nx1_scan.md diagnosed for this same shared policy (even though each leg is
+        # individually dwell-bounded, back-to-back unfavorable-direction legs apparently
+        # still stack risk in demo's environment/physics that eval_search's own validated
+        # 165°/45-step-dwell gate never triggered). 90° restores the ORIGINAL H3 design's own
+        # stated intent ("sweeps ±90° arc") -- just now correctly REALIZED via actual yaw
+        # tracking instead of the buggy assumed-rate calculation -- roughly halving worst-
+        # case single-leg rotation (~205 realized steps for 90° vs ~375 for 165°), which
+        # empirically eliminates the ep9 fall while still comfortably covering ep2 (-73.8°,
+        # needs only ~44.9° into leg2) and ep4 (+62.6°, found directly in leg0). KNOWN
+        # LIMITATION (documented, out of scope for this fix): a 90° leg gives a HARD ceiling
+        # of ±(90+28.9)=±118.9° effective bearing coverage -- demo scenes sample target
+        # bearing uniformly over the full ±180° (code/scene.py, `target_in_fov=False`), so a
+        # target beyond ±118.9° (not present in the seed=999 n=15 gate set -- max observed
+        # magnitude is ep2's 73.8°) would still time out unfound. Widening further would need
+        # a redesign beyond this fix's scope (e.g. detecting/escaping the OOD-risk condition
+        # directly, per docs/nx8_stall.md's STALL_BREAK precedent) -- see docs/nx10_scan_fix.md.
+        H3_LEG_DEG            = 90.0      # NOT eval_search's 165 -- see comment above
+        # `SCAN_TIMEOUT` here is this INITIAL scan's own absolute-episode-step safety net
+        # (mirrors eval_search's identically-purposed outer `SCAN_TIMEOUT` check) --
+        # distinct from `ReacquisitionScan`'s LOCAL step counter (code/lock_mgmt.py), which
+        # is the only thing safe to re-arm mid-episode. Bumped from 200 -> 1000: empirically
+        # (docs/nx10_scan_fix.md) the worst unfavorable-direction demo bearing in the gate set
+        # (ep9, -39.7°) clears leg0+dwell+leg1+dwell and finds the target partway through
+        # leg2 at a REALIZED absolute step of ~470 (reproducible); 1000 gives ample margin.
+        # `MAXSTEPS['demo']` (code/eval_closedloop.py) / `MAXSTEPS_GOTO` (code/demo.py) were
+        # bumped 1400 -> 1700 for the same reason NX-1 bumped MAXSTEPS_SEARCH: ep9's post-scan
+        # walk-in (already heading-aligned) needed ~1043 more realized steps (470 -> ~1513)
+        # to converge below stop_r -- the old 1400 cap would cut it off short.
+        SCAN_TIMEOUT         = 1000      # safety-net cap (was 200) -- see comment above
+        SCAN_RATE            = 0.6       # rad/s scan rate (unchanged; same as eval_search)
         SCAN_DT              = SIM_DT * CONTROL_DECIMATION  # 0.02s per step
+        _h3_scan_sched        = BidirectionalScanSchedule(
+            scan_rate=SCAN_RATE, leg_deg=H3_LEG_DEG, dwell_steps=_H3_DWELL_STEPS)
         # Exit scan when bearing < SCAN_ALIGNED_THR or first detection (whichever is looser).
         SCAN_ALIGNED_THR_DEG = 40.0     # target bearing < this → aligned, exit scan
         # Goal smoothing: exponential moving average of detected goals (E6)
@@ -1141,18 +1197,24 @@ class Inferencer:
             # inject a turning velocity command into the STUDENT action head so the
             # STUDENT produces the turning joint targets → PD → physics.
             # NO WBC teacher.step() called at runtime: 100% WBC-free deploy.
-            # Pattern: right 75 steps (90°), left 150 steps (180°), right remainder —
-            # sweeps ±90° arc covering targets at any initial bearing.
-            # Timeout: after SCAN_TIMEOUT steps, exit scan and use default cached_goal_vec.
+            # NX-10 (docs/nx10_scan_fix.md): pattern is now NX-1's bidirectional bounded
+            # triangle-wave (`_h3_scan_sched`, code/scan_sched.py's `BidirectionalScanSchedule`
+            # class, H3-local `H3_LEG_DEG=90` amplitude -- see the constants-block comment
+            # above for why this is 90, not eval_search's 165) -- 0->+90° (CCW), dwell,
+            # +90->0° (CW), dwell, 0->-90° (CW), dwell, repeat -- tracking the robot's
+            # ACTUAL accumulated yaw each step rather than assuming the commanded SCAN_RATE
+            # is fully realized (the old bug: realized coverage was only ~-61°/+64°, not the
+            # intended ±90°). Timeout: after SCAN_TIMEOUT (absolute episode step) elapses,
+            # exit scan and use default/last cached_goal_vec, same fallback as before.
             if _scan_active and _need_classical_render:
-                # NX-2 (LOCK_M4/M5): a lock-drop-triggered rescan uses NX-1's bounded
-                # BidirectionalScanSchedule (via ReacquisitionScan) instead of the H3
-                # pattern below, because H3's SCAN_TIMEOUT check is keyed on the
-                # EPISODE's absolute `step` -- re-arming it mid-episode would
-                # immediately time out (step already >> SCAN_TIMEOUT=200). This branch
-                # is ONLY ever taken after a M4/M5 trigger (both individually toggled,
-                # default off); with those off, `_using_rescan_sched` is never True and
-                # the `else` (original, byte-identical H3 logic) always runs.
+                # NX-2 (LOCK_M4/M5): a lock-drop-triggered rescan uses a FRESH
+                # ReacquisitionScan (its own LOCAL step counter) instead of the H3 scan
+                # below, because H3's SCAN_TIMEOUT check is keyed on the EPISODE's absolute
+                # `step` -- re-arming it mid-episode would immediately time out (step
+                # already >> SCAN_TIMEOUT). This branch is ONLY ever taken after a M4/M5
+                # trigger (both individually toggled, default off); with those off,
+                # `_using_rescan_sched` is never True and the `else` (H3 scan, now driven by
+                # `_h3_scan_sched`) always runs.
                 if _using_rescan_sched:
                     scan_wz = _rescan_sched.step(yaw)
                     if scan_wz is None:
@@ -1208,14 +1270,11 @@ class Inferencer:
                     if self.verbose:
                         print(f"  [scan] TIMEOUT at step={step}, falling back to default goal", flush=True)
                 else:
-                    # Compute scan direction (same sweep pattern as before)
-                    _quarter = int(SCAN_TIMEOUT * 75.0 / 200.0)
-                    if step < _quarter:
-                        scan_wz = SCAN_RATE          # right: 0→90°
-                    elif step < _quarter * 3:
-                        scan_wz = -SCAN_RATE         # left: 90°→−90°
-                    else:
-                        scan_wz = SCAN_RATE           # right: −90°→0°
+                    # NX-10: bounded bidirectional schedule, driven by REALIZED yaw (see
+                    # module docstring / constants-block comment above for the diagnosis).
+                    # Dwell legs return wz=0.0 (in-distribution stand-still, matches the
+                    # ReacquisitionScan / eval_search dwell behavior).
+                    scan_wz = _h3_scan_sched.step(yaw)
                     _scan_yaw_delta += scan_wz * SCAN_DT
                     # --- STUDENT-driven scan: inject vel into student, not teacher ---
                     # Build proprio from current sim state
