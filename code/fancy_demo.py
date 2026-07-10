@@ -492,6 +492,8 @@ def run_fancy_rollout(
     from code.eval_search import STOP_R_SEARCH, SCAN_ALIGNED_THR_DEG
     from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
                                   SCAN_DWELL_STEPS, SCAN_TIMEOUT as _SCAN_TIMEOUT_DEFAULT)
+    from code import avoid as _avoid
+    from code.arena import CAM_HEAD_Z
 
     # --- Extract scene info ---
     objects      = scene_cfg['objects']
@@ -637,6 +639,17 @@ def run_fancy_rollout(
     _active_cam      = 'GROUNDING'   # default at episode start
     _cam_miss_count  = 0             # consecutive misses on the active camera
     _video_frame_cache = None        # last labeled active-cam frame (RGB, EGO_W x EGO_H)
+
+    # NX-9 AVOID (docs/nx9_avoid.md): same per-episode state / carve-out
+    # pattern as code/inferencer.py / code/eval_search.py -- see
+    # code/inferencer.py's identical block for the full rationale. This file
+    # has no lock_mgmt-driven rescan to reset on, so `_avoid_bias_wz` only
+    # ever resets at episode start (its own decay/hysteresis handles the
+    # rest, including the one scan->goto transition below).
+    _avoid_bias_wz       = 0.0
+    _avoid_is_maneuver   = (_avoid.AVOID and _avoid.is_maneuver_scene(scene_cfg))
+    _avoid_cycles_total  = 0
+    _avoid_cycles_active = 0
 
     spotted     = False
     scan_steps  = 0
@@ -837,6 +850,32 @@ def run_fancy_rollout(
                 if _last_known_goal is not None and _frames_since_det <= HOLD_GOAL_HORIZON:
                     cached_goal_vec = _last_known_goal.copy()
 
+            # NX-9 AVOID (docs/nx9_avoid.md): local obstacle avoidance --
+            # same mechanism/carve-outs as code/inferencer.py's identical
+            # block (shared helper, code/avoid.py), reusing this cycle's
+            # already-rendered depth_ground/intr_active (zero extra renders).
+            # Never while `_scan_active`; fresh bias only while the goal is
+            # fresh (<= AVOID_STALE_MAX_MISSED_CYCLES missed cycles), decay
+            # only on a longer stale coast -- see AVOID_STALE_MAX_MISSED_CYCLES'
+            # comment in code/avoid.py for the ep14 fall trace behind this.
+            if _avoid.AVOID and not _avoid_is_maneuver and not _scan_active:
+                _avoid_cycles_total += 1
+                if _frames_since_det > _avoid.AVOID_STALE_MAX_MISSED_CYCLES:
+                    _avoid_bias_wz = _avoid.decay_bias(_avoid_bias_wz)
+                else:
+                    _avoid_goal_dist_now = float(cached_goal_vec[0])
+                    _avoid_goal_bearing_now = _math.atan2(float(cached_goal_vec[2]),
+                                                           float(cached_goal_vec[1]))
+                    _avoid_carved = (_avoid_goal_dist_now < _avoid.AVOID_MIN_GOAL_DIST_M)
+                    _avoid_cam_h = float(data_mj.qpos[2]) + CAM_HEAD_Z
+                    _avoid_bias_wz, _avoid_dbg = _avoid.compute_obstacle_bias(
+                        depth_ground, intr_active, cam_height_m=_avoid_cam_h,
+                        goal_dist_m=_avoid_goal_dist_now,
+                        goal_bearing_rad=_avoid_goal_bearing_now,
+                        prev_bias_wz=_avoid_bias_wz, carved_out=_avoid_carved)
+                if abs(_avoid_bias_wz) > 1e-9:
+                    _avoid_cycles_active += 1
+
         # Scan mode
         if _scan_active:
             if step >= SCAN_TIMEOUT:
@@ -907,13 +946,25 @@ def run_fancy_rollout(
         img_t      = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32, device=inf.device)
         goal_inj_t = torch.from_numpy(cached_goal_vec).unsqueeze(0).to(inf.device)
 
+        # NX-9 AVOID: replace the model's self-predicted velocity with
+        # steer.py's own control law (from cached_goal_vec) plus the bounded
+        # yaw bias, exactly matching code/inferencer.py's injection point --
+        # only when a nonzero bias is active this cycle (provable no-op on
+        # clear paths / when AVOID is off).
+        gt_vel_t = None
+        if _avoid.AVOID and not _avoid_is_maneuver and abs(_avoid_bias_wz) > 1e-9:
+            vel_av = _avoid.biased_vel_cmd(
+                float(cached_goal_vec[0]), float(cached_goal_vec[1]),
+                float(cached_goal_vec[2]), _avoid_bias_wz, stop_r)
+            gt_vel_t = torch.from_numpy(vel_av).unsqueeze(0).to(inf.device)
+
         with torch.no_grad():
             out = inf.model(
                 ego_rgb   = img_t,
                 lang_emb  = lang_t,
                 proprio_h = prop_t,
                 gt_goal   = goal_inj_t,
-                gt_vel    = None,
+                gt_vel    = gt_vel_t,
             )
 
         raw_action = out['action'].cpu().numpy().squeeze(0)[0]
@@ -995,6 +1046,8 @@ def run_fancy_rollout(
         # FD2: carry path trail forward across sub-goals
         path_trail_out=list(path_trail),
         frames_sbs=frames_sbs,    # returned for multi-goal video concat
+        avoid_bias_active_frac=(_avoid_cycles_active / _avoid_cycles_total
+                                 if _avoid_cycles_total > 0 else 0.0),
     )
 
 

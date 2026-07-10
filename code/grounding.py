@@ -41,7 +41,7 @@ from typing import Optional
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from code.arena import (backproject_pixel, EGO_FOVY, EGO_W, EGO_H, get_ego_intrinsics,
-                        GROUNDING_W, GROUNDING_H)
+                        GROUNDING_W, GROUNDING_H, SHAPES)
 
 # E6 fix v4: The MuJoCo model's actual rendered FOVY = model.vis.global_.fovy = 45 degrees.
 # The arena.EGO_FOVY constant = 90 degrees is incorrect for the rendered image.
@@ -167,6 +167,413 @@ IMG_MARGIN_BOTTOM = 0.05   # fraction of height to ignore at bottom (noisy edge 
 
 # V2: minimum valid depth pixels (lowered for distant targets where eroded mask is small)
 MIN_VALID_DEPTH_PX = 3   # was 5, reduced for 480x360 high-res render of distant blobs
+
+
+# ---------------------------------------------------------------------------
+# NX-3 (docs/nx3_size_gate.md): physical-size plausibility gate (M6).
+# ---------------------------------------------------------------------------
+# Targets are known primitives with KNOWN physical dimensions (see arena.py's
+# build_arena(): every per-shape branch sets hs = obj["size"]/2 and uses hs as the
+# geom's radius (ball/cylinder/cone base) or half-edge (cube) -- so SHAPES' "size"
+# value IS the object's full diameter/edge-length, not a "half-size" despite the
+# module docstring's naming). From a candidate blob's pixel bbox extent + its OWN
+# median depth + the camera's focal length, we can back out the blob's PHYSICAL
+# width/height in metres (pinhole: real_size = pixel_size * depth / focal) and
+# compare against the known nominal size for the instructed shape. A false-positive
+# blob at the wrong depth (ep0/ep5's sliver locked ~2m too far; ep2's confident
+# wall/distractor collision; ep12's hijack) generically produces an implausible
+# physical size for ITS OWN reported depth, even when its pixel-space area/fill-
+# ratio/depth-sample-count look individually fine -- exactly the failure mode M1's
+# conf_area-based floor cannot see, since M1 never looks at depth at all (see
+# docs/rs1_lock_mgmt.md's M1 section and docs/nx2_iso.md's M1 isolation report).
+#
+# NOMINAL_DIMS_M: (width_m, height_m) per shape, derived EXACTLY from
+# arena.build_arena()'s geom-size formulas (not just the raw SHAPES table):
+#   ball/cube : symmetric, width==height==size (sphere radius=size/2 -> diameter=
+#               size; cube half-edge=size/2 -> edge=size)
+#   cylinder  : radius=size/2 -> diameter(width)=size; half-height=(size/2)*1.6 ->
+#               height=size*1.6
+#   cone      : base radius=size/2 -> diameter(width)=size; total height (base
+#               cylinder + narrow tip box, see build_arena()'s "cone" branch) =
+#               ((size/2)*2.2)*1.9 = size*2.09
+_SHAPE_SIZE_M = dict(SHAPES)   # {"ball":0.24, "cube":0.24, "cylinder":0.22, "cone":0.26}
+NOMINAL_DIMS_M = {
+    "ball":     (_SHAPE_SIZE_M["ball"],     _SHAPE_SIZE_M["ball"]),
+    "sphere":   (_SHAPE_SIZE_M["ball"],     _SHAPE_SIZE_M["ball"]),
+    "cube":     (_SHAPE_SIZE_M["cube"],     _SHAPE_SIZE_M["cube"]),
+    "box":      (_SHAPE_SIZE_M["cube"],     _SHAPE_SIZE_M["cube"]),
+    "cylinder": (_SHAPE_SIZE_M["cylinder"], _SHAPE_SIZE_M["cylinder"] * 1.6),
+    "cone":     (_SHAPE_SIZE_M["cone"],     _SHAPE_SIZE_M["cone"] * 2.09),
+}
+
+# Plausibility band multipliers (of nominal size). CALIBRATED (docs/nx3_size_gate.md)
+# against 781 instrumented accepted detections across 15 real episodes (demo passing
+# eps 1/3/6/9/13 + demo failing eps 0/2/5/12 + easy eps 0-5, seed 999), classified
+# true/false by |reported dist - GT dist to true target|:
+#   - LO=0.08: the smallest TRUE detection observed anywhere was ratio 0.105 (easy
+#     ep5's far/eroded early blobs); the initially-proposed 0.4 floor would have
+#     rejected 9/15 of easy ep2's TRUE hits (a currently-100% episode). The low side
+#     carries almost no discriminative power anyway (the ep0/ep2/ep5 false blobs are
+#     all caught on the HIGH side) -- so it is set permissively, purely as a
+#     degenerate-sliver backstop.
+#   - HI=2.5: TRUE unclipped detections' width/height ratios never exceeded 1.9
+#     (aggregate p95=1.4); the ep0/ep2/ep5 FALSE populations sit at 3.3-47.7x --
+#     a clean >1.7x margin on both sides of 2.5.
+M6_SIZE_BAND_LO = 0.08
+M6_SIZE_BAND_HI = 2.5
+
+# Near-depth stand-down for CLIPPED axes (calibration finding, docs/nx3_size_gate.md):
+# during a legitimate final approach the PROXIMITY camera produces a full-frame blob
+# (clipped on ALL four edges, area ~60000 px^2) whose median depth saturates ~0.97m
+# while the true range keeps closing -- its back-projected "physical size" reads
+# 3.5-7.6x nominal despite being the REAL target (depth corruption at extreme close
+# range: surrounding-floor pixels dominating the median + the sensor depth floor).
+# Observed in PASSING demo ep1 and easy eps 2/4 -- enforcing the upper bound on
+# clipped axes there would break currently-100% easy episodes. Below this depth a
+# clipped axis is fully exempt; at/above it, a clipped axis still gets the UPPER
+# bound (clipping can only truncate the measured extent, so measured > HI implies
+# true > HI regardless of clipping -- this is what catches ep2's 12.4m-wide
+# LR-clipped wall blob at 8.8m and ep5's 3.3-5.1x LR-clipped blobs at 6.1m, both of
+# which sail through a naive "skip clipped axes entirely" rule).
+M6_NEAR_DEPTH_M = 1.2   # metres; matches inferencer.py's CAM_D_LO handoff bound
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip() == "1"
+
+
+# NX-3 M6: default OFF (opt-in via LOCK_M6=1), gated the same way as
+# lock_mgmt.py's LOCK_M1..M5 toggles -- but this one lives in grounding.py, not
+# lock_mgmt.py, because it is a GROUNDING-level rejection (a blob that fails this
+# check never becomes a `not_visible=False` detection at all, for EITHER call site
+# -- inferencer.py AND eval_search.py both get it automatically since both call
+# ground()) rather than a lock-STATE-dependent mechanism. This is exactly why it
+# can reach ep12's hijack: that failure enters via the mandatory CAM-2 handoff
+# discontinuity carve-out in lock_mgmt.LockGate.gate_detection() (`bypass=True`),
+# which no lock-state mechanism (M1/M3/M4) can veto because it fires unconditionally
+# on ANY detection at that cycle -- but the hijacking blob still has to pass THIS
+# check first, upstream of lock_mgmt entirely, before it ever reaches that carve-out.
+LOCK_M6 = _env_flag("LOCK_M6")
+
+
+# ---------------------------------------------------------------------------
+# NX-4 (docs/nx4_depth_split.md): depth-guided blob splitting + component
+# re-selection, and a secondary shape-check arbitration toggle.
+# ---------------------------------------------------------------------------
+# Root problem this targets (docs/nx3_size_gate.md §4): the HSV connected-
+# component mask often MERGES the true target with an adjacent same-hue
+# distractor/wall region into one 2-D-contiguous blob (e.g. ep1's cyan cube
+# fused with the cyan-tinted wall into one 74x10px stripe; ep13's target ball
+# fused with a wall region behind it) -- NX-3's physical-size gate could not
+# separate these merged blobs from ep0/ep2/ep5's pure-false stripes because,
+# once merged, they occupy the exact same implausible-size range. Splitting
+# the component BEFORE size-checking (by depth continuity -- a real object's
+# surface is one continuous depth cluster; a merged target+wall region is
+# two, separated by the physical gap between them) fixes the false premise:
+# after splitting, the true target's own sub-blob should read a plausible
+# size while the merged-in wall fragment does not.
+GROUND_SPLIT = _env_flag("GROUND_SPLIT")   # depth-guided blob splitting + re-selection
+GROUND_SHAPE = _env_flag("GROUND_SHAPE")   # secondary: circle-fill shape arbitration (needs GROUND_SPLIT)
+
+# Depth-histogram clustering constants for the split (docs/nx4_depth_split.md
+# §1): a component's valid-depth pixels are histogrammed at GROUND_SPLIT_BIN_M
+# resolution; a run of empty bins spanning >= GROUND_SPLIT_GAP_M is treated as
+# a genuine physical gap between two distinct objects (task brief: 0.4-0.6m).
+GROUND_SPLIT_BIN_M       = 0.15   # metres, histogram bin width
+GROUND_SPLIT_GAP_M       = 0.5    # metres, minimum empty-bin run to call a split
+GROUND_SPLIT_MIN_SAMPLES = 12     # minimum valid-depth pixels before attempting a split
+                                   # (too few samples -> clustering is unreliable noise;
+                                   # conservative no-op, matches _reject_depth_outliers'
+                                   # own size<4 no-op precedent just above)
+GROUND_SPLIT_MIN_PIECE_PX = 25    # minimum pixel count to keep a split-off sub-blob
+                                   # (below MIN_BLOB_AREA=40 deliberately -- a genuine
+                                   # small/distant true-target fragment surviving a split
+                                   # should not be thrown away by a floor tuned for
+                                   # whole, unsplit blobs; _score_all_contours' own
+                                   # MIN_BLOB_AREA filter still applies afterwards to
+                                   # each split piece's re-extracted contour)
+
+# Re-selection size-plausibility band (docs/nx4_depth_split.md §2): applied to
+# the POST-SPLIT candidate set, independently tunable from LOCK_M6's
+# M6_SIZE_BAND_LO/HI (M6 gates un-split whole blobs; this band screens
+# depth-pure split pieces, which -- per the design brief's own hypothesis --
+# should cluster much more tightly around 1x nominal once merged-in
+# distractor/wall fragments are physically separated out). Calibrated in
+# docs/nx4_depth_split.md against split-candidate diagnostics on demo eps
+# 0/1/2/3/5/6/9/13 + easy (same protocol as NX-3's M6 calibration).
+GROUND_SPLIT_SIZE_LO = 0.08
+GROUND_SPLIT_SIZE_HI = 2.5
+
+
+def _estimate_physical_size(bbox_w_px: float, bbox_h_px: float, depth_m: float,
+                            fx: float, fy: float) -> tuple:
+    """
+    Back-project a pixel bbox extent to physical (width_m, height_m) at the
+    blob's own median depth, via the pinhole relation real_size = pixel_size *
+    depth / focal_length. Exact for a fronto-parallel object centred on the
+    principal axis; a reasonable plausibility-banding approximation otherwise
+    (off-axis/oblique viewing shrinks the apparent size somewhat -- exactly why
+    the band below is generous, not a tight tolerance). Returns (0.0, 0.0) for
+    degenerate inputs (never used to silently pass a bad detection -- callers
+    treat (0,0) as "could not evaluate", see _physical_size_plausible's fail-open).
+    """
+    if fx <= 0 or fy <= 0 or depth_m <= 0:
+        return 0.0, 0.0
+    return bbox_w_px * depth_m / fx, bbox_h_px * depth_m / fy
+
+
+def _physical_size_plausible(bbox: tuple, depth_m: float, target_shape: str,
+                             intrinsics: dict, img_w: int, img_h: int,
+                             margin_l_px: int, margin_r_px: int, margin_b_px: int,
+                             *, lo: float = M6_SIZE_BAND_LO, hi: float = M6_SIZE_BAND_HI
+                             ) -> tuple:
+    """
+    Returns (plausible: bool, phys_w_m: float, phys_h_m: float).
+
+    `lo`/`hi` default to M6's calibrated band but are overridable so the
+    NX-4 split-candidate re-selection path (docs/nx4_depth_split.md) can use
+    its own, independently-calibrated GROUND_SPLIT_SIZE_LO/HI band on
+    depth-pure split pieces without disturbing LOCK_M6's whole-blob gate.
+
+    Fails OPEN (plausible=True) for unknown shapes or degenerate inputs -- this
+    gate should never be the reason a legitimate, recognised-shape detection is
+    rejected due to a missing lookup or a zero/negative depth, only due to an
+    actual measured size mismatch.
+
+    Per-axis decision rule (Config F, calibrated in docs/nx3_size_gate.md):
+      - UNCLIPPED axis: both bounds enforced (LO <= ratio <= HI).
+      - CLIPPED axis (bbox touches the usable-region edge on that axis --
+        left/right for width; bottom OR top for height): the LOWER bound is
+        always skipped (partial visibility truncates the measured extent, e.g.
+        a bottom-clipped tall cone on the proximity cam reads too SHORT -- that
+        must not count against it; required by the task brief). The UPPER bound
+        is still enforced when depth_m >= M6_NEAR_DEPTH_M: clipping can only
+        make a blob's measured extent SMALLER than its true extent, so
+        "measured > HI" is definitive evidence of an implausibly large object
+        regardless of clipping. Below M6_NEAR_DEPTH_M the clipped axis is fully
+        exempt (near-field depth estimates are unreliable -- see the
+        M6_NEAR_DEPTH_M constant comment for the measured evidence).
+    """
+    x, y, w, h = bbox
+    phys_w, phys_h = _estimate_physical_size(
+        w, h, depth_m, intrinsics.get('fx', 0.0), intrinsics.get('fy', 0.0))
+
+    nominal = NOMINAL_DIMS_M.get(str(target_shape).lower().strip())
+    if nominal is None or phys_w <= 0.0 or phys_h <= 0.0:
+        return True, phys_w, phys_h
+
+    nominal_w, nominal_h = nominal
+    touches_bottom = (y + h) >= (img_h - margin_b_px - 1)
+    touches_top    = y <= 1
+    touches_lr     = (x <= margin_l_px + 1) or ((x + w) >= (img_w - margin_r_px - 1))
+    far            = depth_m >= M6_NEAR_DEPTH_M
+
+    def _axis_ok(phys: float, nominal_sz: float, clipped: bool) -> bool:
+        if clipped:
+            return (phys <= nominal_sz * hi) if far else True
+        return nominal_sz * lo <= phys <= nominal_sz * hi
+
+    width_ok  = _axis_ok(phys_w, nominal_w, touches_lr)
+    height_ok = _axis_ok(phys_h, nominal_h, touches_bottom or touches_top)
+    return (width_ok and height_ok), phys_w, phys_h
+
+
+# ---------------------------------------------------------------------------
+# NX-4 (docs/nx4_depth_split.md): depth-guided component splitting.
+# ---------------------------------------------------------------------------
+def _histogram_depth_clusters(depth_vals: np.ndarray, bin_m: float = GROUND_SPLIT_BIN_M,
+                              gap_m: float = GROUND_SPLIT_GAP_M) -> list:
+    """
+    Cluster a 1-D array of depth samples into contiguous-occupancy runs in a
+    fine histogram, merging runs separated by a zero-bin gap SHORTER than
+    gap_m (i.e. only a genuine >= gap_m physical gap in the data counts as a
+    split point). Returns a list of (lo_m, hi_m) tuples, sorted ascending,
+    covering every input sample exactly once (no overlaps, no gaps skipped).
+    A single-element result means "one depth-consistent population" (no
+    split warranted).
+    """
+    if depth_vals.size == 0:
+        return []
+    lo, hi = float(depth_vals.min()), float(depth_vals.max())
+    if hi - lo < gap_m:
+        return [(lo, hi)]
+    nbins = max(1, int(math.ceil((hi - lo) / bin_m)))
+    hist, edges = np.histogram(depth_vals, bins=nbins, range=(lo, hi))
+    gap_bins = max(1, int(math.ceil(gap_m / bin_m)))
+
+    occupied = hist > 0
+    runs = []  # [start_bin, end_bin_inclusive]
+    i = 0
+    while i < nbins:
+        if not occupied[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < nbins and occupied[j + 1]:
+            j += 1
+        runs.append([i, j])
+        i = j + 1
+    if not runs:
+        return []
+
+    merged = [runs[0]]
+    for r in runs[1:]:
+        prev = merged[-1]
+        zero_gap = r[0] - prev[1] - 1
+        if zero_gap < gap_bins:
+            prev[1] = r[1]
+        else:
+            merged.append(r)
+
+    return [(float(edges[s]), float(edges[e + 1])) for s, e in merged]
+
+
+def _split_component_by_depth(comp_mask: np.ndarray, depth_map: np.ndarray,
+                              min_depth: float, max_depth: float,
+                              bin_m: float = GROUND_SPLIT_BIN_M,
+                              gap_m: float = GROUND_SPLIT_GAP_M,
+                              min_samples: int = GROUND_SPLIT_MIN_SAMPLES,
+                              min_piece_px: int = GROUND_SPLIT_MIN_PIECE_PX) -> list:
+    """
+    Split a single connected HSV-mask component into depth-consistent
+    sub-masks. Returns a list of boolean masks (same shape as comp_mask); a
+    length-1 list `[comp_mask]` means "no split" (either < 2 depth clusters
+    found, or too few valid-depth samples to trust clustering at all --
+    conservative no-op in every ambiguous case).
+
+    Pixels with a valid depth reading are assigned to the nearest depth
+    cluster unambiguously (clusters partition the observed depth range with
+    no overlap, by construction of `_histogram_depth_clusters`). Pixels
+    WITHOUT a valid depth reading (occluded / out of [min_depth, max_depth])
+    are assigned to the cluster of their nearest assigned neighbour in 2-D
+    image space (task brief: "keep them with their 2D neighbours' mode"),
+    via `scipy.ndimage.distance_transform_edt`'s nearest-index return; if
+    scipy is unavailable those pixels are simply left out of every sub-mask
+    (safe no-op -- they contribute to no candidate's area/bbox either way).
+    """
+    ys, xs = np.where(comp_mask)
+    if ys.size == 0:
+        return [comp_mask]
+    depths = depth_map[ys, xs]
+    valid = np.isfinite(depths) & (depths > min_depth) & (depths < max_depth)
+    if int(valid.sum()) < min_samples:
+        return [comp_mask]
+
+    clusters = _histogram_depth_clusters(depths[valid], bin_m, gap_m)
+    if len(clusters) < 2:
+        return [comp_mask]
+
+    edges_hi = np.array([c[1] for c in clusters])
+
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    local_mask  = comp_mask[y0:y1, x0:x1]
+    local_depth = depth_map[y0:y1, x0:x1]
+    ly, lx = np.where(local_mask)
+    ld = local_depth[ly, lx]
+    lvalid = np.isfinite(ld) & (ld > min_depth) & (ld < max_depth)
+
+    label = np.full(local_mask.shape, -1, dtype=np.int32)
+    vld = ld[lvalid]
+    cluster_idx = np.clip(np.searchsorted(edges_hi, vld, side='left'), 0, len(clusters) - 1)
+    label[ly[lvalid], lx[lvalid]] = cluster_idx
+
+    unassigned = local_mask & (label == -1)
+    if unassigned.any() and (label >= 0).any():
+        try:
+            from scipy import ndimage
+            _, indices = ndimage.distance_transform_edt(
+                label == -1, return_distances=True, return_indices=True)
+            propagated = label[tuple(indices)]
+            label = np.where(unassigned, propagated, label)
+        except Exception:
+            pass   # leave those pixels unassigned (dropped from every sub-mask)
+
+    sub_masks = []
+    for c in range(len(clusters)):
+        piece = (label == c) & local_mask
+        if int(piece.sum()) < min_piece_px:
+            continue
+        full = np.zeros_like(comp_mask)
+        full[y0:y1, x0:x1] = piece
+        sub_masks.append(full)
+
+    if len(sub_masks) < 2:
+        return [comp_mask]
+    return sub_masks
+
+
+def _split_contours_by_depth(contours: list, mask_shape: tuple, ego_depth: np.ndarray,
+                             min_depth: float, max_depth: float) -> list:
+    """
+    Expand each input HSV-mask contour into one or more depth-consistent
+    sub-contours (docs/nx4_depth_split.md §1). Components that are already
+    depth-pure, or too small to safely judge, pass through unchanged as a
+    single-element result. Purely a candidate-set EXPANSION -- scoring and
+    selection happen downstream exactly as before, now over the (possibly
+    larger) candidate list.
+    """
+    out = []
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < GROUND_SPLIT_MIN_PIECE_PX:
+            continue   # never a viable candidate either way; skip cheaply
+        comp_mask = np.zeros(mask_shape, dtype=np.uint8)
+        cv2.drawContours(comp_mask, [cnt], -1, 255, cv2.FILLED)
+        pieces = _split_component_by_depth(comp_mask > 0, ego_depth, min_depth, max_depth)
+        if len(pieces) == 1:
+            out.append(cnt)
+            continue
+        for piece in pieces:
+            piece_u8 = piece.astype(np.uint8) * 255
+            sub_contours, _ = cv2.findContours(piece_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for sc in sub_contours:
+                if float(cv2.contourArea(sc)) >= GROUND_SPLIT_MIN_PIECE_PX:
+                    out.append(sc)
+    return out
+
+
+def _quick_candidate_depth(cnt: np.ndarray, mask_shape: tuple, ego_depth: np.ndarray,
+                           min_depth_eff: float, max_depth_m: float,
+                           erosion_iter: int = EROSION_ITER) -> tuple:
+    """
+    Cheap per-candidate median depth for the NX-4 re-selection pass (a
+    lighter-weight version of the main pipeline's erode-then-median step,
+    run once per split candidate rather than once per accepted detection).
+    Returns (depth_m_or_None, blob_mask_uint8). None depth means "too few
+    valid-depth pixels to trust" -- caller treats that candidate as
+    NOT size-plausible (conservative; never lets an unverifiable candidate
+    win over a verified-plausible one).
+    """
+    blob_mask = np.zeros(mask_shape, dtype=np.uint8)
+    cv2.drawContours(blob_mask, [cnt], -1, 255, cv2.FILLED)
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    eroded  = cv2.erode(blob_mask, erode_k, iterations=erosion_iter)
+    depth_vals = ego_depth[eroded > 0]
+    valid = depth_vals[(depth_vals > min_depth_eff) & (depth_vals < max_depth_m)]
+    if len(valid) < MIN_VALID_DEPTH_PX:
+        return None, blob_mask
+    return float(np.median(valid)), blob_mask
+
+
+def _circle_fill_score(cnt: np.ndarray) -> float:
+    """
+    GROUND_SHAPE (docs/nx4_depth_split.md §3): contour area / minimum-
+    enclosing-circle area. A true ball's silhouette IS (approximately) a
+    circle, so this ratio sits close to 1.0; a cube's silhouette is a
+    quadrilateral inscribed in its own bounding circle, so the ratio sits
+    well below 1.0 (a square inscribed in a circle covers exactly 2/pi =
+    0.6366 of it). Used only to arbitrate a same-color ball-vs-cube twin
+    (e.g. ep12's cyan ball distractor vs the cyan cube target) when BOTH
+    candidates already passed the size-plausibility band -- see the
+    `GROUND_SHAPE` arbitration block in `ground()`.
+    """
+    area = float(cv2.contourArea(cnt))
+    (_, _), r = cv2.minEnclosingCircle(cnt)
+    circ_area = math.pi * r * r
+    if circ_area < 1e-6:
+        return 0.0
+    return float(min(1.0, area / circ_area))
 
 
 # ---------------------------------------------------------------------------
@@ -513,10 +920,292 @@ class GroundingResult:
     # w*h would not have reliably distinguished the two populations (verified
     # numerically, see docs/nx2_impl.md).
     best_area:   Optional[float]      = field(default=None, repr=False)
+    # NX-3 (docs/nx3_size_gate.md M6): the accepted blob's back-projected physical
+    # width/height in metres (pinhole: pixel_extent * depth / focal -- see
+    # _estimate_physical_size). Purely additive fields (default None, always passed
+    # by keyword at the call sites below) -- populated whenever a blob reaches the
+    # point in ground() where depth_m/bbox are known, REGARDLESS of whether LOCK_M6
+    # is on (so calibration/diagnostic callers can read result.phys_w/phys_h off any
+    # ordinary ground() call without needing to enable the gate or monkeypatch
+    # internals -- this is what docs/nx3_size_gate.md's calibration step relies on).
+    phys_w:      Optional[float]      = field(default=None, repr=False)
+    phys_h:      Optional[float]      = field(default=None, repr=False)
+    # NX-4 (docs/nx4_depth_split.md): split/re-selection diagnostics. Purely
+    # additive (default None); only populated when GROUND_SPLIT=1 -- with the
+    # toggle off, `ground()` never runs the split/re-selection code path at
+    # all, so these stay None and there is zero added cost (same "toggle OFF
+    # is provably inert" property as LOCK_M6's phys_w/phys_h fields, which
+    # ARE always populated because that computation is unconditionally cheap;
+    # this one is gated because the split pass itself is the thing being
+    # toggled).
+    n_raw_components: Optional[int]   = field(default=None, repr=False)  # contours before split
+    n_candidates:      Optional[int]  = field(default=None, repr=False)  # candidates after split
+    split_reselected:  Optional[bool] = field(default=None, repr=False)  # winner != naive top-score pick
+    size_plausible:    Optional[bool] = field(default=None, repr=False)  # winner passed GROUND_SPLIT_SIZE band
 
     @property
     def goal_vec(self) -> np.ndarray:
         return np.array([self.dist, self.cos_th, self.sin_th], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# NX-6 INTEGRATION (docs/nx6_judge.md, docs/nx6_train_heatmap.md): alternative
+# learned-grounding backend -- the query-conditioned heatmap detector NX-6 JUDGE
+# selected (`runs/nx6_heatmap_A/model_best.pt`), swapped in for the classical
+# HSV+depth pipeline above when GROUND_NET=1 (default OFF). Same
+# (dist,bearing)+confidence contract (GroundingResult) as the classical path, fed
+# the SAME active-camera RGBD frame any given call site already rendered this
+# cycle (grounding cam far / proximity cam near -- the detector was trained on
+# both, docs/nx6_data.md), and the query is built from the SAME
+# (target_color, target_shape) instruction-target spec every call site already
+# threads through ground()'s existing signature. Dispatch happens INSIDE
+# ground() itself (see the top of the function below), so every caller
+# (code/inferencer.py, code/eval_search.py, code/fancy_demo.py) picks this up
+# with zero call-site changes. code/lock_mgmt.py's M1/M3 lock-management hygiene
+# sits entirely downstream of ground()'s return value and is backend-agnostic by
+# construction -- it applies unchanged on top of this backend too (M1's area
+# floor becomes a no-op pass-through for GROUND_NET detections specifically,
+# since the network has no pixel-blob-area concept and GroundingResult.best_area
+# is left None for it -- see gate_detection()'s `area is not None` check; M3's
+# bearing/distance innovation gate is unaffected either way).
+# ---------------------------------------------------------------------------
+# NX-7 FIX B: reuse code/lock_mgmt.py's M3 innovation-gate constants + angle-diff
+# helper for the hysteresis spatial-continuity check below (imported, not
+# duplicated -- stays in sync with M3's own gate by construction). No
+# circular import: lock_mgmt.py only imports from code.scan_sched.
+from code.lock_mgmt import (
+    _ang_diff_rad,
+    M3_GATE_BEARING_DEG as _M3_GATE_BEARING_DEG,
+    M3_GATE_BEARING_NEAR_MULT as _M3_GATE_BEARING_NEAR_MULT,
+    M3_NEAR_RANGE_M as _M3_NEAR_RANGE_M,
+    M3_GATE_DIST_FLOOR_M as _M3_GATE_DIST_FLOOR_M,
+    M3_GATE_DIST_CLOSING_MULT as _M3_GATE_DIST_CLOSING_MULT,
+    M3_EXPECTED_CLOSING_M_PER_CYCLE as _M3_EXPECTED_CLOSING_M_PER_CYCLE,
+)
+
+# NX-9 ADOPTION (docs/nx9_avoid.md §5): default ON. With AVOID resolving the
+# ep1 obstacle-collision break that blocked NX-6/NX-7/NX-8's adoption attempts,
+# demo under GROUND_NET=1 AVOID=1 scores 13/15 (>= the 13/15 adoption bar; the
+# two remaining fails are the documented honest ep2/ep4 failures,
+# docs/fa1_failures.md), with easy 15/15 and search 14/15 already gated clean
+# for this backend by docs/nx6_final.md. Ships with a graceful classical
+# fallback when the checkpoint is missing (see ground()'s dispatch below --
+# the deploy repo ships no weights). Opt out with GROUND_NET=0.
+GROUND_NET = _env_flag("GROUND_NET", default="1")   # ADOPTED default ON (docs/nx9_avoid.md)
+GROUND_NET_CKPT = os.environ.get(
+    "GROUND_NET_CKPT",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "runs", "nx6_heatmap_A", "model_best.pt"))
+# NX-6 JUDGE's decided deploy operating point (docs/nx6_judge.md §1.2/§1.3/§6):
+# the val-selected tau=0.59, NOT the looser failcase-only-swept tau=0.29 that
+# training doc's headline ep5/ep12 numbers used -- tau=0.59 is the one that
+# should gate/ship (0.29 has a boundary-frame echo artifact tau=0.59 does not).
+GROUND_NET_TAU    = float(os.environ.get("GROUND_NET_TAU", "0.59"))
+GROUND_NET_DEVICE = os.environ.get("GROUND_NET_DEVICE", "cuda")
+
+# NX-7 FIX B (docs/nx7_adoption.md): acquire/track hysteresis, opt-in, default
+# OFF. tau_acquire stays GROUND_NET_TAU=0.59 (unchanged -- protects precision
+# for a FRESH lock); while the immediately-PRIOR cycle's accepted detection
+# ("track" state, reset per grounding call sequence -- see
+# _ground_net_track_reset()) is available, a marginal continuation detection
+# down to GROUND_NET_TAU_TRACK is accepted IF it is spatially continuous with
+# that track state, gated by the SAME bearing/distance innovation-gate
+# constants code/lock_mgmt.py's M3 uses downstream (imported directly, not
+# duplicated) -- approximates "M3's existing gate" without threading LockGate
+# state into ground()'s call signature (keeps the zero-call-site-change
+# contract every caller relies on). Track state is intentionally SEPARATE
+# from LockGate's own incumbent -- this hysteresis operates one layer below
+# M1/M3, at the raw-detection-acceptance boundary.
+GROUND_NET_HYSTERESIS = _env_flag("GROUND_NET_HYSTERESIS")   # opt-in, default OFF
+GROUND_NET_TAU_TRACK  = float(os.environ.get("GROUND_NET_TAU_TRACK", "0.40"))
+
+_ground_net_detector    = None     # lazy-loaded singleton (checkpoint loads once per process)
+_ground_net_load_failed = False    # sticky: don't retry a load every cycle after a failure
+_ground_net_class_names = None     # populated on first successful load (nx6_heatmap_model.CLASS_NAMES)
+_ground_net_color_names = None     # populated on first successful load (nx6_heatmap_model.COLOR_NAMES)
+_ground_net_widefov_warned = False # one-shot warning: widefov cam_type is untested/unsupported
+_ground_net_fallback_warned = False  # NX-9: one-shot notice for the ckpt-missing classical fallback
+_GROUND_NET_LAT_MS: list = []      # per-cycle inference latency (ms), module-level log
+
+# NX-7 FIX B track state (dist_m, bearing_rad) of the last ACCEPTED detection
+# (via either tau_acquire or tau_track+continuity) -- None when no track is
+# live. Must be reset at the start of every episode (see
+# reset_ground_net_track()) to avoid one episode's last detection spuriously
+# validating an unrelated low-confidence blob at the start of the next
+# episode in the same long-lived eval process.
+_ground_net_track_dist_m     = None
+_ground_net_track_bearing_rad = None
+
+
+def reset_ground_net_track() -> None:
+    """Clear NX-7 FIX B's hysteresis track state. Callers should invoke this
+    once at the start of every episode (before the first ground() call) --
+    same pattern as constructing a fresh code.lock_mgmt.LockGate() per
+    episode. A no-op (cheap) when GROUND_NET_HYSTERESIS is off."""
+    global _ground_net_track_dist_m, _ground_net_track_bearing_rad
+    _ground_net_track_dist_m      = None
+    _ground_net_track_bearing_rad = None
+
+
+def _get_ground_net_detector():
+    """Lazy global load of the NX-6 heatmap detector checkpoint. Loaded once per
+    process (not per call/episode); subsequent calls return the cached instance
+    (or None, sticky, if the first load failed -- avoids retry-storming a bad
+    checkpoint path every grounding cycle). Import of code.nx6_heatmap_model is
+    deliberately deferred to inside this function (rather than a module-level
+    import in grounding.py) because nx6_heatmap_model.py itself imports FROM
+    code.grounding (get_ego_intrinsics_rendered, cam_to_egocentric) -- a
+    module-level import here would be a circular import; deferring it until
+    first GROUND_NET=1 use (well after this module has finished initializing)
+    sidesteps that entirely.
+    """
+    global _ground_net_detector, _ground_net_load_failed
+    global _ground_net_class_names, _ground_net_color_names
+    if _ground_net_detector is not None or _ground_net_load_failed:
+        return _ground_net_detector
+    try:
+        import torch
+        from code.nx6_heatmap_model import HeatmapDetector, CLASS_NAMES, COLOR_NAMES
+        _ground_net_class_names = CLASS_NAMES
+        _ground_net_color_names = COLOR_NAMES
+        device = GROUND_NET_DEVICE if (GROUND_NET_DEVICE == "cpu" or torch.cuda.is_available()) else "cpu"
+        _ground_net_detector = HeatmapDetector.load(GROUND_NET_CKPT, device=device)
+        print(f"[grounding] GROUND_NET=1: loaded detector {GROUND_NET_CKPT!r} "
+              f"on device={device!r} (conf_thresh={GROUND_NET_TAU})", flush=True)
+    except Exception as e:
+        _ground_net_load_failed = True
+        print(f"[grounding] GROUND_NET=1: FAILED to load detector from "
+              f"{GROUND_NET_CKPT!r} ({e!r}) -- ground() will fall back to the "
+              f"classical HSV+depth pipeline for the rest of this process "
+              f"(NX-9 graceful fallback, docs/nx9_avoid.md).", flush=True)
+    return _ground_net_detector
+
+
+def ground_net_latency_stats() -> dict:
+    """Summary stats (ms) over every GROUND_NET inference call made so far in
+    this process: n, mean_ms, p50_ms, p95_ms, p99_ms, max_ms. Empty dict if
+    GROUND_NET was never invoked. Diagnostic helper for smoke tests / gate runs
+    to report latency alongside the closed-loop success metrics."""
+    if not _GROUND_NET_LAT_MS:
+        return {}
+    xs = sorted(_GROUND_NET_LAT_MS)
+    n = len(xs)
+
+    def _pct(p):
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return xs[idx]
+
+    return dict(n=n, mean_ms=sum(xs) / n, p50_ms=_pct(0.50), p95_ms=_pct(0.95),
+                p99_ms=_pct(0.99), max_ms=xs[-1])
+
+
+def _ground_net(ego_rgb: np.ndarray, ego_depth: np.ndarray, target_color: str,
+                target_shape: str, intrinsics: dict) -> GroundingResult:
+    """GROUND_NET=1 backend: the NX-6 JUDGE-selected query-conditioned heatmap
+    detector, in place of the classical HSV+depth pipeline. Same
+    (dist,bearing)+confidence contract as ground()'s classical path. Fed
+    whichever camera's frame the caller already rendered this cycle
+    (grounding-cam-far vs proximity-cam-near, selected via
+    intrinsics['is_proximity'] -- the SAME flag the classical path reads).
+    """
+    global _ground_net_widefov_warned
+    import time as _time
+
+    det = _get_ground_net_detector()
+    if det is None:
+        return GroundingResult(0, 1, 0, 0.0, True)
+
+    shape_key = str(target_shape).lower().strip()
+    color_key = str(target_color).lower().strip()
+    if (_ground_net_class_names is None or shape_key not in _ground_net_class_names
+            or color_key not in _ground_net_color_names):
+        # Query outside the detector's trained vocabulary -- fail safe to
+        # not_visible rather than raising or silently guessing. Never actually
+        # observed in this codebase: target_shape/target_color always come
+        # straight from arena.SHAPES/COLORS, the SAME ordering/name-set
+        # dataset/det_v1's labels (and this detector's CLASS_NAMES/COLOR_NAMES)
+        # were built from -- see nx6_heatmap_model.py's module comment.
+        return GroundingResult(0, 1, 0, 0.0, True)
+
+    is_proximity = bool(intrinsics.get('is_proximity', False))
+    is_widefov   = bool(intrinsics.get('is_widefov', False))
+    if is_widefov and not _ground_net_widefov_warned:
+        _ground_net_widefov_warned = True
+        print("[grounding] GROUND_NET=1: widefov camera requested but the "
+              "detector was only trained/validated on {grounding,proximity} "
+              "cam_type geometry (docs/nx6_data.md) -- falling back to "
+              "'grounding' pitch geometry. CAMERA_MODE=widefov combined with "
+              "GROUND_NET=1 is an untested combination (out of scope for the "
+              "NX-6 integration gate, which ran with no CAMERA_MODE set).",
+              flush=True)
+    cam_type = "proximity" if is_proximity else "grounding"
+
+    t0 = _time.perf_counter()
+    try:
+        # NX-7 FIX B: always decode at conf_thresh=0.0 so `out['confidence']` is
+        # the model's TRUE raw peak sigmoid probability every cycle (present or
+        # not) -- nx6_heatmap_model.decode_single already computes `confidence`
+        # unconditionally and only thresholds `present` separately, so this is
+        # free (no extra forward pass); we just do our own thresholding below
+        # instead of trusting det.infer()'s built-in `present` when hysteresis
+        # is enabled, so the tau_track path can see it.
+        out = det.infer(ego_rgb, ego_depth, class_name=shape_key, color_name=color_key,
+                        cam_type=cam_type,
+                        conf_thresh=(0.0 if GROUND_NET_HYSTERESIS else GROUND_NET_TAU))
+    except Exception as e:
+        print(f"[grounding] GROUND_NET=1: infer() raised {e!r} this cycle -- "
+              f"treating as not_visible.", flush=True)
+        return GroundingResult(0, 1, 0, 0.0, True)
+    dt_ms = (_time.perf_counter() - t0) * 1000.0
+    _GROUND_NET_LAT_MS.append(dt_ms)
+
+    conf    = float(out['confidence'])
+    dist    = max(0.0, float(out['dist_m']))
+    yaw_err = math.radians(float(out['bearing_deg']))
+
+    accepted = conf >= GROUND_NET_TAU   # tau_acquire -- unchanged, always the fast path
+    accept_reason = 'acquire'
+
+    if not accepted and GROUND_NET_HYSTERESIS and conf >= GROUND_NET_TAU_TRACK:
+        # tau_track continuation: only valid while a track is live AND the new
+        # (dist,bearing) is spatially continuous with it, gated by the SAME
+        # M3 innovation-gate constants code/lock_mgmt.py uses downstream (kept
+        # in sync by import, not duplicated).
+        global _ground_net_track_dist_m, _ground_net_track_bearing_rad
+        if _ground_net_track_dist_m is not None:
+            near = _ground_net_track_dist_m < _M3_NEAR_RANGE_M
+            bearing_gate_rad = math.radians(
+                _M3_GATE_BEARING_DEG * (_M3_GATE_BEARING_NEAR_MULT if near else 1.0))
+            dist_gate_m = max(_M3_GATE_DIST_FLOOR_M,
+                               _M3_EXPECTED_CLOSING_M_PER_CYCLE * _M3_GATE_DIST_CLOSING_MULT)
+            d_bearing = abs(_ang_diff_rad(yaw_err, _ground_net_track_bearing_rad))
+            d_dist    = abs(dist - _ground_net_track_dist_m)
+            if d_bearing <= bearing_gate_rad and d_dist <= dist_gate_m:
+                accepted = True
+                accept_reason = 'track'
+
+    if not accepted:
+        return GroundingResult(0, 1, 0, 0.0, True)
+
+    if GROUND_NET_HYSTERESIS:
+        _ground_net_track_dist_m      = dist
+        _ground_net_track_bearing_rad = yaw_err
+
+    return GroundingResult(
+        dist        = dist,
+        cos_th      = math.cos(yaw_err),
+        sin_th      = math.sin(yaw_err),
+        confidence  = conf,
+        not_visible = False,
+        # best_area / phys_w / phys_h / n_raw_components / ... intentionally
+        # left None: those are classical-pipeline-specific diagnostics with no
+        # analogue for a learned heatmap detection. See gate_detection()'s
+        # `area is not None` check -- this makes LOCK_M1 a provable no-op for
+        # GROUND_NET detections specifically (by design: the network's own
+        # conf_thresh already serves the "is this detection trustworthy"
+        # role M1's area floor serves for the classical pipeline), while
+        # LOCK_M3's bearing/distance innovation gate is unaffected.
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +1236,34 @@ def ground(
     -------
     GroundingResult
     """
+    # NX-6 INTEGRATION (default ON since NX-9 adoption, docs/nx9_avoid.md §5):
+    # GROUND_NET swaps in the learned heatmap detector in place of everything
+    # below, dispatched right here so every existing caller (inferencer.py,
+    # eval_search.py, fancy_demo.py) gets the alternative backend with zero
+    # call-site changes. `return_mask` has no analogue for the learned backend
+    # (no HSV mask exists) and is ignored there.
+    #
+    # NX-9 graceful classical fallback: if the detector checkpoint is missing
+    # or fails to load (the deploy repo ships NO weights), fall through to the
+    # classical HSV+depth pipeline below instead of returning not_visible
+    # forever (the pre-adoption sticky-failure behavior, which was safe for an
+    # opt-in flag but would brick a default-ON deploy without weights). The
+    # fallback decision is per-process (load failure is sticky in
+    # _get_ground_net_detector()) and announced once, clearly, at first use.
+    if GROUND_NET:
+        _det = _get_ground_net_detector()
+        if _det is not None:
+            return _ground_net(ego_rgb, ego_depth, target_color, target_shape, intrinsics)
+        # else: one-shot warning already printed by _get_ground_net_detector()
+        # / the fallback notice below; continue into the classical pipeline.
+        global _ground_net_fallback_warned
+        if not _ground_net_fallback_warned:
+            _ground_net_fallback_warned = True
+            print("[grounding] GROUND_NET detector unavailable (checkpoint "
+                  f"missing or failed to load: {GROUND_NET_CKPT!r}) -- "
+                  "FALLING BACK to the classical HSV+depth grounding pipeline "
+                  "for the rest of this process.", flush=True)
+
     color_key = target_color.lower().strip()
     if color_key not in HSV_BOUNDS:
         return GroundingResult(0, 1, 0, 0.0, True)
@@ -611,6 +1328,20 @@ def ground(
         return GroundingResult(0, 1, 0, 0.0, True,
                                mask=(mask if return_mask else None))
 
+    # ---- NX-4 (docs/nx4_depth_split.md): depth-guided blob splitting ----
+    # Expand each connected HSV component into depth-consistent sub-components
+    # BEFORE scoring/selection, so a merged true-target+wall stripe becomes two
+    # separate candidates instead of one implausibly-shaped/sized blob. No-op
+    # (contours unchanged) for every component that is already depth-pure, and
+    # entirely inert when the toggle is off.
+    n_raw_components = len(contours)
+    if GROUND_SPLIT:
+        contours = _split_contours_by_depth(contours, mask.shape, ego_depth,
+                                            min_depth_eff, MAX_DEPTH_M)
+        if not contours:
+            return GroundingResult(0, 1, 0, 0.0, True,
+                                   mask=(mask if return_mask else None))
+
     # ---- Select best blob (V5: shape-discriminating composite score) ----
     # When multiple same-color blobs exist (distractors), we pick the one whose
     # contour geometry best matches the instructed shape (ball/cube/cylinder/cone).
@@ -622,7 +1353,54 @@ def ground(
         return GroundingResult(0, 1, 0, 0.0, True,
                                mask=(mask if return_mask else None))
 
-    best_score, best_cnt = scored_contours[0]
+    # ---- NX-4 §2: component re-selection on the (possibly split) candidate
+    # set -- prefer size-plausible candidates over implausible ones; among
+    # plausible candidates (or when nothing is plausible / toggle is off),
+    # keep the existing composite-score ranking unchanged.
+    chosen_idx        = 0
+    _winning_blob_mask = None
+    split_reselected  = False
+    n_candidates      = len(scored_contours)
+    winner_plausible  = None
+    if GROUND_SPLIT:
+        evaluated = []
+        for idx, (cscore, ccnt) in enumerate(scored_contours):
+            carea = float(cv2.contourArea(ccnt))
+            if carea < MIN_BLOB_AREA:
+                continue
+            cx0, cy0, cw0, ch0 = cv2.boundingRect(ccnt)
+            cdepth, cmask = _quick_candidate_depth(ccnt, mask.shape, ego_depth,
+                                                    min_depth_eff, MAX_DEPTH_M)
+            if cdepth is None:
+                cplausible, cphys_w, cphys_h = False, 0.0, 0.0
+            else:
+                cplausible, cphys_w, cphys_h = _physical_size_plausible(
+                    (cx0, cy0, cw0, ch0), cdepth, target_shape, intrinsics, w_img, h_img,
+                    l_px, r_px, b_px, lo=GROUND_SPLIT_SIZE_LO, hi=GROUND_SPLIT_SIZE_HI)
+            evaluated.append(dict(idx=idx, score=cscore, cnt=ccnt, bbox=(cx0, cy0, cw0, ch0),
+                                  plausible=cplausible, blob_mask=cmask))
+        if evaluated:
+            # GROUND_SHAPE (§3): arbitrate a same-color ball-vs-cube twin ONLY
+            # when >=2 candidates already passed the size-plausibility band --
+            # never used to reject the sole candidate on shape alone.
+            if GROUND_SHAPE:
+                plausible_run = [e for e in evaluated if e['plausible']]
+                shape_key = str(target_shape).lower().strip()
+                if len(plausible_run) >= 2 and shape_key in ("ball", "sphere", "cube", "box"):
+                    target_fill = 0.90 if shape_key in ("ball", "sphere") else 0.68
+                    def _fill_dist(e):
+                        return abs(_circle_fill_score(e['cnt']) - target_fill)
+                    best_shape_pick = min(plausible_run, key=lambda e: (_fill_dist(e), -e['score']))
+                    evaluated = [best_shape_pick] + [e for e in evaluated if e is not best_shape_pick]
+
+            evaluated.sort(key=lambda e: (not e['plausible'], -e['score']))
+            winner = evaluated[0]
+            chosen_idx         = winner['idx']
+            _winning_blob_mask = winner['blob_mask']
+            winner_plausible   = winner['plausible']
+            split_reselected   = (chosen_idx != 0)
+
+    best_score, best_cnt = scored_contours[chosen_idx]
     best_area = float(cv2.contourArea(best_cnt))
 
     if best_cnt is None or best_area < MIN_BLOB_AREA:
@@ -630,8 +1408,11 @@ def ground(
                                mask=(mask if return_mask else None))
 
     # ---- Blob mask and bbox ----
-    blob_mask = np.zeros_like(mask)
-    cv2.drawContours(blob_mask, [best_cnt], -1, 255, cv2.FILLED)
+    if _winning_blob_mask is not None:
+        blob_mask = _winning_blob_mask
+    else:
+        blob_mask = np.zeros_like(mask)
+        cv2.drawContours(blob_mask, [best_cnt], -1, 255, cv2.FILLED)
 
     x, y, w, h = cv2.boundingRect(best_cnt)
     cx_px = x + w / 2.0
@@ -712,6 +1493,19 @@ def ground(
 
         fg_contours, _ = cv2.findContours(fg_mask_u8, cv2.RETR_EXTERNAL,
                                           cv2.CHAIN_APPROX_SIMPLE)
+
+        # NX-4 (docs/nx4_depth_split.md): split each FG-rescue candidate by depth
+        # BEFORE the aspect-ratio pre-filter. The FG-rescue mask (pixels closer
+        # than their local blurred-depth neighbourhood) is exactly where NX-3's
+        # merged true-target+wall-fragment stripes come from -- a "relatively
+        # foreground" pixel population can span both the real object AND an
+        # adjacent wall seam/corner that also happens to read locally-closer.
+        # Splitting first lets a genuinely compact true-target sub-piece survive
+        # even when the raw FG contour was fused with a wider neighbour.
+        if GROUND_SPLIT and fg_contours:
+            fg_contours = _split_contours_by_depth(list(fg_contours), mask.shape, ego_depth,
+                                                    min_depth_eff, MAX_DEPTH_M)
+
         # Pre-filter: reject wall-stripe artifacts (wide+shallow → aspect > 8.0).
         valid_fg = []
         for cnt in fg_contours:
@@ -730,15 +1524,39 @@ def ground(
         # not_visible and robot drift. The primary path (above) handles shape discrimination
         # for non-wall-overlap multi-blob cases. FG rescue falls back to largest-area
         # (V4 behavior) to maximize detection reliability.
+        # NX-4: when GROUND_SPLIT is on and there is an actual choice to make
+        # (>1 survivor), prefer a size-plausible candidate over an implausible
+        # one before falling back to the original area-only tie-break -- still
+        # pure area-only (byte-identical to legacy) whenever the toggle is off
+        # or there is only one candidate (never risks discarding the sole
+        # detection, matching the brief's conservative-arbitration rule).
         fg_best_cnt  = None
         fg_best_area = 0.0
         fg_best_score = 0.0
-        for cnt in valid_fg:
-            a = float(cv2.contourArea(cnt))
-            if a > fg_best_score:
-                fg_best_score = a
-                fg_best_area = a
-                fg_best_cnt = cnt
+        if GROUND_SPLIT and len(valid_fg) > 1:
+            fg_evaluated = []
+            for cnt in valid_fg:
+                a = float(cv2.contourArea(cnt))
+                fx0, fy0, fw0, fh0 = cv2.boundingRect(cnt)
+                fdepth, _fmask = _quick_candidate_depth(cnt, mask.shape, ego_depth,
+                                                        min_depth_eff, MAX_DEPTH_M)
+                if fdepth is None:
+                    fplausible = False
+                else:
+                    fplausible, _, _ = _physical_size_plausible(
+                        (fx0, fy0, fw0, fh0), fdepth, target_shape, intrinsics, w_img, h_img,
+                        l_px, r_px, b_px, lo=GROUND_SPLIT_SIZE_LO, hi=GROUND_SPLIT_SIZE_HI)
+                fg_evaluated.append(dict(cnt=cnt, area=a, plausible=fplausible))
+            fg_evaluated.sort(key=lambda e: (not e['plausible'], -e['area']))
+            fg_best_cnt  = fg_evaluated[0]['cnt']
+            fg_best_area = fg_evaluated[0]['area']
+        else:
+            for cnt in valid_fg:
+                a = float(cv2.contourArea(cnt))
+                if a > fg_best_score:
+                    fg_best_score = a
+                    fg_best_area = a
+                    fg_best_cnt = cnt
 
         if fg_best_cnt is None:
             # Depth-FG rescue also failed — truly not visible
@@ -788,6 +1606,20 @@ def ground(
 
     depth_m = float(np.median(valid))
 
+    # ---- NX-3 M6: physical-size plausibility gate (docs/nx3_size_gate.md) ----
+    # Computed regardless of LOCK_M6 (see GroundingResult.phys_w/phys_h docstring
+    # above -- lets calibration/diagnostic callers read the estimate off any
+    # ordinary ground() call). Only actually REJECTS the detection when LOCK_M6=1.
+    _m6_plausible, _phys_w, _phys_h = _physical_size_plausible(
+        (x, y, w, h), depth_m, target_shape, intrinsics, w_img, h_img,
+        l_px, r_px, b_px)
+    if LOCK_M6 and not _m6_plausible:
+        return GroundingResult(0, 1, 0, 0.0, True,
+                               mask=(blob_mask if return_mask else None),
+                               bbox=(x, y, w, h),
+                               best_area=best_area,
+                               phys_w=_phys_w, phys_h=_phys_h)
+
     # ---- Back-project centroid to 3-D ----
     pt3d    = backproject_pixel(cx_px, cy_px, depth_m, intrinsics)
     # V2: if intrinsics contains 'pitch_deg' (from grounding render), use it.
@@ -820,6 +1652,12 @@ def ground(
         mask        = blob_mask if return_mask else None,
         bbox        = (x, y, w, h),
         best_area   = best_area,
+        phys_w      = _phys_w,
+        phys_h      = _phys_h,
+        n_raw_components = n_raw_components if GROUND_SPLIT else None,
+        n_candidates      = n_candidates if GROUND_SPLIT else None,
+        split_reselected  = split_reselected if GROUND_SPLIT else None,
+        size_plausible    = winner_plausible if GROUND_SPLIT else None,
     )
 
 

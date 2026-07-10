@@ -262,6 +262,7 @@ class SearchResult:
     fell:            bool
     ms_per_step:     float
     video_path:      Optional[str] = None
+    avoid_bias_active_frac: float = 0.0   # NX-9: fraction of grounding cycles with |bias|>0
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +306,8 @@ def _run_search_rollout(
     from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
                                   SCAN_DWELL_STEPS, SCAN_TIMEOUT as _SCAN_TIMEOUT_DEFAULT)
     from code.lock_mgmt import LockGate, ReacquisitionScan
+    from code import avoid as _avoid
+    from code.arena import CAM_HEAD_Z
 
     # --- Extract scene info ---
     objects      = scene_cfg['objects']
@@ -432,18 +435,31 @@ def _run_search_rollout(
     _frames_since_det = 0
     HOLD_GOAL_HORIZON = 100
 
-    # NX-2 (docs/rs1_lock_mgmt.md): shared lock-management gate (LOCK_M1..M5,
-    # independently toggled via env var; M1/M3 default ON (opt-out), M2/M4/M5
-    # default OFF (opt-in) per docs/nx2_final.md -- see code/lock_mgmt.py).
+    # NX-2/NX-5 (docs/rs1_lock_mgmt.md, docs/nx5_coherence.md): shared
+    # lock-management gate (LOCK_M1..M5, LOCK_M7, independently toggled via
+    # env var; M1/M3 default ON (opt-out), M2/M4/M5/M7 default OFF (opt-in)
+    # per docs/nx2_final.md / docs/nx5_coherence.md -- see code/lock_mgmt.py).
     # search has no CAM-2 Schmitt handoff / fallback probe (single grounding
     # camera only), so unlike inferencer.py this call site never calls
-    # `mark_discontinuity()` -- M3/M4 always apply their full gate here.
+    # `mark_discontinuity()` -- M3/M4/M7 always apply their full gate here.
     _lock_gate          = LockGate()
-    _using_rescan_sched = False   # True only while a M4/M5-triggered bounded
+    _using_rescan_sched = False   # True only while a M4/M5/M7-triggered bounded
                                    # rescan (ReacquisitionScan) is driving _scan_active,
                                    # as opposed to the initial BidirectionalScanSchedule
                                    # sweep (_scan_sched) above.
     _rescan_sched        = None
+    # M7 odometry-coherence watchdog: robot's own world-frame XY at the
+    # previous grounding cycle (see code/inferencer.py's identical block for
+    # the full rationale). Always maintained; no-op cost when LOCK_M7 is off.
+    _m7_prev_xy          = None
+
+    # NX-9 AVOID (docs/nx9_avoid.md): same per-episode state / carve-out
+    # pattern as code/inferencer.py -- see that file's identical block for
+    # the full rationale.
+    _avoid_bias_wz       = 0.0
+    _avoid_is_maneuver   = (_avoid.AVOID and _avoid.is_maneuver_scene(scene_cfg))
+    _avoid_cycles_total  = 0
+    _avoid_cycles_active = 0
 
     def _lock_drop_and_rescan():
         """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
@@ -455,6 +471,7 @@ def _run_search_rollout(
         docstring)."""
         nonlocal _goal_ema, _last_known_goal, _frames_since_det
         nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
+        nonlocal _avoid_bias_wz
         _lock_gate.force_drop()
         _goal_ema           = None
         _last_known_goal    = None
@@ -463,6 +480,7 @@ def _run_search_rollout(
         _using_rescan_sched = True
         _rescan_sched       = ReacquisitionScan(scan_rate=SCAN_RATE)
         cached_goal_vec      = np.array([2.0, 1.0, 0.0], dtype=np.float32)
+        _avoid_bias_wz       = 0.0   # NX-9: fresh depth read once normal mode resumes
 
     # Search-specific tracking
     spotted     = False    # set True when scan_active first becomes False
@@ -566,10 +584,51 @@ def _run_search_rollout(
 
             # NX-2 (LOCK_M4): divergence watchdog -- runs once per grounding cycle
             # regardless of hit/miss/gate outcome above. Provable no-op when off.
+            # NX-5 (LOCK_M7, docs/nx5_coherence.md): odometry-coherence watchdog --
+            # see code/inferencer.py's identical block for the projection derivation.
             _walking_toward_goal = (not _scan_active) and (float(cached_goal_vec[0]) > stop_r)
-            if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal):
-                print(f"  [lock] M4 divergence -> drop+rescan at step={step}", flush=True)
+            _m7_proj_disp_m = 0.0
+            _cur_xy = data_mj.qpos[0:2].copy()
+            if _m7_prev_xy is not None:
+                _dxw = float(_cur_xy[0] - _m7_prev_xy[0])
+                _dyw = float(_cur_xy[1] - _m7_prev_xy[1])
+                _cy, _sy = _math.cos(yaw), _math.sin(yaw)
+                _d_body_x =  _dxw * _cy + _dyw * _sy
+                _d_body_y = -_dxw * _sy + _dyw * _cy
+                _m7_proj_disp_m = (_d_body_x * float(cached_goal_vec[1])
+                                    + _d_body_y * float(cached_goal_vec[2]))
+            _m7_prev_xy = _cur_xy
+            if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal,
+                                        _m7_proj_disp_m):
+                reason = 'M4 divergence' if _lock_gate.last_trigger == 'M4' else 'M7 coherence'
+                print(f"  [lock] {reason} -> drop+rescan at step={step}", flush=True)
                 _lock_drop_and_rescan()
+
+            # NX-9 AVOID (docs/nx9_avoid.md): local obstacle avoidance --
+            # same mechanism/carve-outs as code/inferencer.py's identical
+            # block (shared helper, code/avoid.py), reusing this cycle's
+            # already-rendered depth/intr_active (zero extra renders).
+            # Never while `_scan_active`; fresh bias only while the goal is
+            # fresh (<= AVOID_STALE_MAX_MISSED_CYCLES missed cycles), decay
+            # only on a longer stale coast -- see AVOID_STALE_MAX_MISSED_CYCLES'
+            # comment in code/avoid.py for the ep14 fall trace behind this.
+            if _avoid.AVOID and not _avoid_is_maneuver and not _scan_active:
+                _avoid_cycles_total += 1
+                if _frames_since_det > _avoid.AVOID_STALE_MAX_MISSED_CYCLES:
+                    _avoid_bias_wz = _avoid.decay_bias(_avoid_bias_wz)
+                else:
+                    _avoid_goal_dist_now = float(cached_goal_vec[0])
+                    _avoid_goal_bearing_now = _math.atan2(float(cached_goal_vec[2]),
+                                                           float(cached_goal_vec[1]))
+                    _avoid_carved = (_avoid_goal_dist_now < _avoid.AVOID_MIN_GOAL_DIST_M)
+                    _avoid_cam_h = float(data_mj.qpos[2]) + CAM_HEAD_Z
+                    _avoid_bias_wz, _avoid_dbg = _avoid.compute_obstacle_bias(
+                        depth, intr_active, cam_height_m=_avoid_cam_h,
+                        goal_dist_m=_avoid_goal_dist_now,
+                        goal_bearing_rad=_avoid_goal_bearing_now,
+                        prev_bias_wz=_avoid_bias_wz, carved_out=_avoid_carved)
+                if abs(_avoid_bias_wz) > 1e-9:
+                    _avoid_cycles_active += 1
 
         # Scan mode: NX-1 bidirectional bounded-rotation sweep (see setup above).
         # Observable (memoryless per-frame visibility check), WBC-free.
@@ -700,13 +759,25 @@ def _run_search_rollout(
         img_t      = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, dtype=torch.float32, device=inf.device)
         goal_inj_t = torch.from_numpy(cached_goal_vec).unsqueeze(0).to(inf.device)
 
+        # NX-9 AVOID: replace the model's self-predicted velocity with
+        # steer.py's own control law (from cached_goal_vec) plus the bounded
+        # yaw bias, exactly matching code/inferencer.py's injection point --
+        # only when a nonzero bias is active this cycle (provable no-op on
+        # clear paths / when AVOID is off).
+        gt_vel_t = None
+        if _avoid.AVOID and not _avoid_is_maneuver and abs(_avoid_bias_wz) > 1e-9:
+            vel_av = _avoid.biased_vel_cmd(
+                float(cached_goal_vec[0]), float(cached_goal_vec[1]),
+                float(cached_goal_vec[2]), _avoid_bias_wz, stop_r)
+            gt_vel_t = torch.from_numpy(vel_av).unsqueeze(0).to(inf.device)
+
         with torch.no_grad():
             out = inf.model(
                 ego_rgb   = img_t,
                 lang_emb  = lang_t,
                 proprio_h = prop_t,
                 gt_goal   = goal_inj_t,
-                gt_vel    = None,
+                gt_vel    = gt_vel_t,
             )
 
         raw_action = out['action'].cpu().numpy().squeeze(0)[0]
@@ -780,6 +851,8 @@ def _run_search_rollout(
         fell=fell,
         ms_per_step=ms_per_step,
         video_path=out_vid,
+        avoid_bias_active_frac=(_avoid_cycles_active / _avoid_cycles_total
+                                 if _avoid_cycles_total > 0 else 0.0),
     )
 
 
@@ -862,7 +935,8 @@ def evaluate_search(
             print(f"[search_eval] ep={ep_i} EXCEPTION: {e}", flush=True)
             traceback.print_exc()
             raw = dict(success=False, spotted=False, scan_steps=0, failure_tag='error',
-                       steps=0, final_dist=999.0, fell=False, ms_per_step=0.0, video_path=None)
+                       steps=0, final_dist=999.0, fell=False, ms_per_step=0.0, video_path=None,
+                       avoid_bias_active_frac=0.0)
 
         dt = time.time() - t0
         sr = SearchResult(
@@ -882,6 +956,7 @@ def evaluate_search(
             fell             = raw['fell'],
             ms_per_step      = raw['ms_per_step'],
             video_path       = raw.get('video_path'),
+            avoid_bias_active_frac = raw.get('avoid_bias_active_frac', 0.0),
         )
         results.append(sr)
         ep_results.append(asdict(sr))

@@ -61,13 +61,14 @@ sys.path.insert(0, str(_REPO))
 
 from code.small_vla import GroundedNav, DEFAULTS
 from code.arena import (build_arena, ArenaRenderer, EGO_W, EGO_H, EGO_FOVY, get_ego_intrinsics,
-                        GROUNDING_W, GROUNDING_H, CAMERA_MODE)
+                        GROUNDING_W, GROUNDING_H, CAMERA_MODE, CAM_HEAD_Z)
 from code.scene import DIFFICULTY_PRESETS
 from code.grounding import ground as classical_ground, _parse_instruction, get_ego_intrinsics_rendered
 from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
                            NUM_ACTIONS, SIM_DT, CONTROL_DECIMATION, RESET_HEIGHT)
 from code.steer import steer as _steer_cmd
 from code.lock_mgmt import LockGate, ReacquisitionScan
+from code import avoid as _avoid
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -82,6 +83,80 @@ IMG_SIZE           = 128
 HOLD_STEPS_REQUIRED = 5       # consecutive in-range steps to succeed
 ACTION_SCALE       = 0.25     # from teacher.py: target_dof = action * 0.25 + default_angles
 SETTLE_STEPS       = 80       # warm-up steps using teacher (zero cmd)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip() == "1"
+
+
+# ---------------------------------------------------------------------------
+# NX-8 STALL_BREAK (docs/nx8_stall.md): steering-level physical-stall watchdog.
+# ---------------------------------------------------------------------------
+# Root cause this targets (docs/nx7_adoption.md §2): under GROUND_NET=1, demo
+# ep1's robot goes PHYSICALLY STATIC (world-frame (x,y) pinned to a ~0.1m box,
+# `qpos` instrumentation) around step ~250-300 -- ~1000 steps before any
+# hold-goal-horizon-keyed recovery mechanism (M4/M5/M7, all gated on
+# accumulated odometry or elapsed detection-loss time) is even ELIGIBLE to
+# fire, because those mechanisms all require either motion (M7's accumulator)
+# or a long elapsed coasting window (M5) to trigger -- neither is available
+# when the robot isn't moving in the first place. NX-7 confirmed this is a
+# locomotion/policy-level phenomenon (the classical grounder's detections are
+# STILL accurate for the ~200 steps right up to the freeze), consistent with
+# this policy's known BC-history stall/static-collapse attractor
+# (`docs/CAMPAIGN.md` T2/E3 era: "mean-regression on absolute joint targets"
+# gait collapse, later fixed for the general case via residual actions + DART
+# + gait-phase input, but evidently not fully retired for every out-of-
+# distribution goal-signal combination).
+#
+# Detects "commanding forward motion but the robot isn't actually moving"
+# directly at the steering level (independent of WHICH grounding backend is
+# in use -- classical or GROUND_NET -- since this is a locomotion phenomenon,
+# not a grounding one) and injects a bounded stop -> resume recovery: force
+# `gt_vel=0` (the "stand" command -- in-distribution, matches the
+# stand-keyframe episode-start init and the scan-dwell segments the policy
+# was trained on) for STALL_RECOVERY_STEPS, then resume the normal
+# goal-directed velocity flow ("episode-start-like" = in-distribution).
+#
+# Opt-in, default OFF. Carve-outs (checked at the trigger site below): never
+# while `_scan_active` (covers the initial H3 scan, any M4/M5/M7-triggered
+# ReacquisitionScan, AND its dwell segments -- the watchdog's own
+# window-update/trigger-check code only executes on the guaranteed-non-scan
+# "normal mode" path each step, so scan/rescan/dwell steps structurally never
+# feed the window or fire the trigger, not just a value check); never below
+# STALL_MIN_GOAL_DIST_M (final-approach creep intentionally involves low
+# commanded vx / fine positioning, not a stall); never during a
+# `difficulty == 'maneuver'` scene (maneuver scenes can legitimately involve
+# sustained forward-vx-commanded-but-not-translating segments, e.g. pushing
+# against/around an obstacle by design -- out of this mechanism's intended
+# scope).
+STALL_BREAK            = _env_flag("STALL_BREAK")   # opt-in, default OFF
+STALL_VX_THR_MPS        = 0.2    # m/s -- commanded |v_fwd| considered "trying to walk"
+STALL_WINDOW_STEPS      = 100    # steps of sustained high-vx-cmd + low displacement
+STALL_DISP_THR_M        = 0.15   # metres -- odometric displacement over the window
+STALL_MIN_GOAL_DIST_M   = 2.0    # metres -- never trigger during final-approach creep
+STALL_RECOVERY_STEPS    = 50     # steps of forced full-stop (gt_vel=0) during recovery
+STALL_COOLDOWN_STEPS    = 100    # steps after a recovery completes before re-arming
+                                  # (give the robot a chance to actually move again
+                                  # before the watchdog is eligible to re-trigger)
+
+# ---------------------------------------------------------------------------
+# NX-9 AVOID (docs/nx9_avoid.md): local obstacle avoidance.
+# ---------------------------------------------------------------------------
+# The system has no local obstacle awareness at all -- it walks straight lines
+# at the goal (dist,bearing), which is exactly why demo ep1's collision with a
+# scene distractor (docs/nx8_stall.md), demo ep4's compound failure
+# (docs/fa1_failures.md), and search ep12's distractor-caused fall
+# (docs/nx1_scan.md) are all path-obstacle collisions, not grounding or
+# locomotion-stability problems. See code/avoid.py for the full mechanism
+# (back-projected near-field depth -> floor/target-exempt corridor mask ->
+# bounded, hysteresis-smoothed yaw-rate bias). DEFAULT ON since NX-9 adoption
+# (docs/nx9_avoid.md §5; opt out with AVOID=0); wired only
+# for `goal_source='classical'` (covers BOTH the classical HSV+depth backend
+# AND GROUND_NET, since GROUND_NET is dispatched INSIDE `ground()` under the
+# same call site -- see code/grounding.py) because that is the only backend
+# the validation ladder (docs/nx9_avoid.md) exercises; zero extra renders
+# (reuses the depth frame already rendered for grounding this cycle).
+AVOID = _avoid.AVOID   # ADOPTED default ON (docs/nx9_avoid.md); opt out with AVOID=0
 
 # Default joint angles (imported from teacher.py, also available in action_stats from ckpt)
 _DEFAULT_ANGLES_NP = DEFAULT_ANGLES.copy()  # shape (15,)
@@ -222,6 +297,8 @@ class RolloutResult:
     forward_disp:  float = 0.0       # forward displacement from start (m)
     scene_cfg:     dict = field(default_factory=dict)
     video_path:    Optional[str] = None
+    stall_break_triggers: int = 0    # NX-8: STALL_BREAK trigger count this episode (0 when off)
+    avoid_bias_active_frac: float = 0.0  # NX-9: fraction of grounding cycles with |bias|>0 (0 when off)
 
 
 # ---------------------------------------------------------------------------
@@ -655,17 +732,57 @@ class Inferencer:
         _cam_miss_count = 0            # consecutive misses on the active camera
         _video_frame_cache = None       # demo-viz: last labeled active-cam frame (video only)
 
-        # NX-2 (docs/rs1_lock_mgmt.md): shared lock-management gate (LOCK_M1..M5,
-        # each independently toggled via env var; M1/M3 default ON (opt-out),
-        # M2/M4/M5 default OFF (opt-in) per docs/nx2_final.md -- see code/lock_mgmt.py).
-        # With all 5 explicitly set to 0, every LockGate method call below is a
+        # NX-2/NX-5 (docs/rs1_lock_mgmt.md, docs/nx5_coherence.md): shared
+        # lock-management gate (LOCK_M1..M5, LOCK_M7, each independently
+        # toggled via env var; M1/M3 default ON (opt-out), M2/M4/M5/M7
+        # default OFF (opt-in) per docs/nx2_final.md / docs/nx5_coherence.md
+        # -- see code/lock_mgmt.py). With all of LOCK_M1..M5=0 (M7 is
+        # already off by default), every LockGate method call below is a
         # provable no-op pass-through, so that legacy configuration is
         # byte-identical-behavior by construction.
         _lock_gate          = LockGate()
-        _using_rescan_sched = False   # True only while a M4/M5-triggered bounded
+        _using_rescan_sched = False   # True only while a M4/M5/M7-triggered bounded
                                        # rescan (ReacquisitionScan) is driving _scan_active,
                                        # as opposed to the original H3 scan below.
         _rescan_sched        = None
+        # M7 odometry-coherence watchdog: robot's own world-frame XY at the
+        # previous classical grounding cycle (privileged sim state, but only
+        # the ROBOT's own pose -- not the target's -- exactly what a real
+        # state-estimator/leg-odometry stack would give on hardware). None
+        # until the first grounding cycle. Always maintained (cheap: one
+        # qpos copy + a handful of flops per grounding cycle) regardless of
+        # LOCK_M7 -- `LockGate.end_of_cycle()` is itself a no-op when off,
+        # matching every other mechanism's "always call, no-op internally"
+        # contract.
+        _m7_prev_xy          = None
+
+        # NX-8 STALL_BREAK (docs/nx8_stall.md): per-episode watchdog state.
+        # `_stall_hist` holds (x, y, vx_cmd) for the last STALL_WINDOW_STEPS
+        # STEPS (not grounding cycles) of the guaranteed-non-scan "normal
+        # mode" path only -- see the STALL_BREAK constant block above for why
+        # scan/rescan/dwell steps structurally never reach the code that
+        # appends to it. Always maintained (cheap) regardless of the toggle,
+        # matching the lock-management mechanisms' "always call, no-op
+        # internally when off" contract.
+        _stall_hist                = collections.deque(maxlen=STALL_WINDOW_STEPS)
+        _stall_recovery_remaining  = 0     # >0 while forcing gt_vel=0 recovery
+        _stall_cooldown_remaining  = 0     # >0 after a recovery, before re-arming
+        _stall_trigger_count       = 0     # diagnostic: times STALL_BREAK fired this episode
+        _stall_is_maneuver         = (STALL_BREAK and
+                                      str(scene_cfg.get('difficulty', '')).lower() == 'maneuver')
+        _cur_vx_cmd                = 0.0   # last normal-mode forward pass's commanded v_fwd
+
+        # NX-9 AVOID (docs/nx9_avoid.md): per-episode obstacle-bias state.
+        # `_avoid_bias_wz` persists across steps between grounding cycles
+        # (same pattern as `cached_goal_vec`); only ever updated/read on the
+        # guaranteed-non-scan "normal mode" path (structural carve-out,
+        # mirroring STALL_BREAK), and reset to 0 whenever a scan/rescan
+        # begins (below and in `_lock_drop_and_rescan`) so a stale bias from
+        # before a scan never silently reapplies once normal mode resumes.
+        _avoid_bias_wz             = 0.0
+        _avoid_is_maneuver         = (AVOID and _avoid.is_maneuver_scene(scene_cfg))
+        _avoid_cycles_total        = 0     # diagnostic: grounding cycles AVOID evaluated
+        _avoid_cycles_active       = 0     # diagnostic: cycles with |bias| > 0 after this cycle
 
         def _lock_drop_and_rescan():
             """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
@@ -675,6 +792,7 @@ class Inferencer:
             just reuse the H3 scan's own absolute-step timeout)."""
             nonlocal _goal_ema, _last_known_goal, _frames_since_detection
             nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
+            nonlocal _avoid_bias_wz
             _lock_gate.force_drop()
             _goal_ema               = None
             _last_known_goal        = None
@@ -683,6 +801,7 @@ class Inferencer:
             _using_rescan_sched     = True
             _rescan_sched           = ReacquisitionScan(scan_rate=SCAN_RATE)
             cached_goal_vec         = np.array([2.0, 1.0, 0.0], dtype=np.float32)
+            _avoid_bias_wz          = 0.0   # NX-9: fresh depth read once normal mode resumes
 
         # Determine rendering and grounding behavior based on goal_source
         # 'gt':        zero ego_rgb, GT goal injected from sim state each step, no render
@@ -917,11 +1036,72 @@ class Inferencer:
                 # classical grounding cycle regardless of hit/miss/gate outcome above, using
                 # the resolved best-estimate distance for this cycle. Provable no-op when
                 # LOCK_M4 is off (see code/lock_mgmt.py).
+                #
+                # NX-5 (LOCK_M7, docs/nx5_coherence.md): odometry-coherence watchdog --
+                # projects the robot's own measured world-frame displacement SINCE THE
+                # LAST GROUNDING CYCLE onto the current goal bearing (robot body frame:
+                # cached_goal_vec's cos_th/sin_th are egocentric, so rotate the world
+                # displacement by -yaw before dotting with them). This is "measured
+                # odometric displacement" per the design brief -- the robot's own pose,
+                # not the target's, exactly what a real state-estimator would give.
                 _walking_toward_goal = (not _scan_active) and (float(cached_goal_vec[0]) > stop_r)
-                if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal):
+                _m7_proj_disp_m = 0.0
+                _cur_xy = data_mj.qpos[0:2].copy()
+                if _m7_prev_xy is not None:
+                    _dxw = float(_cur_xy[0] - _m7_prev_xy[0])
+                    _dyw = float(_cur_xy[1] - _m7_prev_xy[1])
+                    _cy, _sy = math.cos(yaw), math.sin(yaw)
+                    _d_body_x =  _dxw * _cy + _dyw * _sy
+                    _d_body_y = -_dxw * _sy + _dyw * _cy
+                    _m7_proj_disp_m = (_d_body_x * float(cached_goal_vec[1])
+                                        + _d_body_y * float(cached_goal_vec[2]))
+                _m7_prev_xy = _cur_xy
+                if _lock_gate.end_of_cycle(float(cached_goal_vec[0]), _walking_toward_goal,
+                                            _m7_proj_disp_m):
                     if self.verbose:
-                        print(f"  [lock] M4 divergence -> drop+rescan at step={step}", flush=True)
+                        print(f"  [lock] {_lock_gate.last_trigger} "
+                              f"{'divergence' if _lock_gate.last_trigger == 'M4' else 'coherence'} "
+                              f"-> drop+rescan at step={step}", flush=True)
                     _lock_drop_and_rescan()
+
+                # NX-9 AVOID (docs/nx9_avoid.md): local obstacle avoidance.
+                # Reuses THIS cycle's already-rendered `depth`/`intr_active`
+                # (zero extra renders) -- runs at the same grounding cadence,
+                # AFTER cached_goal_vec is finalized for this cycle (so the
+                # target-exemption window and the "goal dist < 1.2m" carve-out
+                # both see the up-to-date goal). Carve-outs (docs/nx9_avoid.md
+                # §1.3): never while `_scan_active` (bias injection is already
+                # structurally impossible then -- scan steps `continue` before
+                # the injection site -- but the COMPUTATION is skipped too, so
+                # scan-sweep geometry never feeds the hysteresis state); and a
+                # fresh bias is only computed while the goal is FRESH
+                # (`_frames_since_detection` <= AVOID_STALE_MAX_MISSED_CYCLES)
+                # -- on a longer stale coast the existing bias only decays.
+                # See AVOID_STALE_MAX_MISSED_CYCLES' comment in code/avoid.py
+                # for the search-ep14 fall trace that motivated the freshness
+                # carve-out (stale cached goal => stale target exemption =>
+                # AVOID attacks its own target).
+                if AVOID and not _avoid_is_maneuver and not _scan_active:
+                    _avoid_cycles_total += 1
+                    if _frames_since_detection > _avoid.AVOID_STALE_MAX_MISSED_CYCLES:
+                        _avoid_bias_wz = _avoid.decay_bias(_avoid_bias_wz)
+                    else:
+                        _avoid_goal_dist_now = float(cached_goal_vec[0])
+                        _avoid_goal_bearing_now = math.atan2(float(cached_goal_vec[2]),
+                                                              float(cached_goal_vec[1]))
+                        _avoid_carved = (_avoid_goal_dist_now < _avoid.AVOID_MIN_GOAL_DIST_M)
+                        _avoid_cam_h = float(data_mj.qpos[2]) + CAM_HEAD_Z
+                        _avoid_bias_wz, _avoid_dbg = _avoid.compute_obstacle_bias(
+                            depth, intr_active, cam_height_m=_avoid_cam_h,
+                            goal_dist_m=_avoid_goal_dist_now,
+                            goal_bearing_rad=_avoid_goal_bearing_now,
+                            prev_bias_wz=_avoid_bias_wz, carved_out=_avoid_carved)
+                        if self.verbose and abs(_avoid_bias_wz) > 1e-9:
+                            print(f"  [avoid] bias_wz={_avoid_bias_wz:+.3f} "
+                                  f"L={_avoid_dbg['left']:.2f} R={_avoid_dbg['right']:.2f} "
+                                  f"n_px={_avoid_dbg['n_obstacle_px']} step={step}", flush=True)
+                    if abs(_avoid_bias_wz) > 1e-9:
+                        _avoid_cycles_active += 1
 
             # Learned grounding (Arch A, goal_source='learned', trained grounding head)
             # Runs at GROUNDING_PERIOD cadence with EMA smoothing.
@@ -1157,6 +1337,38 @@ class Inferencer:
                     vel_gr = np.array([vx_gr, 0.0, wz_gr], dtype=np.float32)
                 gt_vel_inject_t = torch.from_numpy(vel_gr).unsqueeze(0).to(self.device)
 
+            # NX-9 AVOID: when a nonzero obstacle bias is active this cycle
+            # AND nothing else has already claimed gt_vel injection (the
+            # vel_source='gt' probe mode and the learned-grounding replica
+            # above both take priority, matching their own established
+            # precedence -- this only fires for the standard deployed
+            # `goal_source='classical', vel_source='predicted'` path, which
+            # otherwise lets the model's own vel head run freely), replace
+            # the model's self-predicted velocity with steer.py's own control
+            # law (evaluated from cached_goal_vec, backend-agnostic) plus the
+            # bounded yaw bias -- clipped back to steer.py's MAX_WZ. Provable
+            # no-op (leaves gt_vel_inject_t untouched) whenever AVOID is off
+            # or the corridor is clear (`_avoid_bias_wz == 0.0`), which is
+            # the common case on clear paths.
+            if AVOID and not _avoid_is_maneuver and gt_vel_inject_t is None and abs(_avoid_bias_wz) > 1e-9:
+                vel_av = _avoid.biased_vel_cmd(
+                    float(cached_goal_vec[0]), float(cached_goal_vec[1]),
+                    float(cached_goal_vec[2]), _avoid_bias_wz, stop_r)
+                gt_vel_inject_t = torch.from_numpy(vel_av).unsqueeze(0).to(self.device)
+
+            # NX-8 STALL_BREAK: while a recovery is active, force gt_vel=0 (the
+            # "stand" command) regardless of whatever was computed above --
+            # takes priority over both `_inject_gt_vel` and the learned-
+            # grounding velocity injection. Provable no-op when STALL_BREAK is
+            # off or no recovery is active (`_stall_recovery_remaining` stays
+            # 0 forever in that case -- see the trigger-check site below).
+            if STALL_BREAK and _stall_recovery_remaining > 0:
+                gt_vel_inject_t = torch.zeros(1, 3, dtype=torch.float32, device=self.device)
+                _stall_recovery_remaining -= 1
+                if _stall_recovery_remaining == 0:
+                    _stall_cooldown_remaining = STALL_COOLDOWN_STEPS
+                    _stall_hist.clear()   # fresh window once normal control resumes
+
             # Student forward pass
             with torch.no_grad():
                 out = self.model(
@@ -1166,6 +1378,14 @@ class Inferencer:
                     gt_goal   = goal_inject_t,    # None → model predicts; tensor → injected
                     gt_vel    = gt_vel_inject_t,   # Fix 2: None → vel head predicts; tensor → injected
                 )
+
+            # NX-8 STALL_BREAK: capture the commanded v_fwd this cycle (the
+            # SAME `out['vel']` that fed vel_emb into the action head above --
+            # "commanded", not necessarily realized) for the trigger-check
+            # below. Cheap (one tensor->float) and only done when the toggle
+            # is on.
+            if STALL_BREAK and not _stall_is_maneuver and 'vel' in out and out['vel'] is not None:
+                _cur_vx_cmd = float(out['vel'][0, 0].item())
 
             # Extract action chunk
             actions_raw = out['action'].cpu().numpy().squeeze(0)   # (H, 15)
@@ -1227,6 +1447,41 @@ class Inferencer:
 
             # Distance to target
             dist_to_target = float(np.linalg.norm(data_mj.qpos[0:2] - target_xy))
+
+            # NX-8 STALL_BREAK: window update + trigger check. Only reached on
+            # the guaranteed-non-scan "normal mode" path (every scan/rescan/
+            # dwell step `continue`s before this point) -- see the constant
+            # block's comment for why that alone satisfies the "never during
+            # scan/rescan/dwell" carve-out. `_stall_is_maneuver` (computed once
+            # at episode start from scene_cfg['difficulty']) satisfies the
+            # "never in maneuver mode" carve-out.
+            if STALL_BREAK and not _stall_is_maneuver:
+                if _stall_cooldown_remaining > 0:
+                    _stall_cooldown_remaining -= 1
+                if _stall_recovery_remaining > 0:
+                    # Still forcing the stop -- don't feed/check the window
+                    # (the robot is deliberately not walking right now).
+                    pass
+                else:
+                    _now_xy = data_mj.qpos[0:2]
+                    _stall_hist.append((float(_now_xy[0]), float(_now_xy[1]), _cur_vx_cmd))
+                    if (_stall_cooldown_remaining == 0
+                            and len(_stall_hist) >= STALL_WINDOW_STEPS
+                            and float(cached_goal_vec[0]) > STALL_MIN_GOAL_DIST_M):
+                        _x0, _y0, _ = _stall_hist[0]
+                        _x1, _y1, _ = _stall_hist[-1]
+                        _disp = math.hypot(_x1 - _x0, _y1 - _y0)
+                        _sustained = all(abs(v) > STALL_VX_THR_MPS for (_, _, v) in _stall_hist)
+                        if _sustained and _disp < STALL_DISP_THR_M:
+                            _stall_recovery_remaining = STALL_RECOVERY_STEPS
+                            _stall_trigger_count      += 1
+                            _stall_hist.clear()
+                            if self.verbose:
+                                print(f"  [stall] STALL_BREAK #{_stall_trigger_count} "
+                                      f"triggered at step={step} disp={_disp:.3f}m "
+                                      f"goal_dist={float(cached_goal_vec[0]):.2f}m -> "
+                                      f"forcing stop for {STALL_RECOVERY_STEPS} steps",
+                                      flush=True)
 
             # Success check
             if dist_to_target < stop_r:
@@ -1294,6 +1549,9 @@ class Inferencer:
             forward_disp   = forward_disp,
             scene_cfg      = scene_cfg,
             video_path     = video_path if (render_video and frames_ego) else None,
+            stall_break_triggers = _stall_trigger_count,
+            avoid_bias_active_frac = (_avoid_cycles_active / _avoid_cycles_total
+                                       if _avoid_cycles_total > 0 else 0.0),
         )
 
 
