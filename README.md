@@ -29,6 +29,8 @@ Policy inference: **3.4 ms/step** (~6× headroom at 50 Hz). 0 falls in the goto/
 
 > **Reproducibility note.** These headline numbers are from the released training run. A from-scratch retrain via the two-stage pipeline below reproduces the **GT-goal (pure-locomotion) metrics exactly** — easy/GT **100%**, demo/GT **80%** — which is the load-bearing result (and fixing the curriculum was essential: training `phase_A` on the *combined* set instead of easy-only gives 0% demo). The **classical-grounding** numbers show real run-to-run variance across training draws (grounding-noise robustness is a high-variance property of the fit; a multi-seed sweep spans ~87–100% on easy/classical, and a fresh retrain we verified landed ~73%). Select checkpoints by **closed-loop success, not val-loss**.
 
+> **Generalization across scene seeds.** The table above is the fixed seed-999 episode set; we also validated the full stack on two fresh scene seeds (n=15 each, no tuning): easy 100/87%, demo 87/80%, search 93/100%. The adopted *mechanisms* transfer cleanly — zero falls in 30 fresh search episodes, zero detector failures or fallbacks in 90 fresh episodes, zero scan-coverage misses. The fresh-seed demo drop traces to one known residual: a spawn-geometry-specific walking instability during large early rotations (the distilled policy's limitation, reproduced deterministically; documented rather than patched, since deploy-side mitigations only delay it and policy retraining regressed other skills in two prior attempts).
+
 ---
 
 ## Hardware / GPU
