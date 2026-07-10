@@ -168,7 +168,7 @@ MUJOCO_GL=egl python code/eval_nx6_heatmap.py --ckpt runs/nx6_heatmap_B/model_be
 
 ## Evaluation (closed-loop, seed 999)
 
-`eval_closedloop.py` uses `--checkpoint`, `--n`, `--goal-source {learned,classical,gt}`, `--difficulty {easy,demo}`, `--seed`, `--device`. (No GR00T is loaded at eval time — the language embedding is zeroed; navigation is driven by the grounding goal.) `--goal-source learned` is what reproduces the bolded "Learned grounding" column in the results table above — it needs the optional detector checkpoint trained (see the "Learned grounding detector" section above); without it, it gracefully falls back to the classical grounder with a log line, same as `--goal-source classical`.
+`eval_closedloop.py` uses `--checkpoint`, `--n`, `--goal-source {learned,classical,gt}`, `--difficulty {easy,demo}`, `--seed`, `--device`. (No GR00T is loaded at eval time — the language embedding is zeroed; navigation is driven by the grounding goal.) **Naming caveat:** `--goal-source classical` selects the *image-grounding pipeline*, which dispatches to the learned detector automatically when its checkpoint is present (`GROUND_NET`, default on) and to classical HSV+depth otherwise — so `--goal-source classical` is what reproduces **both** columns of the results table, depending on whether you trained the detector. (`--goal-source learned` is a legacy in-model grounding head from an early rejected experiment, kept for reference; `gt` is the privileged locomotion reference.)
 
 ```bash
 export PYTHONPATH=.:$PYTHONPATH
@@ -177,12 +177,13 @@ export PYTHONPATH=.:$PYTHONPATH
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty easy --goal-source classical --n 15 --seed 999 --device cuda --out eval/easy_classical
 
-# Goto — demo-distance, learned grounding (~93%; needs the trained detector checkpoint above)
+# Goto — demo-distance with the trained detector present (~93%): GROUND_NET auto-dispatches
 MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
-    --difficulty demo --goal-source learned --n 15 --seed 999 --device cuda --out eval/demo_learned
+    --difficulty demo --goal-source classical --n 15 --seed 999 --device cuda --out eval/demo_learned
 
-# Goto — demo-distance, classical fallback (~67%; works out of the box, no detector needed)
-MUJOCO_GL=egl python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
+# Goto — demo-distance, classical fallback (~67%): same command without the detector checkpoint,
+# or force it with GROUND_NET=0
+MUJOCO_GL=egl GROUND_NET=0 python code/eval_closedloop.py --checkpoint checkpoint/goto_best.pt --arch A \
     --difficulty demo --goal-source classical --n 15 --seed 999 --device cuda --out eval/demo_classical
 
 # Goto — demo / GT goal (~80%); grounding unused, so --no-render is fine
