@@ -116,6 +116,28 @@ ARENA_HALF_LONG  = 8.0   # 8m half-size → room for 7m targets
 DIST_MIN_LONG    = 4.0   # minimum target distance (impressive walk)
 DIST_MAX_LONG    = 7.0   # maximum target distance (reliable detection ceiling)
 
+# FS-1 (2026-07-10): curated deterministic FIRST scene for --web/terminal launch.
+# The old always-[1234,0] first draw reproducibly landed on `red cone,
+# dist=4.35m, bearing=77.6°` -- the documented walking-instability residual
+# (robot SPOTTED the target at step 20 then walked steadily *away*,
+# dist 4.24m->9.4m; docs/vr1_rehearsal.md friction #3), i.e. a recruiter's
+# very first impression was a known-bad draw. Subsequent new_scene() calls
+# were never the problem (they auto-resample after every rollout), so only
+# this one fixed draw needed curating.
+# Picked by: geometry pre-filter (color in RELIABLE_COLORS, dist 4-7m,
+# |bearing| in [60,110] AND positive-signed -- matches BidirectionalScan-
+# Schedule's _LEG_SIGNS=(+1,-1,-1,+1) "positive leg0 first" so no leg0->leg1
+# reversal is needed, sidestepping the rotation-order-instability class
+# documented in docs/gen1_multiseed.md §3.1 / docs/nx12_turn_dwell.md; no
+# same-color distractor -- docs/gen1_multiseed.md §3.3's false-lock risk; no
+# distractor within 0.5m of the straight robot->target path; target shape
+# != cone -- docs/nx16_cone_stall.md's cone-specific confidence-decay risk),
+# then verified by actually running the full rollout headlessly 2x:
+#   seed=1259 -> target=yellow cube, dist=4.31m, bearing=85.2° (out-of-FOV).
+#   Both runs: success=True, fell=False, steps=637, final_dist=0.472m,
+#   byte-identical trajectories, wall~315s each. See docs/fs1_first_scene.md.
+FIRST_SCENE_SEED = 1259
+
 
 # ---------------------------------------------------------------------------
 # World→BEV projection helper
@@ -2406,10 +2428,21 @@ class FancySceneManager:
         self._scene_cfg  = None
 
     def new_scene(self, long_dist: bool = True) -> dict:
-        """Sample a new scene. FD2: long_dist=True (4-7m) by default."""
-        rng = np.random.default_rng(
-            np.random.SeedSequence([1234 + self.seed_offset, self._ep_count])
-        )
+        """Sample a new scene. FD2: long_dist=True (4-7m) by default.
+
+        FS-1: the very first scene (self._ep_count == 0) draws from the
+        curated FIRST_SCENE_SEED instead of the plain [1234+seed_offset, 0]
+        sequence, so a fresh --web/terminal launch always opens on a
+        verified-good scene. Every later call (manual "New Scene" button,
+        the post-rollout auto-resample, terminal 'new') is untouched and
+        keeps drawing from the original random sequence -- only this one
+        fixed first draw needed curating.
+        """
+        if self._ep_count == 0:
+            seed_seq = np.random.SeedSequence([FIRST_SCENE_SEED, 0])
+        else:
+            seed_seq = np.random.SeedSequence([1234 + self.seed_offset, self._ep_count])
+        rng = np.random.default_rng(seed_seq)
         if long_dist:
             self._scene_cfg = sample_fancy_scene_long(rng, self._ep_count)
         else:
