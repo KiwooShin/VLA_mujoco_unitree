@@ -25,7 +25,7 @@ Grounding notes (V2/V3):
   - 480x360 grounding resolution (2.25x larger blobs vs 320x240)
   - Depth-FG rescue for cyan/blue: rescues 3/3 easy; structural at 4-9m (distractors)
   - Non-cyan/blue at 4-9m: 87% success (demo-distance showcase)
-  - Overall demo/classical: 46.7% (7/15); easy/classical: 93% (14/15)
+  - See README.md's Results table for current closed-loop numbers (not duplicated here to avoid drift)
 
 Usage:
   # Terminal REPL (always works):

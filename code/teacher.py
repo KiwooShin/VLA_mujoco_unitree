@@ -366,7 +366,7 @@ if __name__ == "__main__":
     import sys
     import imageio.v2 as imageio
 
-    os.makedirs("/home/kiwoos/work/unitree_vla/docs", exist_ok=True)
+    os.makedirs("eval/teacher_smoke", exist_ok=True)
 
     # ---- EGL env vars for headless rendering ---
     os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES",
@@ -487,7 +487,7 @@ if __name__ == "__main__":
     print(f"  ONNX device: {teacher.device_str}")
 
     # ---- Save mp4 ---
-    video_path = "/home/kiwoos/work/unitree_vla/docs/teacher_smoke.mp4"
+    video_path = "eval/teacher_smoke/teacher_smoke.mp4"
     imageio.mimwrite(video_path, frames, fps=50, macro_block_size=1)
     print(f"\nVideo saved: {video_path}  ({len(frames)} frames)")
 
@@ -516,7 +516,7 @@ if __name__ == "__main__":
         "dyaw_phase3": round(float(dyaw), 3),
     }
     import json
-    with open("/home/kiwoos/work/unitree_vla/docs/smoke_results.json", "w") as f:
+    with open("eval/teacher_smoke/smoke_results.json", "w") as f:
         json.dump(results, f, indent=2)
     print("Results written to docs/smoke_results.json")
 

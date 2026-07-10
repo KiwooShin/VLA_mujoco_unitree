@@ -1,14 +1,14 @@
-# VLA_mujoco_unitree — Unitree G1 Humanoid VLA in MuJoCo
+# Unitree G1 Humanoid VLA in MuJoCo
 
 A small **Vision-Language-Action** policy for a **Unitree G1 humanoid** navigating an object-filled arena from **onboard RGBD + sensor history + a free-form English instruction**. Output: **15-dim lower-body joint targets at 50 Hz**, running in real time in **MuJoCo** (physics only).
 
-The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen, encoded once per episode and cached). Everything else — the policy, the perception (a from-scratch learned detector with a classical HSV+depth fallback), the velocity controller, the obstacle avoidance — is trained/built from scratch on synthetic teacher rollouts plus **DART** recovery data. The locomotion teacher is a Unitree whole-body-control (WBC) walk policy used **only at training time**; deployment is 100% WBC-free (an offline standing keyframe initializes the robot, then the student policy drives every step).
+The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen, encoded once per episode and cached). Everything else — the policy, the perception (a from-scratch learned detector with a classical HSV+depth fallback), the velocity controller, the obstacle avoidance — is trained/built from scratch on synthetic teacher rollouts plus **DART** recovery data (Disturbances for Augmenting Robot Trajectories, Laskey et al. 2017 — noise-injected actions with clean-action supervision). The locomotion teacher is a Unitree whole-body-control (WBC) walk policy used **only at training time**; deployment is 100% WBC-free (an offline standing keyframe initializes the robot, then the student policy drives every step).
 
 **Skills:** `goto` (navigate to a named object) · `search` (rotate to find an out-of-FOV target, then approach) · `maneuver` (turn L/R after passing a landmark). Plus an interactive demo with an **ego-camera | 3D-diagonal-BEV** view and multi-goal instructions ("find X then find Y").
 
 ![G1Nav interactive demo — "find the red cube": scan with reversal → locate at 6.8 m → walk past a same-color decoy → reach](assets/demo.gif)
 
-<sub>Live demo (`code/fancy_demo.py`), full default stack: the instruction names an object 6.8 m away outside the robot's initial field of view; the G1 runs its bounded bidirectional scan (direction reversal visible), spots the cube, then walks to it — passing a **same-color decoy ball 0.37 m off its path** (the learned detector keeps the lock on the *cube* with both red objects in frame; obstacle avoidance skirts the decoy). **Left:** onboard ego camera showing the **active** camera — head camera at range, automatic handoff to a steeper **proximity camera** for the final approach, so the target stays in frame all the way to the stop. **Right:** 3D-diagonal follow-cam with path trail, target ring, FOV cone, and a `SEARCHING → LOCATED → MOVING → REACHED` status banner. Physics-only, WBC-free; policy inference is real-time-capable (3.4 ms vs the 20 ms/step budget) while this recording pipeline is render-bound, so the GIF plays at ~2.75× sim time.</sub>
+<sub>Live demo (`code/fancy_demo.py`): asked for a cube it can't see, the G1 scans, spots it 6.8 m away, and walks to it — passing a **same-color decoy ball** without losing lock, with the ego view (left) switching cameras automatically so the target stays in frame to the stop. Physics-only, WBC-free; policy inference is real-time-capable (3.4 ms vs the 20 ms/step budget) — the render-bound recording plays at ~2.75× sim time. Details of every element in the Method section below.</sub>
 
 ## Results (closed-loop, seed 999, n=15, WBC-free deploy)
 
@@ -16,20 +16,20 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 |------|-----------|------|------|
 | Goto | easy | **100%** | 100% |
 | Goto | demo-distance (4–9 m) | **93.3%** | 66.7% |
-| Goto | demo / GT goal (locomotion reference) | — | 80.0% |
+| Goto | demo / GT goal *(privileged oracle — locomotion reference, not a grounding condition)* | — | 80.0% |
 | Search | out-of-FOV target | **100%** | 100% |
 | Maneuver | turn after passing a landmark | **66.7–73.3%** (run-to-run band) | same |
 
 The full system stacks three perception/navigation layers on the distilled walk policy, each adopted only after per-episode no-regression gates:
 - **Two-camera handoff** (head + steeper proximity camera): keeps the target detected down to **0.26 m**; a single head camera goes blind below ~0.7 m, before the stop radius.
-- **Learned grounding** (`GROUND_NET`, default when its checkpoint is present; classical HSV+depth otherwise): a 0.9M-param query-conditioned heatmap detector trained from scratch on MuJoCo-segmentation-labeled frames. It eliminates the classical grounder's confident false locks at 4–9 m (hue-similar walls, same-color twin distractors) — demo-distance 66.7% → 86.7%, above even the classical stack's 80% GT-goal reference. A realized-yaw fix to the initial scan (the commanded ±90° sweep only physically realized ~±62°) then recovered a target sitting just past the old coverage edge — **93.3%**; the single residual episode is a compound failure that also fails under ground-truth goals.
+- **Learned grounding** (`GROUND_NET`, default when its checkpoint is present; classical HSV+depth otherwise): a 0.9M-param query-conditioned heatmap detector trained from scratch on MuJoCo-segmentation-labeled frames. It eliminates the classical grounder's confident false locks at 4–9 m (hue-similar walls, same-color twin distractors) — demo-distance 66.7% → 86.7%, above even the classical stack's 80% GT-goal reference (adopted jointly with the obstacle avoidance below, which fixed the one episode blocking its adoption gate). A realized-yaw fix to the initial scan (the commanded ±90° sweep only physically realized ~±62°) then recovered a target sitting just past the old coverage edge — **93.3%**; the single residual episode is a compound failure that also fails under ground-truth goals.
 - **Local obstacle avoidance** (`AVOID`, default on): depth-corridor repulsion at grounding cadence (no extra renders), target- and floor-exempt. Fixes physical path collisions the straight-line steerer couldn't survive — search 93.3% → **100%**.
 
-Policy inference: **3.4 ms/step** (~6× headroom at 50 Hz). 0 falls in the goto/maneuver conditions. EGL-deterministic per seed.
+Policy inference: **3.4 ms/step** (~6× headroom at 50 Hz). EGL-deterministic per seed.
 
 > **Reproducibility note.** These headline numbers are from the released training run. A from-scratch retrain via the two-stage pipeline below reproduces the **GT-goal (pure-locomotion) metrics exactly** — easy/GT **100%**, demo/GT **80%** — which is the load-bearing result (and fixing the curriculum was essential: training `phase_A` on the *combined* set instead of easy-only gives 0% demo). The **classical-grounding** numbers show real run-to-run variance across training draws (grounding-noise robustness is a high-variance property of the fit; a multi-seed sweep spans ~87–100% on easy/classical, and a fresh retrain we verified landed ~73%). Select checkpoints by **closed-loop success, not val-loss**.
 
-> **Generalization across scene seeds.** The table above is the fixed seed-999 episode set; we also validated the full stack on two fresh scene seeds (n=15 each, no tuning): easy 100/87%, demo 87/80%, search 93/100%. The adopted *mechanisms* transfer cleanly — zero falls in 30 fresh search episodes, zero detector failures or fallbacks in 90 fresh episodes, zero scan-coverage misses. The fresh-seed demo drop traces to one known residual: a spawn-geometry-specific walking instability during large early rotations (the distilled policy's limitation, reproduced deterministically; documented rather than patched, since deploy-side mitigations only delay it and policy retraining regressed other skills in two prior attempts).
+> **Generalization across scene seeds.** The table above is the fixed seed-999 episode set; we also validated the full stack on two fresh scene seeds (n=15 each, no tuning): easy 100/87%, demo 87/80%, search 93/100%. The adopted *mechanisms* transfer cleanly — zero falls in 30 fresh search episodes, zero detector failures or fallbacks in 90 fresh episodes, zero scan-coverage misses. The fresh-seed demo drop traces to one known residual: a spawn-geometry-specific walking instability during large early rotations (the distilled policy's limitation, reproduced deterministically; documented rather than patched, since deploy-side mitigations only delay it and policy retraining regressed other skills in two prior attempts). The one fresh-seed search miss was a single false lock onto a same-color distractor — the detector-v2 retrain specifically strengthened that discrimination offline, but the closed-loop case remains n=1 and is tracked as an open item.
 
 ---
 
@@ -208,7 +208,7 @@ MUJOCO_GL=egl python code/eval_maneuver.py --checkpoint checkpoint/maneuver_best
 
 ## Interactive Demo
 
-`demo.py` and `fancy_demo.py` automatically load `checkpoint/goto_best.pt` and `checkpoint/maneuver_best.pt` (no checkpoint flags needed).
+`demo.py` and `fancy_demo.py` automatically load `checkpoint/goto_best.pt` and `checkpoint/maneuver_best.pt` (no checkpoint flags needed). As in evaluation, GR00T is **not** loaded live in the demos: the policy's language-embedding input (used during training) is zeroed at deploy, and typed instructions are understood by a lightweight parser that resolves the named color/shape into the query driving the detector — so the demos start fast and run without the 6 GB LM checkpoint.
 
 ```bash
 export PYTHONPATH=.:$PYTHONPATH
@@ -264,13 +264,14 @@ VLA_mujoco_unitree/
 ```
 
 Created at runtime and **gitignored**: `dataset/`, `runs/`, `checkpoint/`, `eval/`, `videos/`.
+Code comments cite experiment notes by filename (`docs/nx*.md`, `docs/cam_*.md`, …) — that's the private development ledger recording each mechanism's adoption/rejection evidence; it is not included in this repo.
 External, **not committed**: `checkpoints/` (GR00T-N1.6), `third_party/` (GR00T + WBC).
 
 ---
 
 ## Method (one paragraph)
 
-Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV+depth grounding → egocentric goal (dist, bearing)` · `goal → velocity command` · `velocity + proprio history → distilled 15-DoF joint targets`. The joint policy is distilled from the WBC walk teacher via behavior cloning, and stabilized over long horizons with **residual/normalized action targets + DART recovery data + a gait-phase input** — which is what takes naive BC from 0% to 100% on the easy task. Search is a student-driven **bounded bidirectional scan** (yaw triangle-wave with stand dwells between legs — prolonged continuous rotation is out-of-distribution for the walk policy and was the root cause of all search falls); maneuver adds a landmark-pass trigger + heading goal. Grounding locks are hardened by a blob area-quality floor and an innovation-gated lock replacement (`code/lock_mgmt.py`). Real time comes from a 3-rate split: language once per episode, grounding at 5–10 Hz, the action head at 50 Hz.
+Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV+depth grounding → egocentric goal (dist, bearing)` · `goal → velocity command` · `velocity + proprio history → distilled 15-DoF joint targets`. The joint policy is distilled from the WBC walk teacher via behavior cloning, and stabilized over long horizons with **residual/normalized action targets + DART recovery data + a gait-phase input** — which is what takes naive BC from 0% to 100% on the easy task. Search is a student-driven **bounded bidirectional scan** (yaw triangle-wave with stand dwells between legs — prolonged continuous rotation is out-of-distribution for the walk policy and was the root cause of all search falls); maneuver adds a landmark-pass trigger + heading goal. Grounding locks are hardened by a blob area-quality floor and an innovation-gated lock replacement (`code/lock_mgmt.py`). Real time comes from a 3-rate split: language once per episode, grounding at 5–10 Hz, the action head at 50 Hz. (The action head structurally accepts vision/language features alongside the goal, velocity, and proprio history; at deploy those inputs are zeroed — ablations showed navigation is driven by the grounding goal, and the eval/demo scripts run without loading GR00T.)
 
 **Perception — two-camera handoff.** A single pitched head camera goes blind below ~0.7 m (the target exits the FOV bottom edge before the stop radius). Grounding therefore runs on the **active** one of two head-mounted cameras: the head camera at range, and a steeper **proximity camera** (58° pitch) for the final approach, switched by a hysteresis (Schmitt) trigger on the smoothed target distance (in ≤1.2 m, out ≥1.6 m) with depth-based rejection of the robot's own body in frame. Both cameras feed the same `(dist, bearing)` goal, so the policy needs **no retraining**, and only the active camera is rendered each cycle, so steady-state compute is unchanged. This keeps the target detected down to **0.26 m** — through every skill's stop radius. (A wide-FOV single-camera alternative was A/B-tested and rejected: it loses far-range detection, has a shallower close-range floor, and is ~2× slower.)
 

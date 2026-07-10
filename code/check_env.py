@@ -2,7 +2,7 @@
 """
 G1Nav Environment Verification Script
 Checks all dependencies needed for the campaign.
-Run with: /home/kiwoos/miniconda3/envs/g1nav/bin/python code/check_env.py
+Run with: python code/check_env.py   (inside the g1nav conda env)
 """
 
 import os
