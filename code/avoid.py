@@ -119,7 +119,27 @@ AVOID_N_BEARING_BINS      = 25     # angular bins across the corridor (~2 deg/bi
                                     # closest-obstacle-per-bin, not diluted by frame area
 
 # --- Carve-outs ---
-AVOID_MIN_GOAL_DIST_M     = 1.2    # m — proximity endgame: never avoid below this goal dist
+# NX-13 (docs/nx13_avoid_hygiene.md): RE-APPLIED the 1.2 -> 1.6 revision on
+# its own merits (self-body hygiene, not an ep4-flip bet). History: NX-11
+# (docs/nx11_ep4.md) first tried this exact change, aligning this cutoff
+# with inferencer.py's CAM_D_HI=1.6 PROXIMITY->GROUNDING Schmitt threshold,
+# after root-causing a real bug: AVOID's depth back-projection has no
+# self-body exclusion (only a floor-height cut and a target-bearing
+# exemption), and the PROXIMITY camera's steep 58 deg pitch, mounted close
+# to the robot's own chest, captures the robot's OWN raised/swinging arms
+# during locomotion at very close range (0.24-0.43m, ~0.8m above the ground
+# -- nowhere near the floor cut or the target's exemption bearing) --
+# misclassified as a real obstacle (visually confirmed via saved RGB+depth
+# frames on demo ep4, docs/nx11_ep4.md §3). Widening the carve-out to 1.6
+# measurably fixed THIS (avoid_bias_active_frac=0.000, confirmed 2/2), but
+# NX-11 reverted it anyway because ep4 didn't FLIP 2/2 (ep4's dominant
+# failure is an unrelated late-episode balance-loss mechanism, per
+# docs/nx11_ep4.md §5) -- an ep4-flip bar the fix was never meant to clear.
+# NX-13 re-evaluated the fix on its own merits (mechanism-confirmed bug,
+# zero known regression risk under NX-9's mid-path avoidance wins -- see
+# docs/nx13_avoid_hygiene.md for full mechanism replays + five full-gate
+# lines) and ADOPTED it.
+AVOID_MIN_GOAL_DIST_M     = 1.6    # m — proximity endgame: never avoid below this goal dist
 AVOID_TARGET_EXEMPT_DIST_M = 2.0   # m — only mask the target's own bearing window this close
 AVOID_TARGET_EXEMPT_MIN_DEG = 8.0  # deg — floor on the target-exemption half-width
 AVOID_TARGET_EXEMPT_MAX_DEG = 30.0 # deg — ceiling on the target-exemption half-width
