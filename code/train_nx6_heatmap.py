@@ -40,7 +40,8 @@ if str(_REPO) not in sys.path:
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 from code.nx6_heatmap_model import TinyHeatmapUNet, N_CLASS, N_COLOR, TARGET_W, TARGET_H
-from code.nx6_heatmap_data import SplitCache, build_example_index, HeatmapDataset, collate
+from code.nx6_heatmap_data import (SplitCache, build_example_index, HeatmapDataset, collate,
+                                   oversample_far_or_wide)
 from code.nx6_heatmap_eval_utils import run_inference, select_threshold, presence_only_pr
 
 
@@ -103,6 +104,19 @@ def main():
     ap.add_argument("--neg-per-empty-frame", type=int, default=2)
     ap.add_argument("--val-neg-per-object-frame", type=int, default=3)
     ap.add_argument("--val-neg-per-empty-frame", type=int, default=6)
+    # NX-14 detector v2 (docs/nx14_detector_v2.md): additive, default-0 (byte-for-byte
+    # v1-reproducing) train-set-only strengthening -- val/test sampling is untouched
+    # so v1-vs-v2 offline comparisons stay apples-to-apples on the same protocol.
+    ap.add_argument("--hard-color-negs", type=int, default=0,
+                    help="extra same-color/different-shape (twin-distractor) negatives "
+                         "per labeled train frame, on top of --neg-per-object-frame")
+    ap.add_argument("--hard-shape-negs", type=int, default=0,
+                    help="extra same-shape/different-color negatives per labeled train frame")
+    ap.add_argument("--far-oversample", type=int, default=0,
+                    help="extra duplicate copies of positive train examples beyond "
+                         "--far-dist-thresh or --far-bearing-thresh (0 = off)")
+    ap.add_argument("--far-dist-thresh", type=float, default=6.0)
+    ap.add_argument("--far-bearing-thresh", type=float, default=20.0)
     ap.add_argument("--eval-every", type=int, default=3)
     ap.add_argument("--save-every", type=int, default=5)
     ap.add_argument("--num-workers", type=int, default=6)
@@ -167,7 +181,11 @@ def main():
         epoch_rng = np.random.default_rng(args.seed * 7919 + epoch)
         train_examples = build_example_index(
             train_cache, epoch_rng, neg_per_object_frame=args.neg_per_object_frame,
-            neg_per_empty_frame=args.neg_per_empty_frame)
+            neg_per_empty_frame=args.neg_per_empty_frame,
+            hard_color_negs=args.hard_color_negs, hard_shape_negs=args.hard_shape_negs)
+        train_examples = oversample_far_or_wide(
+            train_examples, extra_copies=args.far_oversample,
+            dist_thresh_m=args.far_dist_thresh, bearing_thresh_deg=args.far_bearing_thresh)
         train_ds = HeatmapDataset(train_cache, train_examples, train=True,
                                   seed=args.seed * 1000 + epoch, sigma=args.sigma)
         train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,

@@ -992,15 +992,24 @@ from code.lock_mgmt import (
 # fallback when the checkpoint is missing (see ground()'s dispatch below --
 # the deploy repo ships no weights). Opt out with GROUND_NET=0.
 GROUND_NET = _env_flag("GROUND_NET", default="1")   # ADOPTED default ON (docs/nx9_avoid.md)
+# NX-14 ADOPTION (docs/nx14_detector_v2.md): default points to the v2 detector
+# (runs/nx6_heatmap_B/model_best.pt), which beats v1 (runs/nx6_heatmap_A) on
+# val/test/failcase recall at matched >=0.9 precision, keeps twin separation
+# intact, and held all five closed-loop gate lines with zero reproducible
+# regressions. v1's checkpoint is left in place, unmodified, for rollback
+# (set GROUND_NET_CKPT=runs/nx6_heatmap_A/model_best.pt and GROUND_NET_TAU=0.59
+# to revert). Minimal diff: only this default constant + the paired tau below
+# changed; v1's own checkpoint files, training code path, and default-args
+# behavior of code/train_nx6_heatmap.py are otherwise untouched.
 GROUND_NET_CKPT = os.environ.get(
     "GROUND_NET_CKPT",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "runs", "nx6_heatmap_A", "model_best.pt"))
-# NX-6 JUDGE's decided deploy operating point (docs/nx6_judge.md §1.2/§1.3/§6):
-# the val-selected tau=0.59, NOT the looser failcase-only-swept tau=0.29 that
-# training doc's headline ep5/ep12 numbers used -- tau=0.59 is the one that
-# should gate/ship (0.29 has a boundary-frame echo artifact tau=0.59 does not).
-GROUND_NET_TAU    = float(os.environ.get("GROUND_NET_TAU", "0.59"))
+                 "runs", "nx6_heatmap_B", "model_best.pt"))
+# v2's own training-selected deploy operating point (docs/nx14_detector_v2.md,
+# runs/nx6_heatmap_B/model_best.pt's saved val_metric: tau=0.64, precision=0.903,
+# recall=0.785) -- same selection convention v1's tau=0.59 used (the
+# checkpoint's own recorded best-epoch val tau, not a separately re-swept one).
+GROUND_NET_TAU    = float(os.environ.get("GROUND_NET_TAU", "0.64"))
 GROUND_NET_DEVICE = os.environ.get("GROUND_NET_DEVICE", "cuda")
 
 # NX-7 FIX B (docs/nx7_adoption.md): acquire/track hysteresis, opt-in, default

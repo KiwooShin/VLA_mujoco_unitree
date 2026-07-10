@@ -146,7 +146,7 @@ MUJOCO_GL=egl python code/train_maneuver.py --arch A --data dataset/maneuver dat
 
 ### Learned grounding detector (optional but recommended — the demo-distance headline needs it)
 
-The repo ships **no weights**, so out of the box perception uses the classical HSV+depth grounder (a clear log line says so). To get the learned-grounding numbers, generate the detector dataset and train it (~1 h on a GB10-class GPU; the deploy path auto-picks the checkpoint up at `runs/nx6_heatmap_A/model_best.pt`, or set `GROUND_NET_CKPT`):
+The repo ships **no weights**, so out of the box perception uses the classical HSV+depth grounder (a clear log line says so). To get the learned-grounding numbers, generate the detector dataset and train it (~1.5 h on a GB10-class GPU; the deploy path auto-picks the checkpoint up at `runs/nx6_heatmap_B/model_best.pt`, or set `GROUND_NET_CKPT`):
 
 ```bash
 # ~11k RGBD frames with pixel-perfect MuJoCo segmentation labels (both deploy cameras,
@@ -154,12 +154,14 @@ The repo ships **no weights**, so out of the box perception uses the classical H
 MUJOCO_GL=egl python code/gen_det_dataset.py --n-easy 90 --n-demo 180 --n-search 80 \
     --seed 7001 --out dataset/det_v1
 
-# Query-conditioned heatmap detector, 0.9M params, from scratch (no pretrained backbone)
-MUJOCO_GL=egl python code/train_nx6_heatmap.py --data dataset/det_v1 --out runs/nx6_heatmap_A \
-    --epochs 60 --batch 256 --lr 3e-3
+# Query-conditioned heatmap detector, 0.9M params, from scratch (no pretrained backbone).
+# Strengthened same-color/different-shape hard-negative sampling + far-range/wide-bearing
+# oversampling, trained to full 60-epoch cosine convergence.
+MUJOCO_GL=egl python code/train_nx6_heatmap.py --data dataset/det_v1 --out runs/nx6_heatmap_B \
+    --epochs 60 --batch 256 --lr 3e-3 --hard-color-negs 1 --far-oversample 1
 
 # Offline detection metrics (val/test splits)
-MUJOCO_GL=egl python code/eval_nx6_heatmap.py --ckpt runs/nx6_heatmap_A/model_best.pt --data dataset/det_v1
+MUJOCO_GL=egl python code/eval_nx6_heatmap.py --ckpt runs/nx6_heatmap_B/model_best.pt --data dataset/det_v1
 ```
 
 ---

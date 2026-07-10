@@ -213,8 +213,22 @@ def gaussian_heatmap(h, w, cx, cy, sigma=2.5):
 # Example index: (row_idx, class_id, color_id, target_label_or_None)
 # ---------------------------------------------------------------------------
 def build_example_index(cache: SplitCache, rng: np.random.Generator,
-                        neg_per_object_frame: int = 1, neg_per_empty_frame: int = 2):
-    """One entry per positive label + sampled negative queries per frame."""
+                        neg_per_object_frame: int = 1, neg_per_empty_frame: int = 2,
+                        hard_color_negs: int = 0, hard_shape_negs: int = 0):
+    """One entry per positive label + sampled negative queries per frame.
+
+    `hard_color_negs`/`hard_shape_negs` (NX-14 detector v2, docs/nx14_detector_v2.md):
+    additional negatives per object-containing frame, drawn specifically from the
+    "hard" complement -- same COLOR as a present object but a DIFFERENT class
+    (hard_color, the exact same-color/different-shape twin-distractor confusion
+    docs/gen1_multiseed.md §3.3 and docs/nx6_train_heatmap.md §5's ep12 frame-80
+    echo both flag), or same CLASS but a different color (hard_shape). Default 0
+    for both reproduces v1's plain-uniform-complement sampling byte-for-byte (v1's
+    own negative draws land on such a hard combo only ~9% of the time despite it
+    being available on 100% of labeled frames -- see docs/nx14_detector_v2.md §1
+    dataset analysis -- hence this option, additive, not a replacement for the
+    base `neg_per_object_frame` random draw so overall negative diversity/precision
+    calibration on totally-unrelated queries is preserved too)."""
     examples = []
     n = len(cache)
     for i in range(n):
@@ -229,7 +243,50 @@ def build_example_index(cache: SplitCache, rng: np.random.Generator,
             for k in pick:
                 ci, co = complement[k]
                 examples.append((i, ci, co, None))
+
+        if labs and (hard_color_negs > 0 or hard_shape_negs > 0):
+            present_colors = {co for (_, co) in present}
+            present_classes = {ci for (ci, _) in present}
+            hard_color_pool = [c for c in complement if c[1] in present_colors]
+            hard_shape_pool = [c for c in complement if c[0] in present_classes and c[1] not in present_colors]
+            if hard_color_pool and hard_color_negs > 0:
+                k_n = min(hard_color_negs, len(hard_color_pool))
+                pick = rng.choice(len(hard_color_pool), size=k_n, replace=False)
+                for k in pick:
+                    ci, co = hard_color_pool[k]
+                    examples.append((i, ci, co, None))
+            if hard_shape_pool and hard_shape_negs > 0:
+                k_n = min(hard_shape_negs, len(hard_shape_pool))
+                pick = rng.choice(len(hard_shape_pool), size=k_n, replace=False)
+                for k in pick:
+                    ci, co = hard_shape_pool[k]
+                    examples.append((i, ci, co, None))
     return examples
+
+
+def oversample_far_or_wide(examples: list, extra_copies: int = 1,
+                           dist_thresh_m: float = 6.0, bearing_thresh_deg: float = 20.0):
+    """NX-14 detector v2 (docs/nx14_detector_v2.md §1 dataset analysis): det_v1's
+    positive labels are only ~11% beyond 6m and only ~4.5% combine >6m with
+    >15deg |bearing| -- the far-range/growing-bearing regime that
+    docs/nx7_adoption.md's ep1 root-cause trace flagged as the detector's raw-
+    confidence collapse geometry (mostly <0.1, noise-floor peaks, during the
+    stuck window). Duplicates positive examples meeting EITHER threshold
+    `extra_copies` additional times (each duplicate independently re-augmented
+    per-epoch since HeatmapDataset's per-example RNG is seeded by its list
+    index, not by content) -- a bounded, reweighting-only mitigation (no dataset
+    regen) per the task brief's "prefer reweighting/sampling" instruction.
+    No-op (extra_copies=0) reproduces the base example list unchanged."""
+    if extra_copies <= 0:
+        return examples
+    extra = []
+    for ex in examples:
+        _, _, _, lab = ex
+        if lab is None:
+            continue
+        if lab["dist_gt"] > dist_thresh_m or abs(lab["bearing_gt"]) > bearing_thresh_deg:
+            extra.extend([ex] * extra_copies)
+    return examples + extra
 
 
 # ---------------------------------------------------------------------------
