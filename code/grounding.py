@@ -1034,6 +1034,7 @@ _ground_net_class_names = None     # populated on first successful load (nx6_hea
 _ground_net_color_names = None     # populated on first successful load (nx6_heatmap_model.COLOR_NAMES)
 _ground_net_widefov_warned = False # one-shot warning: widefov cam_type is untested/unsupported
 _ground_net_fallback_warned = False  # NX-9: one-shot notice for the ckpt-missing classical fallback
+_ground_net_optout_notified = False  # VR-1: one-shot notice when GROUND_NET=0 explicitly disables the detector
 _GROUND_NET_LAT_MS: list = []      # per-cycle inference latency (ms), module-level log
 
 # NX-7 FIX B track state (dist_m, bearing_rad) of the last ACCEPTED detection
@@ -1259,6 +1260,13 @@ def ground(
     # opt-in flag but would brick a default-ON deploy without weights). The
     # fallback decision is per-process (load failure is sticky in
     # _get_ground_net_detector()) and announced once, clearly, at first use.
+    global _ground_net_optout_notified
+    if not GROUND_NET and not _ground_net_optout_notified:
+        # VR-1 friction fix: the explicit opt-out path previously printed
+        # nothing, leaving no evidence of which backend produced a result.
+        _ground_net_optout_notified = True
+        print("[grounding] GROUND_NET=0: learned detector disabled by env; "
+              "using the classical HSV+depth pipeline.", flush=True)
     if GROUND_NET:
         _det = _get_ground_net_detector()
         if _det is not None:

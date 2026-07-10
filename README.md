@@ -142,7 +142,14 @@ MUJOCO_GL=egl python code/train_maneuver.py --arch A --data dataset/maneuver dat
     --epochs 10 --batch 128 --lr 5e-5 --device cuda
 ```
 
-> **Select checkpoints by closed-loop success, not offline val-loss** (the two diverge — in our maneuver runs the val-loss minimum is ~27pp worse in closed loop than the behavioral peak, which lands in the first ~3 epochs). For goto use `runs/demo_dart_A/epoch_0003.pt`; for maneuver, sweep the early epochs with `eval_maneuver.py` and take the closed-loop best (epoch 2 in the released run; a from-scratch reproduction peaked at epoch 3, same 73.3%). Copy the chosen ones to `checkpoint/goto_best.pt` and `checkpoint/maneuver_best.pt` (the demo/eval scripts load those by default).
+> **Select checkpoints by closed-loop success, not offline val-loss** (the two diverge — in our maneuver runs the val-loss minimum is ~27pp worse in closed loop than the behavioral peak, which lands in the first ~3 epochs). For goto use `runs/demo_dart_A/epoch_0003.pt`; for maneuver, sweep the early epochs with `eval_maneuver.py` and take the closed-loop best (epoch 2 in the released run; a from-scratch reproduction peaked at epoch 3, same 73.3%).
+
+```bash
+# Install the selected checkpoints where the demo/eval scripts look for them
+mkdir -p checkpoint
+cp runs/demo_dart_A/epoch_0003.pt checkpoint/goto_best.pt
+cp runs/maneuver_A/epoch_0002.pt  checkpoint/maneuver_best.pt
+```
 
 ### Learned grounding detector (optional but recommended — the demo-distance headline needs it)
 
@@ -226,7 +233,7 @@ MUJOCO_GL=egl python code/fancy_demo.py --smoke --n-smoke 6 --device cuda --out 
 ```
 
 Example prompts: `find the red ball` · `go to the orange cone` · `find the purple ball then find the yellow cube` · `turn left after passing the blue cube`.
-Use **red / orange / yellow / purple** objects for the most reliable grounding (cyan/blue can collide with the wall color in HSV — a documented limitation).
+Use **red / orange / yellow / purple** objects for the most reliable grounding (cyan/blue can collide with the wall color in HSV — a documented limitation). Typed instructions drive the rollout: the named object is matched against the current scene (ambiguous references get a clarification; unknown objects get the scene's object list). A small fraction of random scenes hit the documented walking-instability residual (robot veers off or stalls) — a new random scene loads automatically after each attempt, so just submit again.
 
 To view the web UI from your laptop over SSH: `ssh -L 5001:localhost:5001 <user>@<host>`, run the command above on the host, then open `http://localhost:5001` locally.
 

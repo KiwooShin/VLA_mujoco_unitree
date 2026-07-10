@@ -55,6 +55,26 @@ in the "attempt 1" re-gate).
 
 See docs/nx1_scan.md for the full design writeup, both gate-eval attempts,
 and the final per-episode results.
+
+NX-12 (docs/nx12_turn_dwell.md) TRIED, NOT ADOPTED: an intra-leg forced-dwell
+extension (bounding CONTINUOUS rotation to 45 degrees within a leg via a
+sub-dwell, rather than only at the 90/165-degree leg boundary) was built and
+mechanism-tested against the two byte-identical fresh-seed scan-phase falls
+`docs/gen1_multiseed.md` §3.1 diagnosed (demo seed1000 ep12, seed2000 ep2,
+both spawn_yaw=180, x=4.125). At two tested parameter points (45deg/40-step
+and 20deg/80-step sub-dwells) the fall was NOT eliminated in either case --
+only delayed (256 -> 314 -> 553 realized steps) while the robot kept
+drifting toward the wall behind its spawn (x drifted from 4.125 to as far as
+5.011, arena wall face at 5.45) and consuming materially more of the scan
+step budget (a control passer, demo seed999 ep9, went from 1507 to 1653
+realized steps against a 1700-step cap, a regression-risk timing squeeze
+with no corresponding benefit). Root cause is therefore NOT "a single
+continuous-rotation segment exceeds an OOD length" (a 90-degree/~200-step
+leg0 is already far under the ~470-step/323-degree ceiling and still falls);
+the evidence instead points at a spawn/heading-specific translational-drift-
+during-in-place-turning instability that intra-leg dwell insertion does not
+arrest -- see the doc for full traces. Not adopted; no default-path constant
+here was changed as a result of that investigation.
 """
 
 from __future__ import annotations

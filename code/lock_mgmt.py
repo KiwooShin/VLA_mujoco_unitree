@@ -20,28 +20,36 @@ passing episodes without fixing their target episodes) and remain default OFF
     LOCK_M3=0   disables the innovation gate + incumbent inertia (association gating) -- ON by default
     LOCK_M4=1   enables the divergence watchdog (drop + rescan on a monotonic dist trend) -- OFF by default (REJECT, docs/nx2_iso.md)
     LOCK_M5=1   enables bounded coast -> reroute to rescan after hold-goal-horizon expiry -- OFF by default (bundled w/ REJECTed M2, docs/nx2_iso.md)
+    LOCK_M7=1   enables the odometry-coherence watchdog (drop + rescan when walked
+                displacement toward the goal bearing isn't matched by a commensurate
+                goal-distance shrink) -- OFF by default (NX-5, docs/nx5_coherence.md,
+                pending gate verdict)
 
-With M1/M3 at their new ON defaults and M2/M4/M5 left at their OFF defaults,
+With M1/M3 at their new ON defaults and M2/M4/M5/M7 left at their OFF defaults,
 every public method below matches the fully-validated `eval/nx2_combined_*`
 gate results (demo 10/15, easy 15/15, search 14/15 -- see docs/nx2_final.md).
-Setting all five of LOCK_M1..LOCK_M5=0 reproduces the pre-NX-2 byte-identical
-pass-through behavior (see per-method docstrings) documented in
-docs/nx2_impl.md. This is deliberate: it means the two call sites only need
-ONE extra function call per decision point, not a maze of conditionals, and
-both the "all-off legacy" and "shipped-defaults" properties are enforced
-structurally rather than by convention.
+Setting LOCK_M1=0 LOCK_M2=0 LOCK_M3=0 LOCK_M4=0 LOCK_M5=0 (LOCK_M7 is already
+off by default and structurally independent of the other four) reproduces the
+pre-NX-2 byte-identical pass-through behavior (see per-method docstrings)
+documented in docs/nx2_impl.md. This is deliberate: it means the two call
+sites only need ONE extra function call per decision point, not a maze of
+conditionals, and both the "all-off legacy" and "shipped-defaults" properties
+are enforced structurally rather than by convention.
 
-Mandatory carve-outs (docs/rs1_lock_mgmt.md risk #2): M3's innovation gate and
-M4's divergence watchdog must NOT fire on the two legitimate (dist,bearing)
-discontinuities this codebase already knows about -- the CAM-2 fallback
-probe-adopt event and an `_active_cam` Schmitt-trigger flip (both only exist
-in inferencer.py; eval_search.py has no second camera and never calls
-`mark_discontinuity()`). Callers signal these via `LockGate.mark_discontinuity()`
-at the point the event happens; the resulting cooldown window bypasses M3's
-gate for new detections and suppresses M4's trigger, and clears the M4 dist
-window so stale pre-event samples cannot corrupt the post-event trend check.
+Mandatory carve-outs (docs/rs1_lock_mgmt.md risk #2): M3's innovation gate,
+M4's divergence watchdog, and M7's odometry-coherence watchdog must NOT fire
+on the two legitimate (dist,bearing) discontinuities this codebase already
+knows about -- the CAM-2 fallback probe-adopt event and an `_active_cam`
+Schmitt-trigger flip (both only exist in inferencer.py; eval_search.py has no
+second camera and never calls `mark_discontinuity()`). Callers signal these
+via `LockGate.mark_discontinuity()` at the point the event happens; the
+resulting cooldown window bypasses M3's gate for new detections, suppresses
+M4's trigger, clears the M4 dist window so stale pre-event samples cannot
+corrupt the post-event trend check, AND resets M7's accumulation window
+(pre/post-handoff distances come from different camera geometries and are
+not comparable).
 
-Rescans triggered by M4/M5 reuse NX-1's `BidirectionalScanSchedule`
+Rescans triggered by M4/M5/M7 reuse NX-1's `BidirectionalScanSchedule`
 (`code/scan_sched.py`) via `ReacquisitionScan` below -- never an unbounded
 spin. This is a SEPARATE small wrapper from the callers' own initial-scan
 mechanisms (inferencer.py's absolute-step H3 sweep, eval_search.py's own
@@ -51,6 +59,16 @@ would immediately "time out" since the absolute step is already well past
 their timeout constant by the time a mid-episode rescan can trigger.
 `ReacquisitionScan` tracks its own LOCAL step counter from the moment it is
 constructed, so it is safe to instantiate fresh at any point in an episode.
+
+M7 additionally applies a short-term (not hard-block) RE-LOCK PENALTY after
+it fires: a fresh detection landing within `M7_PENALTY_BEARING_DEG` /
+`M7_PENALTY_DIST_TOL_M` of the just-dropped lock's (bearing, dist) needs
+`M7_PENALTY_CONFIRM_M`-of-`M7_PENALTY_CONFIRM_N` mutually-consistent hits
+(instead of the usual single-frame confirm) for `M7_PENALTY_CYCLES` cycles --
+this exists specifically so a dropped false lock can't instantly re-seed
+itself on the very next frame (the mechanism that killed M4, docs/nx2_final.md
+M4 section), while a real target sitting nearby can still relock within a
+couple of frames rather than being hard-blocked.
 
 See docs/nx2_impl.md for the full write-up, chosen constants, and the
 empirical evidence behind the M1 floor value.
@@ -83,6 +101,8 @@ LOCK_M3 = _env_flag("LOCK_M3", default="1")   # innovation gate + incumbent iner
 LOCK_M2 = _env_flag("LOCK_M2")   # N-of-M tentative->confirmed
 LOCK_M4 = _env_flag("LOCK_M4")   # divergence watchdog
 LOCK_M5 = _env_flag("LOCK_M5")   # bounded coast -> reroute to rescan
+# M7: NX-5 (docs/nx5_coherence.md), pending gate verdict -> default OFF, opt-in.
+LOCK_M7 = _env_flag("LOCK_M7")   # odometry-coherence watchdog
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +163,29 @@ M4_TREND_MARGIN_M               = 0.5     # metres
 M4_EXEMPT_CYCLES_AFTER_CONFIRM  = 15       # cycles after any (re)confirmation
 M4_EXEMPT_CYCLES_AROUND_HANDOFF = 2        # +/- cycles around a legit discontinuity
 
+# --- M7: odometry-coherence watchdog (docs/nx5_coherence.md) ---
+# Sliding DISTANCE window (not a cycle/step count -- M4's documented fragility,
+# docs/nx2_final.md: a burst of heading-correction transients tripped M4's
+# 15-cycle window on ep13 without the robot actually diverging). Once the
+# CONFIRMED lock's commanded/measured displacement projected toward the goal
+# bearing accumulates to M7_X_WALK_M while walking, the goal distance must
+# have shrunk by at least M7_K_MIN_FRAC * M7_X_WALK_M over the same window --
+# a real static target satisfies this by construction (the robot is walking
+# toward it); a fixed wrong-depth pseudo-point (ep0/ep5's ~5.45m sliver blob
+# vs a true 3.3-3.5m target, docs/fa1_failures.md) does not.
+M7_X_WALK_M               = 1.75   # metres -- task brief's 1.5-2.0m band, midpoint
+M7_K_MIN_FRAC             = 0.4    # required shrink = K_MIN_FRAC * X_WALK_M
+M7_MIN_GOAL_DIST_M        = 1.5    # endgame carve-out: suspend below this (proximity-cam territory)
+# Short-term (not hard-block) re-lock penalty after an M7 trigger -- prevents
+# an instant same-blob re-confirm (the failure that killed M4, docs/nx2_final.md).
+M7_PENALTY_CYCLES         = 50     # cycles the penalty stays active
+M7_PENALTY_BEARING_DEG    = 10.0   # +/- degrees around the dropped lock's bearing
+M7_PENALTY_DIST_TOL_M     = 0.75   # metres tolerance around the dropped lock's distance
+M7_PENALTY_CONFIRM_M      = 2      # of the last N cycles must be mutually consistent...
+M7_PENALTY_CONFIRM_N      = 2      # ...to re-confirm while inside the penalty zone
+M7_PENALTY_TOL_DIST_M     = 0.6    # metres (corroboration tolerance, reuses M2's values)
+M7_PENALTY_TOL_BEARING_DEG = 12.0  # degrees (corroboration tolerance, reuses M2's values)
+
 
 def _ang_diff_rad(a: float, b: float) -> float:
     """Signed angular difference a-b, wrapped to (-pi, pi]."""
@@ -177,8 +220,12 @@ class LockGate:
          lock (force_drop()) and re-enter scan via a fresh
          `ReacquisitionScan` instead of freezing forever.
       4. Exactly once per grounding cycle (regardless of hit/miss/reject),
-         call `end_of_cycle(current_best_dist_estimate, walking)`; if True,
-         M4 has fired -- drop the lock and re-enter scan, same action as (3).
+         call `end_of_cycle(current_best_dist_estimate, walking, proj_disp_m)`
+         (the `proj_disp_m` arg is M7-only -- commanded/measured base
+         displacement since the last call, projected onto the current goal
+         bearing; omit/None if not computing it). If True, M4 or M7 has
+         fired (`self.last_trigger` says which) -- drop the lock and
+         re-enter scan, same action as (3).
     """
 
     def __init__(self):
@@ -190,6 +237,17 @@ class LockGate:
         self._confirm_cycle     = None
         self._cycle_count       = 0
         self._discontinuity_cooldown = 0
+        self.last_trigger       = None    # 'M4' | 'M7' | None -- diagnostics only
+
+        # M7 accumulation window state.
+        self._m7_accum          = 0.0
+        self._m7_window_dist0   = None
+        # M7 short-term re-lock penalty state (persists across force_drop() --
+        # it is deliberately keyed on the DROPPED lock, not the current one).
+        self._m7_penalty_bearing       = None
+        self._m7_penalty_dist          = None
+        self._m7_penalty_expire_cycle  = None
+        self._m7_penalty_hist          = deque(maxlen=M7_PENALTY_CONFIRM_N)
 
     # -- carve-out signal (docs/rs1_lock_mgmt.md risk #2) --
     def mark_discontinuity(self, cooldown_cycles: int = M4_EXEMPT_CYCLES_AROUND_HANDOFF) -> None:
@@ -206,6 +264,12 @@ class LockGate:
         """
         self._discontinuity_cooldown = max(self._discontinuity_cooldown, cooldown_cycles)
         self._dist_hist.clear()
+        # M7: pre/post-handoff distances are from different camera geometries
+        # (docs/nx5_coherence.md carve-out) -- reset the accumulation window so
+        # it restarts cleanly from the first post-handoff cycle instead of
+        # comparing across the discontinuity.
+        self._m7_accum        = 0.0
+        self._m7_window_dist0 = None
 
     def _confirm(self, entry: dict) -> None:
         self.state              = 'CONFIRMED'
@@ -213,6 +277,23 @@ class LockGate:
         self._confirm_cycle     = self._cycle_count
         self._challenger_streak = 0
         self._m2_hist.clear()
+        # M7: (re)start the coherence-accumulation window fresh from this
+        # confirm's own distance -- never carry a stale reference across a
+        # fresh/re acquisition.
+        self._m7_accum          = 0.0
+        self._m7_window_dist0   = entry['dist']
+
+    def _m7_in_penalty_zone(self, dist: float, bearing_rad: float) -> bool:
+        """True iff an active M7 re-lock penalty exists and (dist, bearing)
+        falls within its bearing/distance tolerance of the dropped lock."""
+        if self._m7_penalty_expire_cycle is None:
+            return False
+        if self._cycle_count >= self._m7_penalty_expire_cycle:
+            return False
+        d_bearing = abs(_ang_diff_rad(bearing_rad, self._m7_penalty_bearing))
+        d_dist    = abs(dist - self._m7_penalty_dist)
+        return (d_bearing <= math.radians(M7_PENALTY_BEARING_DEG) and
+                d_dist    <= M7_PENALTY_DIST_TOL_M)
 
     def gate_detection(self, dist: float, bearing_rad: float, area: Optional[float]) -> bool:
         """
@@ -237,6 +318,27 @@ class LockGate:
         entry = dict(dist=dist, bearing=bearing_rad, area=area)
 
         if self.state != 'CONFIRMED':
+            # M7 (docs/nx5_coherence.md): short-term, NOT hard-block, re-lock
+            # penalty. A fresh candidate landing near the (bearing, dist) of a
+            # lock M7 JUST dropped needs M7_PENALTY_CONFIRM_M-of-N corroborating
+            # cycles instead of the usual instant single-frame confirm -- this
+            # is specifically what M4 lacked (docs/nx2_final.md) and let a
+            # dropped false lock re-seed itself on the very next frame.
+            # Outside the penalty zone (different bearing/dist, or the penalty
+            # has expired), behaviour is completely unchanged.
+            if LOCK_M7 and self._m7_in_penalty_zone(dist, bearing_rad):
+                self._m7_penalty_hist.append(entry)
+                latest = self._m7_penalty_hist[-1]
+                tol_bearing_rad = math.radians(M7_PENALTY_TOL_BEARING_DEG)
+                n_consistent = sum(
+                    1 for h in self._m7_penalty_hist
+                    if abs(h['dist'] - latest['dist']) < M7_PENALTY_TOL_DIST_M
+                    and abs(_ang_diff_rad(h['bearing'], latest['bearing'])) < tol_bearing_rad
+                )
+                if n_consistent >= M7_PENALTY_CONFIRM_M:
+                    self._confirm(entry)
+                    return True
+                return False
             if not LOCK_M2:
                 self._confirm(entry)
                 return True
@@ -294,20 +396,37 @@ class LockGate:
         self._challenger_streak = 0
         return False
 
-    def end_of_cycle(self, best_dist_estimate: float, walking: bool) -> bool:
+    def end_of_cycle(self, best_dist_estimate: float, walking: bool,
+                      proj_disp_m: Optional[float] = None) -> bool:
         """
         Call exactly once per grounding cycle, regardless of hit/miss/gate
         outcome, with the caller's current best distance estimate for this
-        cycle (its EMA'd/held goal distance). Returns True iff M4 has
-        detected a divergent lock and the caller should force_drop() +
-        re-enter scan.
+        cycle (its EMA'd/held goal distance) and (for M7) the commanded/
+        measured base displacement since the last call, PROJECTED onto the
+        current goal bearing (metres, may be negative; None/0 if unavailable
+        or not applicable, e.g. the very first cycle). Returns True iff M4
+        or M7 has detected a bad lock and the caller should force_drop() +
+        re-enter scan; `self.last_trigger` records which one ('M4'|'M7') for
+        logging/diagnostics.
 
-        With LOCK_M4 off this always returns False (dist-window bookkeeping
-        still runs harmlessly for internal state consistency but has no
-        externally observable effect).
+        With LOCK_M4/LOCK_M7 both off this always returns False (window
+        bookkeeping still runs harmlessly for internal state consistency but
+        has no externally observable effect).
+
+        M7 (docs/nx5_coherence.md): sliding DISTANCE window, not a cycle/step
+        count (M4's documented fragility -- a burst of heading-correction
+        transients can trip a fixed-cycle window without the robot actually
+        diverging, docs/nx2_final.md). Accumulates `proj_disp_m` while
+        CONFIRMED + walking + no discontinuity cooldown + goal distance >=
+        M7_MIN_GOAL_DIST_M (endgame/proximity-cam carve-out); once the
+        accumulation reaches M7_X_WALK_M, the goal distance must have shrunk
+        by >= M7_K_MIN_FRAC * M7_X_WALK_M over that same window or M7 fires.
+        A passed check SLIDES the window forward (reset accum/reference to
+        the current cycle) rather than freezing a one-shot check.
         """
         self._cycle_count += 1
         triggered = False
+
         if self.state == 'CONFIRMED':
             self._dist_hist.append(best_dist_estimate)
             if LOCK_M4 and walking and self._discontinuity_cooldown == 0:
@@ -318,8 +437,48 @@ class LockGate:
                     window_min = min(self._dist_hist)
                     if (best_dist_estimate - window_min) > M4_TREND_MARGIN_M:
                         triggered = True
+                        self.last_trigger = 'M4'
+
+            if (LOCK_M7 and walking and self._discontinuity_cooldown == 0
+                    and best_dist_estimate >= M7_MIN_GOAL_DIST_M):
+                if self._m7_window_dist0 is None:
+                    # First eligible cycle after a confirm/discontinuity
+                    # reset/endgame suspension -- (re)start the window here.
+                    self._m7_window_dist0 = best_dist_estimate
+                    self._m7_accum        = 0.0
+                else:
+                    self._m7_accum += (proj_disp_m or 0.0)
+                    if self._m7_accum >= M7_X_WALK_M:
+                        shrink   = self._m7_window_dist0 - best_dist_estimate
+                        required = M7_K_MIN_FRAC * M7_X_WALK_M
+                        if shrink >= required:
+                            # Coherent -- slide the window forward.
+                            self._m7_window_dist0 = best_dist_estimate
+                            self._m7_accum        = 0.0
+                        else:
+                            # Incoherent: walked >= X_WALK toward the bearing
+                            # without the distance shrinking commensurately --
+                            # a static wrong-depth pseudo-point, not a real
+                            # approach. Snapshot the dropped lock's
+                            # (bearing, dist) for the short-term re-lock
+                            # penalty BEFORE the caller's force_drop() clears
+                            # `_incumbent`.
+                            if self._incumbent is not None:
+                                self._m7_penalty_bearing = self._incumbent['bearing']
+                                self._m7_penalty_dist    = self._incumbent['dist']
+                                self._m7_penalty_expire_cycle = (
+                                    self._cycle_count + M7_PENALTY_CYCLES)
+                                self._m7_penalty_hist.clear()
+                            triggered = True
+                            self.last_trigger = 'M7'
         else:
             self._dist_hist.clear()
+            # M7's window is only meaningful while CONFIRMED and is properly
+            # (re)started in `_confirm()`; clear defensively so a stale
+            # window can't leak into a future confirm via a code-path we
+            # haven't anticipated.
+            self._m7_accum        = 0.0
+            self._m7_window_dist0 = None
 
         if self._discontinuity_cooldown > 0:
             self._discontinuity_cooldown -= 1
@@ -337,13 +496,21 @@ class LockGate:
 
     def force_drop(self) -> None:
         """Reset to 'NONE' -- caller must separately clear its own
-        _goal_ema/_last_known_goal and re-enter scan (see ReacquisitionScan)."""
+        _goal_ema/_last_known_goal and re-enter scan (see ReacquisitionScan).
+
+        Deliberately does NOT touch the M7 penalty state
+        (_m7_penalty_bearing/_dist/_expire_cycle/_hist): that state is keyed
+        on the just-DROPPED lock and must survive exactly this call so the
+        short-term re-lock penalty (docs/nx5_coherence.md) can apply to
+        whatever the caller re-locks onto next."""
         self.state              = 'NONE'
         self._m2_hist.clear()
         self._incumbent         = None
         self._challenger_streak = 0
         self._dist_hist.clear()
         self._confirm_cycle     = None
+        self._m7_accum          = 0.0
+        self._m7_window_dist0   = None
 
 
 # ---------------------------------------------------------------------------
