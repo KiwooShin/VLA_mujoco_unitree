@@ -493,6 +493,7 @@ def run_fancy_rollout(
     from code.eval_search import STOP_R_SEARCH, SCAN_ALIGNED_THR_DEG
     from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
                                   SCAN_DWELL_STEPS, SCAN_TIMEOUT as _SCAN_TIMEOUT_DEFAULT)
+    from code.lock_mgmt import ReacquisitionScan
     from code import avoid as _avoid
     from code.arena import CAM_HEAD_Z
 
@@ -613,6 +614,81 @@ def run_fancy_rollout(
     _scan_sched      = BidirectionalScanSchedule(scan_rate=SCAN_RATE,
                                                   leg_deg=SCAN_LEG_DEG,
                                                   dwell_steps=SCAN_DWELL_STEPS)
+
+    # NX-16 (docs/nx16_cone_stall.md): sustained-loss-of-lock recovery.
+    # code/inferencer.py / code/eval_search.py already have this exact
+    # mechanism (lock_mgmt.py's M5 "coast-expiry -> drop lock + bounded
+    # ReacquisitionScan"), but it is default-OFF there (LOCK_M5=0, REJECT-
+    # verdicted on the gated eval protocols as a GLOBAL toggle, docs/nx2_iso.md)
+    # and this file never imported lock_mgmt at all -- so a detection that is
+    # lost for good (never fewer than HOLD_GOAL_HORIZON=100 frames since last
+    # detection) left `cached_goal_vec` frozen FOREVER with no recovery path.
+    # Root-caused (docs/nx16_cone_stall.md): the GROUND_NET detector's
+    # confidence on a `cone` decays steadily as range closes under the
+    # (shallow-pitch) GROUNDING camera -- cones are ~1.5-2.3x taller than the
+    # other 3 shapes (code/arena.py's two-part cone mesh) and increasingly
+    # clip out of frame -- and can drop under GROUND_NET_TAU right at the
+    # GROUNDING/PROXIMITY handoff boundary (~1.6-1.8m, just above CAM_D_LO),
+    # so the CAM-2 fallback probe never gets an EMA distance to re-trigger
+    # the handoff on, and PROXIMITY itself also fails to (re)detect at that
+    # range. The image-blind goto policy then keeps consuming the stale,
+    # never-updated egocentric (dist,bearing), which is not re-grounded in
+    # the robot's actual (moving) pose -- pure open-loop dead reckoning that
+    # curves past the true target and settles into a stable orbit (exactly
+    # DR-1's "approach to 0.6-0.9m, reverse, rock-stable plateau" signature).
+    #
+    # Fix, scoped ENTIRELY to this file's own local state (does not read or
+    # write LOCK_M5 / lock_mgmt.LockGate, so code/inferencer.py's and
+    # code/eval_search.py's default behavior -- and the M5 REJECT verdict --
+    # are untouched): once a previously-SPOTTED lock has been missing for
+    # more than HOLD_GOAL_HORIZON frames, drop it and re-enter scan mode via
+    # a fresh ReacquisitionScan (own local step counter -- safe to start
+    # mid-episode, unlike re-arming `_scan_sched`/SCAN_TIMEOUT which are keyed
+    # off the episode's absolute step and would time out on the very next
+    # cycle). Bounded: if the rescan itself times out without reacquiring,
+    # falls back to the default forward-looking goal vector (same fallback
+    # the original never-spotted scan timeout already used) rather than
+    # freezing again.
+    #
+    # NX-16 mechanism-test finding: `ReacquisitionScan`'s own built-in bound
+    # reuses the shared SCAN_TIMEOUT=1150 (the INITIAL blind-scan's budget,
+    # sized for sweeping from a completely unknown bearing). A coast-expiry
+    # rescan starts from a MUCH better prior (it was tracking the target right
+    # up until the loss), and in gate testing reacquired within ~310-330
+    # steps whenever the target was actually re-detectable -- but on one seed
+    # where the target sat in a detector blind range no amount of turning
+    # could escape (a cone specifically, docs/nx16_cone_stall.md), letting the
+    # rescan run for a nearly-full ~1150-step continuous sweep before an
+    # eventual (lucky, drift-induced) reacquisition produced an abrupt
+    # scan-to-goto transition that ended in a fall on one of two repeated
+    # runs (the other repeat instead simply timed out, no fall either way --
+    # consistent with this being right at the edge of the policy's competence
+    # envelope for an atypically long uninterrupted turn-in-place, not a
+    # deterministic bug). Capping the LOCAL rescan budget well below the
+    # shared 1150 (NX16_RESCAN_MAX_STEPS, ~2x the observed successful-
+    # reacquisition time) keeps the common case (quick re-lock) unaffected
+    # while preventing this file's own rescan from ever running long enough
+    # to reach that observed instability regime -- falling back to the
+    # default goal (same as the pre-existing scan-timeout fallback, proven
+    # non-falling in DR-1's original 30+5-episode sweep) instead.
+    NX16_RESCAN_MAX_STEPS = 600
+    _using_rescan_sched = False
+    _rescan_sched        = None
+    _rescan_local_steps  = 0
+
+    def _lock_drop_and_rescan():
+        nonlocal _goal_ema, _last_known_goal, _frames_since_det
+        nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
+        nonlocal _avoid_bias_wz, _rescan_local_steps
+        _goal_ema               = None
+        _last_known_goal        = None
+        _frames_since_det       = 0
+        _scan_active            = True
+        _using_rescan_sched     = True
+        _rescan_sched           = ReacquisitionScan(scan_rate=SCAN_RATE)
+        _rescan_local_steps     = 0
+        cached_goal_vec         = np.array([2.0, 1.0, 0.0], dtype=np.float32)
+        _avoid_bias_wz          = 0.0
 
     # CAM-2 (docs/cam_p1.md, adopted champion): Schmitt-trigger handoff between the
     # GROUNDING camera (26° pitch, far/mid range) and the PROXIMITY camera (58° pitch,
@@ -850,6 +926,14 @@ def run_fancy_rollout(
                 _frames_since_det += 1
                 if _last_known_goal is not None and _frames_since_det <= HOLD_GOAL_HORIZON:
                     cached_goal_vec = _last_known_goal.copy()
+                elif (not _scan_active) and _frames_since_det > HOLD_GOAL_HORIZON:
+                    # NX-16: coast expired without ever re-detecting -- drop the
+                    # stale lock and re-enter scan instead of freezing forever
+                    # (see the module comment above `_lock_drop_and_rescan`).
+                    print(f"  [fancy] NX-16 lock coast-expired at step={step} "
+                          f"(frames_since_det={_frames_since_det}) -> drop+rescan",
+                          flush=True)
+                    _lock_drop_and_rescan()
 
             # NX-9 AVOID (docs/nx9_avoid.md): local obstacle avoidance --
             # same mechanism/carve-outs as code/inferencer.py's identical
@@ -879,12 +963,36 @@ def run_fancy_rollout(
 
         # Scan mode
         if _scan_active:
-            if step >= SCAN_TIMEOUT:
+            # NX-16: a coast-expiry drop+rescan (_lock_drop_and_rescan) uses a FRESH
+            # ReacquisitionScan (its own LOCAL step counter) instead of the initial
+            # `_scan_sched`/SCAN_TIMEOUT pair below, because SCAN_TIMEOUT is keyed on
+            # the episode's absolute `step` -- re-arming it mid-episode would time out
+            # on the very next cycle (step is already >> SCAN_TIMEOUT by then). This
+            # branch is only ever taken after a coast-expiry trigger; otherwise
+            # `_using_rescan_sched` stays False and the original H3-style scan below
+            # (bounded by the absolute-step SCAN_TIMEOUT) runs exactly as before.
+            if _using_rescan_sched:
+                if _rescan_local_steps >= NX16_RESCAN_MAX_STEPS:
+                    scan_wz = None   # NX-16 tighter local cap -- see comment above
+                else:
+                    scan_wz = _rescan_sched.step(yaw)
+                if scan_wz is None:
+                    _scan_active        = False
+                    _using_rescan_sched = False
+                    print(f"  [fancy] NX-16 RESCAN TIMEOUT step={step} "
+                          f"(local_steps={_rescan_local_steps}), "
+                          f"falling back to default goal", flush=True)
+                else:
+                    _rescan_local_steps += 1
+            elif step >= SCAN_TIMEOUT:
                 _scan_active = False
+                scan_wz = None
                 print(f"  [fancy] SCAN TIMEOUT step={step}", flush=True)
             else:
-                scan_steps += 1
                 scan_wz = _scan_sched.step(yaw)   # bounded CCW/CW schedule, dwells at 0.0
+
+            if scan_wz is not None:
+                scan_steps += 1
                 _scan_yaw_delta += scan_wz * SCAN_DT
 
                 prop_now = _build_proprio(data_mj, prev_action)
