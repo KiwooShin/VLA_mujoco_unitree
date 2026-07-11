@@ -22,6 +22,15 @@ import math
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+# GPU-rendering fix (2026-07-11): on glvnd systems where Mesa wins the EGL
+# vendor race (symptom: "libEGL warning: egl: failed to create dri2 screen"),
+# MuJoCo silently binds llvmpipe SOFTWARE rendering — measured 409 ms/frame
+# for a 640x480 offscreen render vs 1.3 ms on the actual GPU (315x). Steer
+# glvnd to the NVIDIA ICD when it exists and the user hasn't chosen one.
+_NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+if os.path.exists(_NVIDIA_EGL_ICD):
+    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", _NVIDIA_EGL_ICD)
+
 import numpy as np
 import mujoco
 
