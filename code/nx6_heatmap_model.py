@@ -224,6 +224,12 @@ class HeatmapDetector:
     def __init__(self, model: TinyHeatmapUNet, device: str = "cpu"):
         self.model = model.to(device).eval()
         self.device = device
+        # VF-1 (docs/vf1_showpiece.md): render-side-only cache of the last
+        # infer() call's confidence map, so a caller can display it (e.g.
+        # fancy_demo.py's detector-heatmap overlay) with ZERO extra inference.
+        # Pure numpy attribute, never read by any control-flow code path.
+        self.last_heat_prob = None   # (TARGET_H, TARGET_W) float32 in [0,1] or None
+        self.last_heat_meta = None   # dict(class_name, color_name, cam_type) or None
 
     @classmethod
     def load(cls, ckpt_path: str, device: str = "cpu"):
@@ -252,6 +258,13 @@ class HeatmapDetector:
         heat_logit, dist_resid = self.model(x_t, q_t)
         heat_logit = heat_logit[0].cpu().numpy()
         dist_resid = dist_resid[0].cpu().numpy()
+
+        # VF-1: cache the sigmoid confidence map from THIS forward pass (pure
+        # elementwise numpy op on the array already produced above -- no extra
+        # inference, no torch/CUDA interaction, no effect on decode_single's own
+        # independently-computed prob array below or on the returned detection).
+        self.last_heat_prob = 1.0 / (1.0 + np.exp(-heat_logit))
+        self.last_heat_meta = dict(class_name=class_name, color_name=color_name, cam_type=cam_type)
 
         return decode_single(heat_logit, dist_resid, depth_r, class_id, cam_type,
                               conf_thresh=conf_thresh)
