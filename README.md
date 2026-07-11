@@ -17,7 +17,7 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 | ![Long-range navigation](assets/gallery/01_long_range.gif) | ![Search with reversal](assets/gallery/02_search_reversal.gif) |
 | Long-range navigation — scan, spot the cube at 8 m, walk in with camera handoff. | Search with reversal — scan direction flips before locking on, then walks to the target. |
 | ![Multi-goal instruction](assets/gallery/03_multi_goal.gif) | ![Same-color decoy discrimination](assets/gallery/04_twin_decoy.gif) |
-| Multi-goal instruction — reach goal 1, HUD resets, then search and reach goal 2. | Same-color decoy discrimination — heatmap locks the cube, ignoring an identical-colored ball nearby. |
+| Multi-goal instruction — reach goal 1, goal-2 search continues from the goal-1 position. | Same-color decoy discrimination — heatmap locks the cube, ignoring an identical-colored ball nearby. |
 | ![Obstacle avoidance](assets/gallery/05_obstacle_weave.gif) | ![Detection-loss recovery](assets/gallery/06_loss_recovery.gif) |
 | Obstacle avoidance — repulsion arrow and path bend the robot around a blue cylinder. | Detection-loss recovery — lock expires into a re-scan, then reacquires and reaches the cone. |
 

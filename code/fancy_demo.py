@@ -82,9 +82,28 @@ BEV_W, BEV_H       = 640, 480  # BEV camera resolution
 EGO_W, EGO_H       = 320, 240  # ego camera resolution (native)
 STREAM_W            = BEV_W + EGO_W  # side-by-side width
 
-# BEV follow-camera parameters (45° elevation, diagonal azimuth)
-BEV_DISTANCE   = 6.0     # metres from robot
-BEV_ELEVATION  = -40.0   # degrees (negative = looking down)
+# BEV follow-camera parameters (diagonal azimuth, steep-diagonal elevation)
+#
+# VF-3 fix (docs/vf3_bev_fixes.md, user feedback #2 "move camera a little
+# further ... currently only part of field is visible"): BEV_DISTANCE=6.0 /
+# BEV_ELEVATION=-40.0 only ever showed a tight ~14x14m patch of ground
+# straight-line-asymmetric around the robot (e.g. robot at arena origin in
+# an ARENA_HALF_LONG=8.0 arena: visible ground x/y in [-11.0, 3.4] -- the
+# opposite walls, and often the target itself 4-9m away, were simply never
+# in frame). Re-derived analytically (ground-plane ray intersection of the
+# camera frustum's corners, `framing_calc.py`-style) and re-verified with
+# real renders: BEV_DISTANCE=28.0 / BEV_ELEVATION=-67.0 keeps the FULL
+# arena floor (all 4 walls, ARENA_HALF_LONG=8.0 half-size) in frame with a
+# comfortable margin for every robot position actually reachable by these
+# demos (single-goal excursions up to 7m in any direction, multi-goal
+# combined excursions up to the (±7.4,±7.4) corner) -- confirmed by
+# sweeping robot positions incl. the arena corners, smallest margin 1.6m
+# at the (-7.4,-7.4) corner. Steepening the elevation (not just pulling the
+# distance back at the old -40°) keeps the framing efficient (arena fills
+# most of the frame) instead of wastefully zoomed out with the old shallow
+# angle's asymmetric footprint. Azimuth (diagonal viewpoint) is unchanged.
+BEV_DISTANCE   = 28.0    # metres from robot
+BEV_ELEVATION  = -67.0   # degrees (negative = looking down)
 BEV_AZIMUTH    = 225.0   # degrees diagonal (SW view → robot in frame, facing right)
 BEV_LOOKAT_Z   = 0.3     # lookat height (ground-level scene)
 
@@ -217,23 +236,37 @@ def world_to_bev_pixel(
     """
     import mujoco
 
-    # Build camera view matrix from lookat / azimuth / elevation / distance
-    # MuJoCo uses azimuth (from +X, counter-clockwise), elevation (from XY plane)
+    # Build camera view matrix from lookat / azimuth / elevation / distance.
+    #
+    # VF-3 fix (docs/vf3_bev_fixes.md): the formula below was previously
+    # cam_fwd = (-sin(az)*cos(el), cos(az)*cos(el), sin(el)) -- i.e. the
+    # world-space (cos(az), sin(az)) direction rotated +90 deg. This does NOT
+    # match MuJoCo's real mjCAMERA_FREE convention, so every BEV overlay
+    # (FOV cone + path trail + AVOID viz) that goes through this function was
+    # silently drawn ~90 deg rotated from what the ACTUAL rendered BEV image
+    # (produced by renderer.render_tp() -> real MuJoCo camera math) shows.
+    #
+    # Ground truth for MuJoCo's real convention comes from code/arena.py's
+    # `_set_ego_cam` (empirically verified pitch-independent by CAM-P0,
+    # docs/cam_p0.md, via cam.distance=1.0): it sets cam.azimuth=degrees(yaw),
+    # cam.elevation=-pitch_deg, and its OWN forward vector (used to place
+    # `cam.lookat`) is (cos(pitch)*cos(yaw), cos(pitch)*sin(yaw), -sin(pitch))
+    # == (cos(el)*cos(az), cos(el)*sin(az), sin(el)) with el=-pitch, az=yaw.
+    # Verified empirically here too: rendering known-position colored markers
+    # via the real render_tp() and comparing their true pixel centroid against
+    # this function's projection dropped the error from 300-560px (old buggy
+    # formula) to 1-8px (this formula) across yaw=0/90/offset-position cases.
     az  = math.radians(bev_cam.azimuth)
     el  = math.radians(bev_cam.elevation)  # negative = below horizon
     dist = bev_cam.distance
 
-    # Camera position in world frame
-    # MuJoCo free camera: position = lookat + distance * (-sinaz*cosel, -cosaz*cosel, -sinel)
-    # Actually: MuJoCo azimuth measures from -Y (south) axis, counter-clockwise when viewed from top
-    # Let's compute cam position directly:
     cosel = math.cos(el)
     sinel = math.sin(el)
     cosaz = math.cos(az)
     sinaz = math.sin(az)
 
-    # Camera Z-axis (forward = from cam toward lookat)
-    cam_fwd = np.array([-sinaz * cosel, cosaz * cosel, sinel], dtype=np.float64)
+    # Camera forward (from cam toward lookat) -- MuJoCo's real convention.
+    cam_fwd = np.array([cosaz * cosel, sinaz * cosel, sinel], dtype=np.float64)
 
     lookat = np.array(bev_cam.lookat, dtype=np.float64)
     cam_pos = lookat - dist * cam_fwd
@@ -467,8 +500,29 @@ def draw_bev_overlays(
         cv2.circle(img, robot_pix, 6, (255, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(img, robot_pix, 7, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # (c) FOV CONE — robot ego camera wedge on the ground (±45° from robot_yaw, 3m range)
-    fov_half_rad = math.radians(45.0)  # ego cam FOV half-angle (90° FOVY → ±45°)
+    # (c) FOV CONE — the robot's ACTIVE detection camera's real horizontal FOV
+    # wedge on the ground, anchored at robot_yaw (== the camera's azimuth;
+    # arena._set_ego_cam sets cam.azimuth=degrees(yaw) exactly, no independent
+    # pan, for the ego/GROUNDING/PROXIMITY cameras alike).
+    #
+    # VF-3 fix (docs/vf3_bev_fixes.md): this used to be a hardcoded ±45 deg,
+    # from a comment that conflated the camera's VERTICAL FOVY with a
+    # horizontal half-angle ("90° FOVY -> ±45°"). Two separate errors:
+    #   1. The ACTUAL rendered FOVY is 45° (MuJoCo's model.vis.global_.fovy
+    #      default — see code/grounding.py's EGO_FOVY_RENDERED / "E6 fix v4"
+    #      comment), not the stale arena.EGO_FOVY=90 constant the old ±45 was
+    #      (incorrectly) derived from.
+    #   2. Even the correct FOVY needs the aspect-ratio pinhole conversion —
+    #      the same atan(tan(fovy/2)*w/h) formula this file already uses in
+    #      world_to_bev_pixel()/arena.get_ego_intrinsics() — to get the
+    #      HORIZONTAL half-angle, not a naive fovy/2.
+    # Real horizontal half-FOV for FOVY=45° at the GROUNDING/PROXIMITY cameras'
+    # shared 4:3 aspect (480x360 / 320x240 — both equal 4:3, so this is the
+    # same value regardless of which one is currently active):
+    # atan(tan(22.5°)*4/3) = 28.87°.
+    _FOV_CONE_FOVY_DEG = 45.0        # actual rendered FOVY (all non-widefov cams)
+    _FOV_CONE_ASPECT   = 4.0 / 3.0   # GROUNDING_W/H == PROXIMITY_W/H aspect ratio
+    fov_half_rad = math.atan(math.tan(math.radians(_FOV_CONE_FOVY_DEG) / 2.0) * _FOV_CONE_ASPECT)
     fov_range    = 3.0                  # metres shown
     N_CONE_PTS   = 10
     cone_pts = []
@@ -497,17 +551,19 @@ def draw_bev_overlays(
     if target_xy is not None:
         tgt_pix = w2p([target_xy[0], target_xy[1], 0.0])
         if 0 <= tgt_pix[0] < W and 0 <= tgt_pix[1] < H:
-            # Pulsing effect based on time
-            pulse = 1.0  # static for video (no time.time() drift in video)
-            r = 14
-            cv2.circle(img, tgt_pix, r, COLOR_TARGET_RING, 2, cv2.LINE_AA)
+            # VF-4 (user verification pass): the previous r=14 double ring +
+            # center-filling crosshair completely covered the target mesh
+            # (~5-9 px at whole-arena zoom), making it impossible to SEE that
+            # the marker is actually on the object. Keep the center clear:
+            # thin open ring + 4 corner ticks OUTSIDE the ring, nothing within
+            # r-2 px of the object itself.
+            r = 13
+            cv2.circle(img, tgt_pix, r, COLOR_TARGET_RING, 1, cv2.LINE_AA)
             cv2.circle(img, tgt_pix, r + 5, COLOR_TARGET_RING, 1, cv2.LINE_AA)
-            # Cross hair
-            sz = 8
-            cv2.line(img, (tgt_pix[0] - sz, tgt_pix[1]), (tgt_pix[0] + sz, tgt_pix[1]),
-                     COLOR_TARGET_RING, 2, cv2.LINE_AA)
-            cv2.line(img, (tgt_pix[0], tgt_pix[1] - sz), (tgt_pix[0], tgt_pix[1] + sz),
-                     COLOR_TARGET_RING, 2, cv2.LINE_AA)
+            for sx, sy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                p_in  = (tgt_pix[0] + sx * (r + 6), tgt_pix[1] + sy * (r + 6))
+                p_out = (tgt_pix[0] + sx * (r + 12), tgt_pix[1] + sy * (r + 12))
+                cv2.line(img, p_in, p_out, COLOR_TARGET_RING, 2, cv2.LINE_AA)
         else:
             # Target off-screen — draw arrow pointing toward it from robot
             # Direction arrow from robot
@@ -537,10 +593,17 @@ def draw_bev_overlays(
         if (0 <= tgt_pix2[0] < W and 0 <= tgt_pix2[1] < H and
                 0 <= robot_pix[0] < W and 0 <= robot_pix[1] < H and
                 state in (STATE_MOVING, STATE_LOCATED)):
-            if FEAT_TRAIL and target_color_bgr is not None:
-                _dashed_line(img, robot_pix, tgt_pix2, target_color_bgr, thickness=2)
-            else:
-                cv2.line(img, robot_pix, tgt_pix2, (180, 80, 255), 1, cv2.LINE_AA)
+            # VF-4: stop the goal line at the target ring's edge so the line
+            # never crosses over (and hides) the target mesh itself.
+            _gdx = tgt_pix2[0] - robot_pix[0]
+            _gdy = tgt_pix2[1] - robot_pix[1]
+            _glen = math.hypot(_gdx, _gdy)
+            if _glen > 22.0:
+                _gend = (int(tgt_pix2[0] - _gdx / _glen * 20), int(tgt_pix2[1] - _gdy / _glen * 20))
+                if FEAT_TRAIL and target_color_bgr is not None:
+                    _dashed_line(img, robot_pix, _gend, target_color_bgr, thickness=2)
+                else:
+                    cv2.line(img, robot_pix, _gend, (180, 80, 255), 1, cv2.LINE_AA)
 
     # VF-1 item 2: AVOID repulsion visualization (corridor tint + arrow + chip).
     # Pure read of already-computed avoid_bias_wz/avoid_info -- no-op internally
@@ -985,6 +1048,22 @@ def run_fancy_rollout(
     # the per-sub-goal `prompt` (e.g. multi-goal's combined instruction).
     # Defaults to `prompt` when not given.
     title_instruction: Optional[str] = None,
+    # VF-3 (docs/vf3_bev_fixes.md, user feedback #3): optional continuation
+    # context, used ONLY by run_fancy_rollout_multi's sequential sub-goals.
+    # When given, this call reuses the SAME MuJoCo model/data/teacher/renderer
+    # and the policy's own carried-forward state (proprio history, gait-phase
+    # tracker, last commanded action) instead of building a fresh arena and
+    # resetting qpos/qvel back to scene_cfg['robot_xy']/['robot_yaw'] (the
+    # ORIGINAL episode start) -- i.e. genuine continuous physics across
+    # sub-goals, not a same-looking reset. Every existing single-goal caller
+    # leaves this None and gets EXACTLY the prior build-fresh-arena-and-settle
+    # behavior (see docs/vf3_bev_fixes.md's invariance check).
+    resume_ctx: Optional[dict] = None,
+    # When True, don't close the renderer / tear down the sim at the end of
+    # this call -- instead return the live objects + carried policy state in
+    # the result dict under 'live_ctx', for the caller to feed into the NEXT
+    # sub-goal's `resume_ctx`. Only ever set by run_fancy_rollout_multi.
+    keep_alive: bool = False,
 ) -> dict:
     """
     Search-then-goto rollout with ego|BEV side-by-side frames + 4 overlays.
@@ -1024,66 +1103,96 @@ def run_fancy_rollout(
     target_shape = target_obj['shape_name']
     stop_r       = float(scene_cfg.get('stop_r', STOP_R_SEARCH))
 
-    # --- Build MuJoCo env ---
-    arena_model = build_arena(scene_cfg)
-    arena_model.opt.timestep = SIM_DT
+    if resume_ctx is None:
+        # --- Build MuJoCo env ---
+        arena_model = build_arena(scene_cfg)
+        arena_model.opt.timestep = SIM_DT
 
-    teacher = WBCTeacher(use_gpu=False)
-    teacher.model = arena_model
-    teacher.data  = mujoco.MjData(arena_model)
-    teacher._nj   = arena_model.nq - 7
-    teacher._pelvis_id = mujoco.mj_name2id(
-        arena_model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
-    )
+        teacher = WBCTeacher(use_gpu=False)
+        teacher.model = arena_model
+        teacher.data  = mujoco.MjData(arena_model)
+        teacher._nj   = arena_model.nq - 7
+        teacher._pelvis_id = mujoco.mj_name2id(
+            arena_model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+        )
 
-    rx, ry    = scene_cfg['robot_xy']
-    robot_yaw = float(scene_cfg.get('robot_yaw', 0.0))
-    teacher.reset(pos_xy=(rx, ry), yaw=robot_yaw)
+        rx, ry    = scene_cfg['robot_xy']
+        robot_yaw = float(scene_cfg.get('robot_yaw', 0.0))
+        teacher.reset(pos_xy=(rx, ry), yaw=robot_yaw)
 
-    data_mj  = teacher.data
-    model_mj = teacher.model
-    nj       = teacher._nj
+        data_mj  = teacher.data
+        model_mj = teacher.model
+        nj       = teacher._nj
 
-    # --- Single renderer (anti-EGL-exhaustion: reuse one renderer for all views) ---
-    # ego: 320x240 @32°, grounding: 480x360 @26°, proximity: 320x240 @58°, BEV: 640x480 free cam
-    # Use separate Renderer objects but all from the same model
-    renderer    = ArenaRenderer(model_mj, tp_w=BEV_W, tp_h=BEV_H)
-    # NOTE: intrinsics now come dynamically from whichever camera the CAM-2
-    # Schmitt-trigger handoff selects each cycle (render_grounding()/render_proximity()
-    # each return their own correct (dims, pitch_deg, is_proximity) intrinsics dict) —
-    # mirrors code/inferencer.py's adopted CAM-2 champion (docs/cam_p1.md).
+        # --- Single renderer (anti-EGL-exhaustion: reuse one renderer for all views) ---
+        # ego: 320x240 @32°, grounding: 480x360 @26°, proximity: 320x240 @58°, BEV: 640x480 free cam
+        # Use separate Renderer objects but all from the same model
+        renderer    = ArenaRenderer(model_mj, tp_w=BEV_W, tp_h=BEV_H)
+        # NOTE: intrinsics now come dynamically from whichever camera the CAM-2
+        # Schmitt-trigger handoff selects each cycle (render_grounding()/render_proximity()
+        # each return their own correct (dims, pitch_deg, is_proximity) intrinsics dict) —
+        # mirrors code/inferencer.py's adopted CAM-2 champion (docs/cam_p1.md).
 
-    # BEV follow-cam (elevated diagonal)
-    bev_cam = mujoco.MjvCamera()
-    bev_cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
-    bev_cam.distance  = BEV_DISTANCE
-    bev_cam.azimuth   = BEV_AZIMUTH
-    bev_cam.elevation = BEV_ELEVATION
-    bev_cam.lookat[:] = [rx, ry, BEV_LOOKAT_Z]
+        # BEV follow-cam (elevated diagonal)
+        bev_cam = mujoco.MjvCamera()
+        bev_cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
+        bev_cam.distance  = BEV_DISTANCE
+        bev_cam.azimuth   = BEV_AZIMUTH
+        bev_cam.elevation = BEV_ELEVATION
+        bev_cam.lookat[:] = [rx, ry, BEV_LOOKAT_Z]
 
-    # --- Settle (keyframe or WBC fallback) ---
-    kf = getattr(inf, '_keyframe', None)
-    if kf is not None:
-        kf_qpos = kf['qpos_local'].copy()
-        kf_qpos[0] = rx
-        kf_qpos[1] = ry
-        kf_qpos[3] = _math.cos(robot_yaw / 2)
-        kf_qpos[4] = 0.0
-        kf_qpos[5] = 0.0
-        kf_qpos[6] = _math.sin(robot_yaw / 2)
-        data_mj.qpos[:len(kf_qpos)] = kf_qpos
-        data_mj.qvel[:len(kf['qvel_local'])] = kf['qvel_local']
-        mujoco.mj_forward(model_mj, data_mj)
-        teacher._target_dof = kf['target_dof'].copy()
+        # --- Settle (keyframe or WBC fallback) ---
+        kf = getattr(inf, '_keyframe', None)
+        if kf is not None:
+            kf_qpos = kf['qpos_local'].copy()
+            kf_qpos[0] = rx
+            kf_qpos[1] = ry
+            kf_qpos[3] = _math.cos(robot_yaw / 2)
+            kf_qpos[4] = 0.0
+            kf_qpos[5] = 0.0
+            kf_qpos[6] = _math.sin(robot_yaw / 2)
+            data_mj.qpos[:len(kf_qpos)] = kf_qpos
+            data_mj.qvel[:len(kf['qvel_local'])] = kf['qvel_local']
+            mujoco.mj_forward(model_mj, data_mj)
+            teacher._target_dof = kf['target_dof'].copy()
+        else:
+            for _ in range(80):
+                teacher.step(vel_cmd=(0.0, 0.0, 0.0))
+
+        if teacher.base_height < FALL_HEIGHT:
+            renderer.close()
+            return dict(success=False, spotted=False, scan_steps=0, failure_tag='fall',
+                        steps=0, final_dist=float(np.linalg.norm(data_mj.qpos[0:2] - target_xy)),
+                        fell=True, video_path=None)
+        if os.environ.get("FANCY_MULTIGOAL_DEBUG"):
+            print(f"    [multigoal_dbg] goal_idx={goal_idx} FRESH BUILD, robot_xy=({rx:.3f},{ry:.3f}) "
+                  f"yaw={robot_yaw:.3f}rad (scene_cfg['robot_xy']={scene_cfg.get('robot_xy')})",
+                  flush=True)
     else:
-        for _ in range(80):
-            teacher.step(vel_cmd=(0.0, 0.0, 0.0))
-
-    if teacher.base_height < FALL_HEIGHT:
-        renderer.close()
-        return dict(success=False, spotted=False, scan_steps=0, failure_tag='fall',
-                    steps=0, final_dist=float(np.linalg.norm(data_mj.qpos[0:2] - target_xy)),
-                    fell=True, video_path=None)
+        # VF-3 (docs/vf3_bev_fixes.md, user feedback #3): continue the SAME
+        # MuJoCo sim from the previous sub-goal's live end state -- no
+        # build_arena(), no teacher.reset(), no keyframe re-settle. The
+        # robot's actual qpos/qvel (position, heading, joint angles,
+        # velocities) at the moment the previous sub-goal ended IS the
+        # starting state of this one. Scene geometry is identical across
+        # sub-goals anyway (run_fancy_rollout_multi's `sub_scene` only ever
+        # changes `target_index`), so nothing here needs rebuilding.
+        teacher  = resume_ctx['teacher']
+        data_mj  = resume_ctx['data_mj']
+        model_mj = resume_ctx['model_mj']
+        nj       = resume_ctx['nj']
+        renderer = resume_ctx['renderer']
+        bev_cam  = resume_ctx['bev_cam']
+        # `rx, ry` feed path_trail's/telemetry's start-point below -- use the
+        # robot's CURRENT actual position (continuous from the prior
+        # sub-goal), not scene_cfg['robot_xy'] (the original episode start —
+        # exactly the bug being fixed here).
+        rx, ry = float(data_mj.qpos[0]), float(data_mj.qpos[1])
+        if os.environ.get("FANCY_MULTIGOAL_DEBUG"):
+            print(f"    [multigoal_dbg] goal_idx={goal_idx} RESUMING sim at "
+                  f"robot_xy=({rx:.3f},{ry:.3f}) yaw={_yaw_of(data_mj.qpos[3:7]):.3f}rad "
+                  f"(continuing from prior sub-goal's live end state, "
+                  f"scene_cfg start was {scene_cfg.get('robot_xy')})", flush=True)
 
     # --- Load action stats from inferencer ---
     _use_residual = (getattr(inf, '_action_stats', None) is not None)
@@ -1094,20 +1203,30 @@ def run_fancy_rollout(
         _da_deflt = _as['default_angles']
 
     _use_phase = getattr(inf, '_use_phase', False)
-    _phase_tracker = _GaitPhaseTracker() if _use_phase else None
+    _phase_tracker = (resume_ctx['phase_tracker'] if resume_ctx is not None
+                      else (_GaitPhaseTracker() if _use_phase else None))
     _eff_pdim = PROPRIO_DIM_PHASE if _use_phase else PROPRIO_DIM
 
     # --- State ---
-    prev_action  = teacher._target_dof.copy()
-    proprio_hist = collections.deque(
-        [np.zeros(_eff_pdim, dtype=np.float32)] * PROPRIO_K, maxlen=PROPRIO_K
-    )
-    prop_now = _build_proprio(data_mj, prev_action)
-    if _use_phase:
-        ph = _phase_tracker.update(data_mj.qpos[7:22].copy())
-        prop_now = np.concatenate([prop_now, ph])
-    for _ in range(PROPRIO_K):
-        proprio_hist.append(prop_now.copy())
+    if resume_ctx is not None:
+        # Carry the policy's own recurrent-ish state forward too (last
+        # commanded joint targets + the K-step proprio history window) so the
+        # first few control cycles of the new sub-goal aren't fed a
+        # discontinuous/zeroed history -- genuine continuity, not just a
+        # matching (x,y,yaw).
+        prev_action  = resume_ctx['prev_action']
+        proprio_hist = resume_ctx['proprio_hist']
+    else:
+        prev_action  = teacher._target_dof.copy()
+        proprio_hist = collections.deque(
+            [np.zeros(_eff_pdim, dtype=np.float32)] * PROPRIO_K, maxlen=PROPRIO_K
+        )
+        prop_now = _build_proprio(data_mj, prev_action)
+        if _use_phase:
+            ph = _phase_tracker.update(data_mj.qpos[7:22].copy())
+            prop_now = np.concatenate([prop_now, ph])
+        for _ in range(PROPRIO_K):
+            proprio_hist.append(prop_now.copy())
 
     lang_t = torch.zeros(1, 2048, device=inf.device)
 
@@ -1274,8 +1393,16 @@ def run_fancy_rollout(
     #  - dist_traveled_m: running odometry total, for the outro stats card.
     #  - _hud_state: camera-handoff flash countdown for the HUD bar / cam chip
     #    (item 3) -- rendering-only mutable state, never read by any control path.
-    dist_traveled_m = 0.0
-    _prev_rxy_odom  = np.array([rx, ry], dtype=np.float64)
+    # VF-3: carried forward across sub-goals too when resuming, so the outro
+    # card's "distance traveled" reflects the WHOLE multi-goal journey, not
+    # just the final leg (pure telemetry, same never-fed-back-into-control
+    # guarantee as the rest of this accumulator).
+    if resume_ctx is not None:
+        dist_traveled_m = resume_ctx['dist_traveled_m']
+        _prev_rxy_odom  = resume_ctx['prev_rxy_odom']
+    else:
+        dist_traveled_m = 0.0
+        _prev_rxy_odom  = np.array([rx, ry], dtype=np.float64)
     _hud_state = {"prev_cam": None, "flash_frames_left": 0}
     CAM_FLASH_FRAMES = 10
 
@@ -1734,8 +1861,6 @@ def run_fancy_rollout(
                   f"scan={'ON' if _scan_active else 'OFF'}  spotted={spotted}  h={height:.3f}m",
                   flush=True)
 
-    renderer.close()
-
     final_height = float(data_mj.qpos[2])
     upright      = final_height >= FALL_HEIGHT and not fell
     final_dist   = float(np.linalg.norm(data_mj.qpos[0:2] - target_xy))
@@ -1781,7 +1906,20 @@ def run_fancy_rollout(
     if render_video and video_path and frames_sbs:
         out_vid = _write_fancy_video(frames_sbs, video_path)
 
-    return dict(
+    # VF-3: only keep the renderer (and the rest of the live sim) open when a
+    # caller (run_fancy_rollout_multi) both asked for it AND the robot is
+    # still upright -- otherwise close it here exactly as before this fix.
+    _continuing = keep_alive and not fell
+    if os.environ.get("FANCY_MULTIGOAL_DEBUG"):
+        _final_xy = data_mj.qpos[0:2]
+        print(f"    [multigoal_dbg] goal_idx={goal_idx} ENDED at "
+              f"robot_xy=({_final_xy[0]:.3f},{_final_xy[1]:.3f}) "
+              f"yaw={_yaw_of(data_mj.qpos[3:7]):.3f}rad  fell={fell}  "
+              f"keep_alive={keep_alive}  continuing={_continuing}", flush=True)
+    if not _continuing:
+        renderer.close()
+
+    result = dict(
         success=success,
         spotted=spotted,
         scan_steps=scan_steps,
@@ -1798,6 +1936,21 @@ def run_fancy_rollout(
         avoid_bias_active_frac=(_avoid_cycles_active / _avoid_cycles_total
                                  if _avoid_cycles_total > 0 else 0.0),
     )
+    if _continuing:
+        # VF-3 (docs/vf3_bev_fixes.md): hand the LIVE sim + carried policy
+        # state back to run_fancy_rollout_multi so the NEXT sub-goal's
+        # resume_ctx can continue the SAME simulation (no rebuild, no reset).
+        # Withheld if the robot fell -- there is no physically sensible way
+        # to "continue" a fallen robot's simulation into the next sub-goal;
+        # run_fancy_rollout_multi treats a missing 'live_ctx' as "stop here".
+        result['live_ctx'] = dict(
+            teacher=teacher, data_mj=data_mj, model_mj=model_mj, nj=nj,
+            renderer=renderer, bev_cam=bev_cam,
+            prev_action=prev_action, proprio_hist=proprio_hist,
+            phase_tracker=_phase_tracker,
+            dist_traveled_m=dist_traveled_m, prev_rxy_odom=_prev_rxy_odom,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2025,6 +2178,13 @@ def run_fancy_rollout_multi(
     completed_targets = []
     all_results = []
     overall_success = True
+    # VF-3 (docs/vf3_bev_fixes.md, user feedback #3): carries the LIVE MuJoCo
+    # sim (+ carried policy state) from one sub-goal's run_fancy_rollout()
+    # call to the next, so the robot's actual physical state (position,
+    # heading, joint angles/velocities) continues instead of being reset back
+    # to the scene's ORIGINAL start for every sub-goal (the bug being fixed
+    # here). None on the very first call (nothing to resume yet).
+    live_ctx = None
 
     for gi, goal in enumerate(goals):
         color = goal["color"]
@@ -2050,6 +2210,13 @@ def run_fancy_rollout_multi(
         # Video path for this sub-goal clip (no write if part of multi)
         sub_vid_path = None  # we collect frames, write combined video later
 
+        # VF-3: only the LAST sub-goal lets run_fancy_rollout tear down its
+        # own sim/renderer as before -- every earlier sub-goal keeps it alive
+        # so the NEXT one can resume from it (scene objects are untouched
+        # across sub-goals -- `sub_scene` only ever changes `target_index` --
+        # so goal-1's target stays exactly where it was; only the robot's
+        # physical state and the goal query change).
+        is_last_goal = (gi == n_goals - 1)
         result = run_fancy_rollout(
             inf=inf,
             scene_cfg=sub_scene,
@@ -2064,6 +2231,8 @@ def run_fancy_rollout_multi(
             completed_targets=completed_targets,
             scenario_title=scenario_title,
             title_instruction=" then ".join(g.get("prompt_part", f"{g['color']} {g['shape']}") for g in goals),
+            resume_ctx=live_ctx,
+            keep_alive=(not is_last_goal),
         )
 
         # Carry trail forward
@@ -2082,6 +2251,33 @@ def run_fancy_rollout_multi(
         all_results.append(result)
         print(f"  [multi] sub-goal {gi+1}/{n_goals} => {result.get('failure_tag')}  "
               f"dist={result.get('final_dist',0):.3f}m", flush=True)
+
+        # VF-3: hand the live sim to the next sub-goal. A missing 'live_ctx'
+        # on a non-last goal means run_fancy_rollout couldn't (or the robot
+        # fell and there's nothing physically sensible to continue) -- stop
+        # the sequence honestly rather than silently rebuilding a fresh scene
+        # for the remaining goals (which would reintroduce the exact
+        # teleport-back-to-start bug this fix addresses).
+        if is_last_goal:
+            live_ctx = None
+        else:
+            live_ctx = result.get("live_ctx")
+            if live_ctx is None:
+                print(f"  [multi] sub-goal {gi+1}/{n_goals} ended with no continuable "
+                      f"sim state (failure_tag={result.get('failure_tag')}, "
+                      f"fell={result.get('fell')}) — stopping multi-goal sequence",
+                      flush=True)
+                overall_success = False
+                break
+
+    # VF-3: defensive cleanup -- if the loop ended (break, or the true last
+    # goal was skipped via `continue` above) while a live sim was still open,
+    # close it here so its EGL renderer doesn't leak.
+    if live_ctx is not None:
+        try:
+            live_ctx['renderer'].close()
+        except Exception:
+            pass
 
     # Write combined video
     out_vid = None
