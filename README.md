@@ -276,3 +276,49 @@ Modular VLA: `language → cached GR00T-LM embedding` · `RGBD → classical HSV
 **Perception — two-camera handoff.** A single pitched head camera goes blind below ~0.7 m (the target exits the FOV bottom edge before the stop radius). Grounding therefore runs on the **active** one of two head-mounted cameras: the head camera at range, and a steeper **proximity camera** (58° pitch) for the final approach, switched by a hysteresis (Schmitt) trigger on the smoothed target distance (in ≤1.2 m, out ≥1.6 m) with depth-based rejection of the robot's own body in frame. Both cameras feed the same `(dist, bearing)` goal, so the policy needs **no retraining**, and only the active camera is rendered each cycle, so steady-state compute is unchanged. This keeps the target detected down to **0.26 m** — through every skill's stop radius. (A wide-FOV single-camera alternative was A/B-tested and rejected: it loses far-range detection, has a shallower close-range floor, and is ~2× slower.)
 
 **Why a learned detector.** The classical grounder's demo-distance ceiling (66.7% vs 80% under ground-truth goals) is a discrimination limit: at 4–9 m among hue-similar walls, some false HSV+depth locks are geometrically indistinguishable from true ones — we falsified area-, physical-size-, depth-continuity-, shape-, and odometric-coherence-based rejection, each with traced per-episode root causes, before concluding only appearance learning could separate them. The learned detector confirmed that diagnosis (zero confident false locks on the previously-failing episodes). The final piece was **obstacle avoidance**: with accurate grounding the robot walks perfectly straight lines — straight into off-path obstacles the classical stack happened to weave around thanks to its own bearing noise. Depth-corridor repulsion fixed those collisions (search 100%) and only then did the learned-grounding stack clear its adoption gate.
+
+---
+
+## Experimental process
+
+Every mechanism in this system was adopted (or rejected) through the same loop:
+
+1. **Failure analysis first.** After each evaluation round, every failing episode was replayed with instrumentation until it had a *mechanistic* root cause (e.g. "the false lock is a wall stripe whose depth ramp is continuous, so depth-splitting cannot separate it" — not "grounding is noisy"). Fixes were only proposed against diagnosed mechanisms.
+2. **Mechanism-level validation before expensive gates.** A candidate fix first had to demonstrably change the diagnosed failure on the specific failing episodes (2× replays), *and* stay silent on named at-risk passing episodes — before any full evaluation was spent on it.
+3. **Staged closed-loop gates with per-episode no-regression bars.** Candidates then ran the full benchmark (n=15 per condition, fixed seed 999) and were compared **per episode** against the previous baseline, not just on the aggregate rate. Any reproducible break of a previously-passing episode rejected the candidate outright, regardless of net gains — this rule rejected five plausible mechanisms whose aggregate numbers looked acceptable.
+4. **One change at a time, behind a toggle.** Each mechanism was implemented behind an env-var switch, gated in isolation, and only flipped default-on after passing. Rejected mechanisms remain in the code, default-off, with their rejection evidence — several later fixes were built on what a rejected mechanism's instrumentation revealed.
+5. **Independent validation of the final system**: a two-fresh-seed generalization sweep (no tuning allowed), a 55-episode wild-usage sweep of the interactive-demo path (random scenes/instructions, full object×color matrix), a claim-by-claim audit of this README against the raw eval artifacts, and a fresh-clone rehearsal that literally ran every documented command (which caught a real runtime blocker two static audits had missed).
+
+Notable applications of the loop: the classical grounder's ceiling was established by *falsifying five rejection heuristics in sequence* (lock lifecycle, blob area, physical size via depth back-projection, depth-continuity splitting, odometric coherence) — each killed by a traced counterexample episode — which is what justified training a detector; and the detector itself failed its first adoption gate (it broke one episode by walking a perfectly straight line into an off-path obstacle the noisier classical stack happened to weave around), which is how the obstacle-avoidance layer was discovered to be necessary.
+
+### Validation metrics
+
+| Metric | Definition | Where used |
+|---|---|---|
+| Closed-loop success rate | fraction of episodes where the robot stops within the success radius of the correct target, upright, within the step budget (n=15/condition, seed 999; fresh seeds 1000/2000 for generalization) | headline results table |
+| Per-episode fail set | the identity of failing episodes, compared across runs | the no-regression adoption bar |
+| Spot rate / reach rate | search decomposition: target seen at all vs reached after seeing | search skill |
+| Falls / final distance | safety + near-miss diagnostics per episode | failure taxonomy |
+| Detector offline recall/precision | recall at (bearing err < 2°, dist err < 0.5 m) at ≥0.9 precision, on scene-disjoint val/test splits plus a frozen set of frames captured at real closed-loop failure moments | detector training + version selection |
+| Latency | per-cycle grounding inference and per-step policy inference (ms), against the 5–10 Hz / 50 Hz budgets | real-time claims |
+| Run-to-run noise protocol | single unexpected episode flips trigger one full condition re-run before any conclusion (EGL rendering is not bit-deterministic) | every gate |
+
+### Tools
+
+**MuJoCo 3.9** (EGL headless rendering; also the source of pixel-perfect segmentation labels for detector training) · **PyTorch 2.7.1 + CUDA 12.8** on an NVIDIA GB10 (Grace-Blackwell) · **ONNX Runtime** (frozen WBC teacher, training-time only) · **OpenCV** (classical HSV+depth grounding) · **GR00T-N1.6-3B** frozen language model (training-time conditioning) · **Flask** (interactive web demo) · **ffmpeg** (recordings/GIFs) · deterministic seeded scene generation throughout.
+
+---
+
+## References
+
+- **DART** — Laskey et al., *DART: Noise Injection for Robust Imitation Learning*, CoRL 2017. The recovery-data recipe used for the locomotion student (noise-injected actions, clean-action supervision).
+- **DAgger** — Ross, Gordon, Bagnell, *A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning*, AISTATS 2011. The interactive-imitation framing that motivated the recovery-data approach; DART was chosen as the non-interactive variant.
+- **U-Net** — Ronneberger et al., MICCAI 2015. Backbone shape of the query-conditioned grounding detector (0.9M-param from-scratch variant).
+- **CenterNet / Objects as Points** — Zhou et al., 2019. Source of the penalty-reduced focal heatmap loss used to train the detector (and of a rejected center-point detector variant, judged against the U-Net on failure-case frames).
+- **Focal loss** — Lin et al., ICCV 2017. Underlies the heatmap loss above.
+- **FiLM** — Perez et al., AAAI 2018. Conditioning scheme of the rejected CenterNet-style detector variant.
+- **SORT-style track management** — Bewley et al., ICIP 2016 (with classical radar M-of-N track initiation). Informed the target-lock lifecycle experiments (`lock_mgmt.py`) — the N-of-M variant was tested and rejected with evidence.
+- **Potential-field obstacle avoidance** — Khatib, ICRA 1985. The depth-corridor repulsion in `avoid.py` is a camera-space descendant of this idea.
+- **ACT / action chunking** — Zhao et al., RSS 2023. Evaluated during early architecture exploration; deprioritized for this locomotion-dominant task in favor of per-step residual actions.
+- **GR00T N1** — NVIDIA, 2025. Source of the frozen language model (the only pretrained weights used) and of the WBC walk teacher assets.
+- **MuJoCo** — Todorov et al., IROS 2012. Simulation, rendering, and ground-truth labeling substrate.
