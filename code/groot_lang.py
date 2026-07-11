@@ -20,12 +20,13 @@ python code/groot_lang.py --verify --cache dataset/lang_cache.pkl
 """
 
 from __future__ import annotations
+
 import argparse
 import os
+from pathlib import Path
 import pickle
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ sys.path.insert(0, _ROOT)
 # Keep in sync with code/arena.py:COLORS, code/arena.py:SHAPES,
 # code/scene.py:_VERBS, code/scene.py:_TEMPLATES.
 
-COLORS = [
+COLORS: list[tuple[str, tuple[int, int, int]]] = [
     ("red",     (220,  40,  40)),
     ("yellow",  (235, 205,  40)),
     ("blue",    ( 50,  90, 220)),
@@ -51,20 +52,20 @@ COLORS = [
     ("cyan",    ( 40, 200, 210)),
 ]
 
-SHAPES = [
+SHAPES: list[tuple[str, float]] = [
     ("ball",     0.24),
     ("cube",     0.24),
     ("cylinder", 0.22),
     ("cone",     0.26),
 ]
 
-_VERBS = [
+_VERBS: list[str] = [
     "go to", "walk to", "approach", "head to",
     "head over to", "move to", "navigate to",
     "make your way to", "get to", "proceed to",
 ]
 
-_TEMPLATES = [
+_TEMPLATES: list[str] = [
     "{v} the {c} {s}",
     "{v} the {s} that is {c}",
     "{v} the {c}-colored {s}",
@@ -101,7 +102,13 @@ class GrootLangEncoder:
 
     EMBED_DIM = 2048
 
-    def __init__(self, ckpt_path: str, device: str = "cuda"):
+    def __init__(self, ckpt_path: str, device: str = "cuda") -> None:
+        """Load the frozen GR00T-N1.6-3B language model in bf16.
+
+        Args:
+            ckpt_path: Path to the GR00T-N1.6-3B checkpoint directory.
+            device: Torch device string to load the model onto.
+        """
         self.device = torch.device(device)
         ckpt_path = str(ckpt_path)
 
@@ -142,13 +149,19 @@ class GrootLangEncoder:
 
     @torch.no_grad()
     def encode_batch(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
-        """
-        Encode a list of instructions → np.float32 array (N, 2048).
-        Uses the LM embedding layer + full forward pass (no image tokens).
-        Mean-pools the last hidden state over the sequence dimension.
+        """Encode a list of instructions to mean-pooled embeddings.
 
-        The LM is loaded in bf16 with flash-attention. We run it in bf16/fp16
+        Uses the LM embedding layer + full forward pass (no image tokens).
+        Mean-pools the last hidden state over the sequence dimension. The LM
+        is loaded in bf16 with flash-attention; we run it in a bf16/fp16
         autocast context to satisfy flash-attn dtype constraints.
+
+        Args:
+            texts: Instructions to encode.
+            batch_size: Number of instructions encoded per forward pass.
+
+        Returns:
+            np.float32 array of shape (len(texts), 2048).
         """
         all_embs = []
         n = len(texts)
@@ -194,10 +207,20 @@ class GrootLangEncoder:
 # Cache builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_cache(ckpt_path: str, out_path: str, batch_size: int = 64) -> dict:
-    """
-    Enumerate all instructions, encode them, and save cache to disk.
-    Returns the cache dict {instruction: np.float32[2048]}.
+def build_cache(ckpt_path: str, out_path: str, batch_size: int = 64) -> dict[str, np.ndarray]:
+    """Enumerate all instructions, encode them, and save the cache to disk.
+
+    Args:
+        ckpt_path: Path to the GR00T-N1.6-3B checkpoint directory.
+        out_path: Output cache pickle path (a sibling .npz is also written).
+        batch_size: Encoding batch size passed to `encode_batch`.
+
+    Returns:
+        Cache dict mapping each instruction to its np.float32[2048] embedding.
+
+    Raises:
+        AssertionError: If the encoded embeddings' shape doesn't match the
+            expected (num_instructions, 2048).
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,7 +259,16 @@ def build_cache(ckpt_path: str, out_path: str, batch_size: int = 64) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def verify_cache(cache_path: str) -> None:
-    """Sanity: different instructions differ; same instruction is stable."""
+    """Sanity-check a cache: different instructions differ; same is stable.
+
+    Args:
+        cache_path: Path to the cache pickle to verify.
+
+    Raises:
+        AssertionError: If any embedding has the wrong shape/dtype, two
+            distinct instructions embed near-identically, the same
+            instruction is unstable, or any embedding norm is near-zero.
+    """
     with open(cache_path, "rb") as f:
         cache = pickle.load(f)
 
@@ -277,14 +309,21 @@ def verify_cache(cache_path: str) -> None:
 # Look up helper (used by dataset.py at runtime)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_GLOBAL_CACHE: dict | None = None
+_GLOBAL_CACHE: dict[str, np.ndarray] | None = None
 _GLOBAL_CACHE_PATH: str | None = None
 
 
 def get_embedding(instruction: str, cache_path: str) -> np.ndarray:
-    """
-    Look up a cached embedding. Loads cache on first call.
-    Returns np.float32[2048], or zeros if not found (with warning).
+    """Look up a cached embedding, loading the cache on first call.
+
+    Args:
+        instruction: Instruction string to look up.
+        cache_path: Path to the cache pickle (loaded into the module-level
+            `_GLOBAL_CACHE` on first call, or if `cache_path` changes).
+
+    Returns:
+        np.float32[2048] embedding, or a zero vector (with a warning) if
+        `instruction` is not in the cache.
     """
     global _GLOBAL_CACHE, _GLOBAL_CACHE_PATH
 
@@ -305,7 +344,8 @@ def get_embedding(instruction: str, cache_path: str) -> np.ndarray:
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
+    """CLI entry point: list, build, or verify the language embedding cache."""
     parser = argparse.ArgumentParser(description="GR00T-LM language embedding cache builder")
     parser.add_argument("--ckpt",    type=str, default="checkpoints/GR00T-N1.6-3B",
                         help="Path to GR00T-N1.6-3B checkpoint directory")

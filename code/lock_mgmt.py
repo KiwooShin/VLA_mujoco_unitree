@@ -79,7 +79,6 @@ from __future__ import annotations
 import math
 import os
 from collections import deque
-from typing import Optional
 
 from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
                               SCAN_DWELL_STEPS, SCAN_TIMEOUT as _RESCAN_TIMEOUT_STEPS)
@@ -228,7 +227,8 @@ class LockGate:
          re-enter scan, same action as (3).
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize a fresh, unlocked ('NONE') state machine."""
         self.state              = 'NONE'
         self._m2_hist           = deque(maxlen=M2_CONFIRM_N)
         self._incumbent         = None    # dict(dist, bearing, area)
@@ -295,7 +295,7 @@ class LockGate:
         return (d_bearing <= math.radians(M7_PENALTY_BEARING_DEG) and
                 d_dist    <= M7_PENALTY_DIST_TOL_M)
 
-    def gate_detection(self, dist: float, bearing_rad: float, area: Optional[float]) -> bool:
+    def gate_detection(self, dist: float, bearing_rad: float, area: float | None) -> bool:
         """
         Decide whether a raw detection this cycle should be treated as an
         accepted "hit" (caller should feed it to the EMA / last-known-goal)
@@ -397,7 +397,7 @@ class LockGate:
         return False
 
     def end_of_cycle(self, best_dist_estimate: float, walking: bool,
-                      proj_disp_m: Optional[float] = None) -> bool:
+                      proj_disp_m: float | None = None) -> bool:
         """
         Call exactly once per grounding cycle, regardless of hit/miss/gate
         outcome, with the caller's current best distance estimate for this
@@ -536,16 +536,28 @@ class ReacquisitionScan:
     class and constants (`SCAN_LEG_DEG`, `SCAN_DWELL_STEPS`) NX-1 validated.
     """
 
-    def __init__(self, scan_rate: float = 0.6):
+    def __init__(self, scan_rate: float = 0.6) -> None:
+        """Start a fresh bounded rescan with its own local step counter.
+
+        Args:
+            scan_rate: Commanded yaw rate magnitude (rad/s) while rotating.
+        """
         self._sched = BidirectionalScanSchedule(
             scan_rate=scan_rate, leg_deg=SCAN_LEG_DEG, dwell_steps=SCAN_DWELL_STEPS)
         self._local_step = 0
 
-    def step(self, current_yaw_rad: float) -> Optional[float]:
-        """Advance by one control step. Returns commanded wz (rad/s), or
-        None if the bounded rescan has timed out (caller should exit rescan
-        mode and fall back to the default/cached goal, same as the existing
-        scan-timeout fallback)."""
+    def step(self, current_yaw_rad: float) -> float | None:
+        """Advance by one control step.
+
+        Args:
+            current_yaw_rad: Robot's current world yaw (radians).
+
+        Returns:
+            Commanded wz (rad/s), or None if the bounded rescan has timed
+            out (caller should exit rescan mode and fall back to the
+            default/cached goal, same as the existing scan-timeout
+            fallback).
+        """
         if self._local_step >= _RESCAN_TIMEOUT_STEPS:
             return None
         self._local_step += 1

@@ -32,7 +32,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -44,15 +43,15 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.small_vla import GroundedNav, DEFAULTS
-from code.dataset_phase import make_phase_dataloader, PhaseParquetDataset, PROPRIO_DIM_PHASE
 from code.action_stats import compute_action_stats, DEFAULT_ANGLES, STD_FLOOR
+from code.dataset_phase import make_phase_dataloader, PhaseParquetDataset, PROPRIO_DIM_PHASE
+from code.small_vla import GroundedNav, DEFAULTS
 from code.train_gaitfix import GaitFixLoss, _run_epoch
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PROPRIO_DIM = PROPRIO_DIM_PHASE   # 57
+PROPRIO_DIM: int = PROPRIO_DIM_PHASE   # 57
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +70,29 @@ def run_overfit_gate(
     swing_weight: float = 2.0,
     verbose:      bool  = True,
 ) -> dict:
+    """Runs the DART+phase overfit gate on a small subset of real data.
+
+    Trains ``GroundedNav`` (arch ``A`` or ``C``, proprio_dim=57) on a small
+    fixed subset until the action loss drops below ``target_loss`` or
+    ``max_epochs`` is reached.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: Path to the combined DART+clean dataset repo.
+        action_stats: Action normalization statistics (mean/std/etc.).
+        batch_size: Batch size for the overfit subset loader.
+        overfit_n: Number of samples to overfit on.
+        max_epochs: Maximum number of overfit epochs before declaring FAIL.
+        target_loss: Action loss threshold to declare PASS.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        verbose: Whether to print periodic progress lines.
+
+    Returns:
+        A dict with keys 'status' ('PASS' or 'FAIL'), 'epoch', 'action_loss',
+        and 'elapsed' (seconds).
+    """
     print(f"\n{'='*60}")
     print(f"  DART+PHASE OVERFIT GATE — Arch {arch}  proprio_dim={PROPRIO_DIM}")
     print(f"  repo={repo_path}  n_samples={overfit_n}  target_loss={target_loss}")
@@ -137,9 +159,34 @@ def train_full(
     swing_weight:   float = 2.0,
     train_fraction: float = 0.9,
     num_workers:    int   = 0,
-    resume_ckpt:    Optional[str] = None,
+    resume_ckpt:    str | None = None,
     reset_epoch:    bool  = False,
 ) -> list:
+    """Runs full training over the combined DART+phase dataset.
+
+    Trains ``GroundedNav`` with ``GaitFixLoss``, saving a per-epoch
+    checkpoint plus a running-best checkpoint to ``out_dir``, and a
+    ``curves.json`` log of per-epoch train/val metrics.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: Path to the combined DART+clean dataset repo.
+        action_stats: Action normalization statistics (mean/std/etc.).
+        out_dir: Directory to write checkpoints and logs to.
+        n_epochs: Number of training epochs.
+        batch_size: Batch size for train/val loaders.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        train_fraction: Fraction of frames used for the train split.
+        num_workers: Number of DataLoader worker processes.
+        resume_ckpt: Optional checkpoint path to resume training from.
+        reset_epoch: If True, reset the epoch counter to 1 when resuming
+            (used for fine-tuning from a pre-trained checkpoint).
+
+    Returns:
+        A list of per-epoch metric dicts (epoch, train, val, elapsed_s).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader = make_phase_dataloader(
@@ -246,7 +293,8 @@ def train_full(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """Parses CLI args and runs the DART+phase overfit gate and/or training."""
     ap = argparse.ArgumentParser(
         description='DART+Phase trainer (Fix 4+5 on top of Fix 1 residual actions)'
     )

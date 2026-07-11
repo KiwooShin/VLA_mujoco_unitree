@@ -14,7 +14,7 @@ All vision weights are FROM SCRATCH. No pretrained checkpoint is loaded.
 
 from __future__ import annotations
 import math
-from typing import Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # Defaults (overridden by config or constructor kwargs)
 # ---------------------------------------------------------------------------
-DEFAULTS = dict(
+DEFAULTS: dict[str, Any] = dict(
     img_size=128,
     in_ch=3,           # 3=RGB, 4=RGBD
     patch_size=8,      # TinyViT patch
@@ -54,7 +54,7 @@ DEFAULTS = dict(
 
 class PatchEmbed(nn.Module):
     """Non-overlapping patch tokenizer."""
-    def __init__(self, img_size: int, patch_size: int, in_ch: int, embed_dim: int):
+    def __init__(self, img_size: int, patch_size: int, in_ch: int, embed_dim: int) -> None:
         super().__init__()
         assert img_size % patch_size == 0
         self.n_patches = (img_size // patch_size) ** 2
@@ -68,7 +68,9 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
+    """Standard multi-head self-attention block."""
+
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
@@ -88,7 +90,9 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, heads: int, ff_mult: int = 2, dropout: float = 0.0):
+    """Pre-norm transformer block: self-attention + MLP with residual connections."""
+
+    def __init__(self, dim: int, heads: int, ff_mult: int = 2, dropout: float = 0.0) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, heads, dropout)
@@ -109,7 +113,7 @@ class TinyViT(nn.Module):
     """From-scratch vision encoder: ego RGBD → patch tokens + pooled feature."""
     def __init__(self, img_size: int, patch_size: int, in_ch: int,
                  dim: int, depth: int, heads: int, ff_mult: int = 2,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0) -> None:
         super().__init__()
         self.patch_embed = PatchEmbed(img_size, patch_size, in_ch, dim)
         n_patches = self.patch_embed.n_patches
@@ -123,7 +127,7 @@ class TinyViT(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.out_dim = dim
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (patch_tokens: B×N×D, pooled: B×D)."""
         B = x.shape[0]
         tok = self.patch_embed(x)                        # (B, N, D)
@@ -141,7 +145,7 @@ class TinyViT(nn.Module):
 
 class ProprioEncoder(nn.Module):
     """GRU over K proprio frames → hidden state."""
-    def __init__(self, proprio_dim: int, hidden: int, dropout: float = 0.0):
+    def __init__(self, proprio_dim: int, hidden: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.gru = nn.GRU(proprio_dim, hidden, batch_first=True, num_layers=1)
         self.drop = nn.Dropout(dropout)
@@ -176,7 +180,7 @@ class GroundingHead(nn.Module):
     making the learning problem much easier.
     """
     def __init__(self, vis_dim: int, lang_dim: int, goal_dim: int = 3,
-                 n_patches: int = 256):
+                 n_patches: int = 256) -> None:
         super().__init__()
         self.vis_dim    = vis_dim
         self.goal_dim   = goal_dim
@@ -281,7 +285,7 @@ class VelocityHead(nn.Module):
     (goal, vis, lang) with no extra args.
     """
     def __init__(self, goal_dim: int, vis_dim: int, lang_dim: int, vel_dim: int = 3,
-                 vel_proprio: bool = False, proprio_enc_dim: int = 128):
+                 vel_proprio: bool = False, proprio_enc_dim: int = 128) -> None:
         super().__init__()
         self.vel_proprio = vel_proprio
         if vel_proprio:
@@ -296,8 +300,8 @@ class VelocityHead(nn.Module):
         )
 
     def forward(self, goal: torch.Tensor, vis: torch.Tensor, lang: torch.Tensor,
-                proprio_emb: Optional[torch.Tensor] = None,
-                phase: Optional[torch.Tensor] = None) -> torch.Tensor:
+                proprio_emb: torch.Tensor | None = None,
+                phase: torch.Tensor | None = None) -> torch.Tensor:
         if self.vel_proprio and proprio_emb is not None and phase is not None:
             return self.net(torch.cat([goal, vis, lang, proprio_emb, phase], dim=-1))
         return self.net(torch.cat([goal, vis, lang], dim=-1))
@@ -316,7 +320,7 @@ class ActionHead(nn.Module):
     temporal ensembling at deploy time.
     """
     def __init__(self, feat_dim: int, action_dim: int, chunk_H: int,
-                 n_dec_layers: int = 2, n_heads: int = 4, dropout: float = 0.0):
+                 n_dec_layers: int = 2, n_heads: int = 4, dropout: float = 0.0) -> None:
         super().__init__()
         self.H = chunk_H
         self.action_dim = action_dim
@@ -351,7 +355,7 @@ class ActionHead(nn.Module):
 
 class DoneHead(nn.Module):
     """(vis, lang) → done logit (BCE)."""
-    def __init__(self, vis_dim: int, lang_dim: int):
+    def __init__(self, vis_dim: int, lang_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(vis_dim + lang_dim, 64), nn.GELU(),
@@ -377,7 +381,7 @@ class GroundedNav(nn.Module):
                          them in downstream heads instead of predicted values.
     """
 
-    def __init__(self, arch: str = 'A', teacher_forcing: bool = True, **cfg):
+    def __init__(self, arch: str = 'A', teacher_forcing: bool = True, **cfg: Any) -> None:
         super().__init__()
         C = {**DEFAULTS, **cfg}
         self.arch = arch.upper()
@@ -427,7 +431,8 @@ class GroundedNav(nn.Module):
             self.vel_proj = nn.Sequential(
                 nn.Linear(C['vel_dim'], C['vel_proj_dim']), nn.GELU()
             )
-            action_feat_dim = vis_dim + lang_proj_dim + proprio_enc_dim + C['goal_proj_dim'] + C['vel_proj_dim']
+            action_feat_dim = (vis_dim + lang_proj_dim + proprio_enc_dim
+                               + C['goal_proj_dim'] + C['vel_proj_dim'])
         else:  # Arch C
             action_feat_dim = vis_dim + lang_proj_dim + proprio_enc_dim
 
@@ -465,9 +470,9 @@ class GroundedNav(nn.Module):
         ego_rgb: torch.Tensor,          # (B, in_ch, 128, 128)
         lang_emb: torch.Tensor,         # (B, 2048)
         proprio_h: torch.Tensor,        # (B, K, 55)
-        gt_goal: Optional[torch.Tensor] = None,   # (B, 3) — teacher-forced if arch=A
-        gt_vel: Optional[torch.Tensor] = None,    # (B, 3) — teacher-forced if arch=A
-    ) -> dict:
+        gt_goal: torch.Tensor | None = None,   # (B, 3) — teacher-forced if arch=A
+        gt_vel: torch.Tensor | None = None,    # (B, 3) — teacher-forced if arch=A
+    ) -> dict[str, torch.Tensor]:
         """
         Returns a dict with keys present depending on arch:
           'action'   : (B, H, 15)
@@ -531,9 +536,9 @@ class GroundedNav(nn.Module):
         return out
 
     # ------------------------------------------------------------------
-    def param_count(self) -> dict:
+    def param_count(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
-        breakdown = {}
+        breakdown: dict[str, int] = {}
         for name, mod in [
             ('vision', self.vision),
             ('lang_proj', self.lang_proj),

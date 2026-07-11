@@ -14,11 +14,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 
 PROPRIO_DIM_BASE  = 55   # original proprio without phase
@@ -49,8 +48,8 @@ class PhaseParquetDataset(Dataset):
         chunk_H: int = 1,
         img_size: int = 128,
         in_ch: int = 3,
-        lang_cache_path: Optional[str] = None,
-    ):
+        lang_cache_path: str | None = None,
+    ) -> None:
         super().__init__()
         if isinstance(repo_paths, str):
             repo_paths = [repo_paths]
@@ -62,7 +61,7 @@ class PhaseParquetDataset(Dataset):
         self.proprio_dim = PROPRIO_DIM_PHASE  # 57
 
         # Load lang cache
-        self._lang_cache: Optional[dict] = None
+        self._lang_cache: dict | None = None
         if lang_cache_path and os.path.exists(lang_cache_path):
             import pickle
             with open(lang_cache_path, "rb") as f:
@@ -190,10 +189,23 @@ def make_phase_dataloader(
     batch_size: int = 64,
     train_fraction: float = 0.9,
     num_workers: int = 0,
-    lang_cache_path: Optional[str] = None,
+    lang_cache_path: str | None = None,
     **kwargs,
 ) -> DataLoader:
-    """Create a DataLoader for the phase-aware dataset."""
+    """Create a DataLoader for the phase-aware dataset.
+
+    Args:
+        repo_paths: One repo path or a list of paths to combine.
+        split: 'train' or 'val'.
+        batch_size: DataLoader batch size.
+        train_fraction: Fraction of episodes (per repo) used for training.
+        num_workers: DataLoader worker count.
+        lang_cache_path: Optional path to a pre-built language embedding cache.
+        **kwargs: Forwarded to `PhaseParquetDataset`.
+
+    Returns:
+        A configured DataLoader over `PhaseParquetDataset`.
+    """
     ds = PhaseParquetDataset(
         repo_paths      = repo_paths,
         split           = split,

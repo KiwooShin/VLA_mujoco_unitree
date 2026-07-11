@@ -25,7 +25,9 @@ scene_cfg additions (beyond normal scene_cfg):
 """
 
 import math
+
 import numpy as np
+
 from code.arena import COLORS, SHAPES
 
 # ---------------------------------------------------------------------------
@@ -56,26 +58,31 @@ _TEMPLATES = [
 ]
 
 
-def _make_instruction(rng, color, shape, direction):
+def _make_instruction(rng: np.random.Generator, color: str, shape: str, direction: str) -> str:
+    """Render a random maneuver instruction template for the given landmark/turn."""
     tpl = _TEMPLATES[int(rng.integers(len(_TEMPLATES)))]
     return tpl.format(c=color, s=shape, d=direction)
 
 
 def derive_rng(base_seed: int, episode_idx: int) -> np.random.Generator:
+    """Create a per-episode RNG derived from base_seed and episode_idx."""
     ss = np.random.SeedSequence([base_seed, episode_idx])
     return np.random.default_rng(ss)
 
 
 def sample_maneuver_scene(rng: np.random.Generator) -> dict:
-    """
-    Sample a deterministic maneuver scene configuration.
+    """Sample a deterministic maneuver scene configuration.
 
     Robot at (-ARENA_HALF * ROBOT_OFFSET, jitter) facing +X.
     Landmark at (rx + LANDMARK_DIST, small_y_jitter).
     Turn direction: left or right (random).
     2-4 distractor objects elsewhere.
 
-    Returns dict compatible with build_arena() plus maneuver-specific keys.
+    Args:
+        rng: Caller-owned RNG; advances state.
+
+    Returns:
+        dict compatible with build_arena() plus maneuver-specific keys.
     """
     arena_half = ARENA_HALF
     margin = 0.6

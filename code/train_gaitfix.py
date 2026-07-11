@@ -43,7 +43,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -59,14 +58,14 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.small_vla import GroundedNav, DEFAULTS
-from code.dataset import make_dataloader, ParquetDataset
 from code.action_stats import compute_action_stats, DEFAULT_ANGLES, STD_FLOOR
+from code.dataset import make_dataloader, ParquetDataset
+from code.small_vla import GroundedNav, DEFAULTS
 
 # ---------------------------------------------------------------------------
 # Joint names (for logging)
 # ---------------------------------------------------------------------------
-JOINT_NAMES = [
+JOINT_NAMES: list[str] = [
     'l_hip_pitch', 'l_hip_roll',  'l_hip_yaw',
     'l_knee',      'l_ank_pitch', 'l_ank_roll',
     'r_hip_pitch', 'r_hip_roll',  'r_hip_yaw',
@@ -80,8 +79,7 @@ JOINT_NAMES = [
 # ---------------------------------------------------------------------------
 
 class GaitFixLoss(nn.Module):
-    """
-    Multi-task loss with residual-standardized action target (Fix 1).
+    """Multi-task loss with residual-standardized action target (Fix 1).
 
     The model is trained to predict standardized deltas:
         normed_delta = (action - default_angles - mean) / std
@@ -90,6 +88,18 @@ class GaitFixLoss(nn.Module):
     Optionally, higher-variance swing joints are up-weighted.
 
     Other heads (goal, vel, done) use the same smooth-L1 as before.
+
+    Args:
+        action_stats: Dict with 'mean' (15,), 'std' (15,), and
+            'default_angles' (15,) arrays used to standardize actions.
+        huber_beta: Beta (transition point) for the smooth-L1 losses.
+        w_action: Weight for the action loss term.
+        w_goal: Weight for the goal loss term.
+        w_vel: Weight for the velocity loss term.
+        w_done: Weight for the done (BCE) loss term.
+        swing_weight: Multiplier applied to the top-5 highest-variance
+            (swing) joints in the action loss.
+        device: Device string the stat buffers are placed on.
     """
 
     def __init__(
@@ -102,7 +112,7 @@ class GaitFixLoss(nn.Module):
         w_done:   float = 1.0,
         swing_weight: float = 1.0,         # multiplier for top-5 highest-variance joints
         device: str = 'cpu',
-    ):
+    ) -> None:
         super().__init__()
         self.beta     = huber_beta
         self.w_action = w_action
@@ -130,15 +140,31 @@ class GaitFixLoss(nn.Module):
         self.register_buffer('_joint_w', joint_w)  # (15,)
 
     def normalize_action(self, action_abs: torch.Tensor) -> torch.Tensor:
-        """Convert absolute action (B, H, 15) → standardized delta (B, H, 15)."""
+        """Converts absolute action (B, H, 15) to standardized delta (B, H, 15).
+
+        Args:
+            action_abs: Absolute joint-angle action tensor, shape (B, H, 15).
+
+        Returns:
+            Standardized delta tensor, shape (B, H, 15).
+        """
         delta = action_abs - self._deflt                       # (B, H, 15)
         return (delta - self._mean) / self._std               # normalized
 
     def denormalize_action(self, normed: torch.Tensor) -> torch.Tensor:
-        """Convert standardized delta (*, 15) → absolute action (*, 15)."""
+        """Converts standardized delta (*, 15) to absolute action (*, 15).
+
+        Args:
+            normed: Standardized delta tensor, any leading shape with a
+                trailing 15-dim.
+
+        Returns:
+            Absolute joint-angle action tensor, same shape as ``normed``.
+        """
         return self._deflt + normed * self._std + self._mean
 
     def _huber(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Computes mean smooth-L1 loss between pred and target."""
         return F.smooth_l1_loss(pred, target, beta=self.beta, reduction='mean')
 
     def _huber_weighted(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -154,12 +180,26 @@ class GaitFixLoss(nn.Module):
         *,
         action_gt_abs: torch.Tensor,         # (B, H, 15) absolute joint angles
         done_gt:       torch.Tensor,          # (B,) float 0/1
-        goal_gt:       Optional[torch.Tensor] = None,   # (B, 3)
-        vel_gt:        Optional[torch.Tensor] = None,   # (B, 3)
+        goal_gt:       torch.Tensor | None = None,   # (B, 3)
+        vel_gt:        torch.Tensor | None = None,   # (B, 3)
     ) -> tuple[torch.Tensor, dict]:
-        """
-        preds['action'] is in STANDARDIZED DELTA SPACE (model output).
-        action_gt_abs is in ABSOLUTE space; we normalize it here for loss.
+        """Computes the total multi-task loss and a per-term breakdown.
+
+        ``preds['action']`` is in STANDARDIZED DELTA SPACE (model output).
+        ``action_gt_abs`` is in ABSOLUTE space; it is normalized here before
+        computing the action loss.
+
+        Args:
+            preds: Model output dict, expected to contain 'action', 'done',
+                and optionally 'goal'/'vel' tensors.
+            action_gt_abs: Ground-truth absolute joint angles, (B, H, 15).
+            done_gt: Ground-truth done flags, (B,) float 0/1.
+            goal_gt: Optional ground-truth goal, (B, 3).
+            vel_gt: Optional ground-truth velocity command, (B, 3).
+
+        Returns:
+            A tuple of (total weighted loss tensor, dict of per-term float
+            loss values including 'total').
         """
         losses = {}
         dev   = action_gt_abs.device
@@ -211,11 +251,34 @@ def _run_epoch(
     model:     GroundedNav,
     loader:    DataLoader,
     loss_fn:   GaitFixLoss,
-    optimizer: Optional[torch.optim.Optimizer],
+    optimizer: torch.optim.Optimizer | None,
     device:    torch.device,
     train:     bool,
     verbose:   bool = False,
 ) -> dict:
+    """Runs one training or validation epoch over ``loader``.
+
+    Vision input is zeroed out (not the stability bottleneck; keeps
+    iteration fast). When ``train`` is True and ``optimizer`` is given,
+    performs backprop and a gradient-clipped optimizer step per batch.
+
+    Args:
+        model: The GroundedNav model to run forward (and optionally backward)
+            through.
+        loader: DataLoader yielding batches with 'ego_rgb', 'lang_emb',
+            'proprio_h', 'action', 'goal', 'vel_cmd', and 'done' keys.
+        loss_fn: The GaitFixLoss instance used to compute the loss.
+        optimizer: Optimizer to step when training; ignored/unused when
+            ``train`` is False.
+        device: Torch device to move batch tensors to.
+        train: Whether to run in training mode (grad enabled, backprop) or
+            eval mode (no grad).
+        verbose: Unused; reserved for future per-batch logging.
+
+    Returns:
+        A dict of epoch-averaged metrics: 'total', 'action', 'done', 'goal',
+        'vel', and 'done_acc'.
+    """
     model.train(train)
     total_loss = action_loss = done_loss = goal_loss = vel_loss = 0.0
     n_done_correct = n_total = n_batches = 0
@@ -293,8 +356,26 @@ def run_overfit_gate(
     swing_weight:  float = 2.0,
     verbose:       bool  = True,
 ) -> dict:
-    """
-    Overfit a small fixed subset of real data. PASS = action_loss drops significantly.
+    """Overfits a small fixed subset of real data.
+
+    PASS = action_loss drops below ``target_loss`` within ``max_epochs``.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: Path to the dataset repo (e.g. easy_train80).
+        action_stats: Action normalization statistics (mean/std/etc.).
+        batch_size: Batch size for the overfit subset loader.
+        overfit_n: Number of samples to overfit on.
+        max_epochs: Maximum number of overfit epochs before declaring FAIL.
+        target_loss: Action loss threshold to declare PASS.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        verbose: Whether to print periodic progress lines.
+
+    Returns:
+        A dict with keys 'status' ('PASS' or 'FAIL'), 'epoch', 'action_loss',
+        and 'elapsed' (seconds).
     """
     print(f"\n{'='*60}")
     print(f"  GAITFIX OVERFIT GATE — Arch {arch}  swing_weight={swing_weight}")
@@ -364,9 +445,27 @@ def train_full(
     swing_weight:  float = 2.0,
     train_fraction: float = 0.9,
     num_workers:   int   = 0,
-    resume_ckpt:   Optional[str] = None,
+    resume_ckpt:   str | None = None,
 ) -> list:
-    """Full training loop with per-epoch checkpoints."""
+    """Runs the full training loop with per-epoch checkpoints.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: Path to the dataset repo (e.g. easy_train80).
+        action_stats: Action normalization statistics (mean/std/etc.).
+        out_dir: Directory to write checkpoints and logs to.
+        n_epochs: Number of training epochs.
+        batch_size: Batch size for train/val loaders.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        train_fraction: Fraction of frames used for the train split.
+        num_workers: Number of DataLoader worker processes.
+        resume_ckpt: Optional checkpoint path to resume training from.
+
+    Returns:
+        A list of per-epoch metric dicts (epoch, train, val, elapsed_s).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Dataloaders (vision=zeros via load_video=False → zeros returned)
@@ -482,9 +581,18 @@ def audit_velocity_head(
     device:       torch.device,
     n_batches:    int = 20,
 ) -> dict:
-    """
-    Evaluate the velocity head on val data: compare pred (vx,vy,wz) vs GT.
-    Returns stats that reveal whether the vel head predicts ~0 (bad) or GT (good).
+    """Evaluates the velocity head on val data: compares pred (vx,vy,wz) vs GT.
+
+    Args:
+        model: The GroundedNav model to evaluate (vision is zeroed out).
+        val_loader: DataLoader over the validation split.
+        device: Torch device to move batch tensors to.
+        n_batches: Number of batches to evaluate over.
+
+    Returns:
+        A dict of pred/GT mean/std/MAE stats per axis (vx, vy, wz), plus
+        'n_samples' and 'vel_head_near_zero'. Returns
+        ``{'error': ...}`` if the model has no 'vel' head (e.g. arch C).
     """
     model.eval()
     pred_vels = []
@@ -541,7 +649,8 @@ def audit_velocity_head(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
+    """Parses CLI args and runs the overfit gate, training, and/or audit."""
     ap = argparse.ArgumentParser(description='GaitFix trainer — Fix 1 residual+standardized action')
     ap.add_argument('--arch',      default='A', choices=['A', 'C'])
     ap.add_argument('--data',      required=True, help='Dataset repo path (easy_train80)')

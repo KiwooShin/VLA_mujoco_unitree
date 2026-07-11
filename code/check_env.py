@@ -5,6 +5,7 @@ Checks all dependencies needed for the campaign.
 Run with: python code/check_env.py   (inside the g1nav conda env)
 """
 
+from collections.abc import Callable
 import os
 import sys
 import traceback
@@ -14,10 +15,21 @@ os.environ["MUJOCO_GL"] = "egl"
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-results = {}  # name -> (pass/fail, message)
+results: dict[str, tuple[str, str]] = {}  # name -> (pass/fail, message)
 
 
-def check(name, fn):
+def check(name: str, fn: Callable[[], str]) -> None:
+    """Run a single check function, recording and printing its outcome.
+
+    Args:
+        name: Short identifier for the check (used as the `results` key).
+        fn: Zero-arg callable that performs the check and returns a status
+            message on success.
+
+    Raises:
+        None: all exceptions raised by `fn` are caught and recorded as a
+            "FAIL" result rather than propagating.
+    """
     try:
         msg = fn()
         results[name] = ("PASS", msg)
@@ -32,7 +44,16 @@ def check(name, fn):
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 1: PyTorch + CUDA
 # ─────────────────────────────────────────────────────────────────────────────
-def check_torch():
+def check_torch() -> str:
+    """Verify CUDA is available and run a small GPU matmul.
+
+    Returns:
+        Status message with the torch version, GPU name, and VRAM size.
+
+    Raises:
+        AssertionError: If CUDA is unavailable or the matmul output shape
+            is wrong.
+    """
     import torch
     assert torch.cuda.is_available(), "CUDA not available"
     gpu_name = torch.cuda.get_device_name(0)
@@ -55,7 +76,16 @@ check("1_torch_cuda", check_torch)
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 2: MuJoCo + EGL offscreen render of G1 model
 # ─────────────────────────────────────────────────────────────────────────────
-def check_mujoco():
+def check_mujoco() -> str:
+    """Verify MuJoCo can load the G1 model and render an EGL offscreen frame.
+
+    Returns:
+        Status message with the mujoco version and render shape.
+
+    Raises:
+        AssertionError: If the XML is missing or the rendered frame has an
+            unexpected shape/dtype.
+    """
     import mujoco
     # g1.xml references ../../../meshes/benchmark_bin_centered.stl (terrain mesh)
     # which is NOT in the repo. Use g1_gear_wbc.xml (robot-only, no terrain) instead.
@@ -87,9 +117,20 @@ check("2_mujoco_egl", check_mujoco)
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 3: onnxruntime + WBC ONNX policies
 # ─────────────────────────────────────────────────────────────────────────────
-onnx_io_report = {}
+onnx_io_report: dict[str, dict] = {}
 
-def check_onnxruntime():
+def check_onnxruntime() -> str:
+    """Verify onnxruntime loads the Walk and Balance WBC policies.
+
+    Populates the module-level `onnx_io_report` dict with each policy's
+    input/output shapes as a side effect.
+
+    Returns:
+        Status message with the onnxruntime version.
+
+    Raises:
+        AssertionError: If either ONNX file is missing.
+    """
     import onnxruntime as ort
 
     policy_dir = os.path.join(
@@ -127,9 +168,21 @@ check("3_onnxruntime_wbc", check_onnxruntime)
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 4: gr00t imports + GR00T-N1.6-3B checkpoint
 # ─────────────────────────────────────────────────────────────────────────────
-groot_module_paths = {}
+groot_module_paths: dict[str, str] = {}
 
-def check_groot():
+def check_groot() -> str:
+    """Verify gr00t imports and load the GR00T-N1.6-3B checkpoint in bf16.
+
+    Populates the module-level `groot_module_paths` dict with the
+    vision/language submodule paths as a side effect.
+
+    Returns:
+        Status message with the gr00t version, parameter count, and VRAM
+        usage.
+
+    Raises:
+        AssertionError: If the checkpoint directory is missing.
+    """
     import torch
     import gr00t
     from gr00t.model.gr00t_n1d6.gr00t_n1d6 import Gr00tN1d6
@@ -181,7 +234,16 @@ check("4_groot_n1d6", check_groot)
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 5: OpenCV + imageio
 # ─────────────────────────────────────────────────────────────────────────────
-def check_media():
+def check_media() -> str:
+    """Verify OpenCV and imageio via a small PNG encode/decode round trip.
+
+    Returns:
+        Status message with the cv2 and imageio versions.
+
+    Raises:
+        AssertionError: If the decoded image shape doesn't match the
+            encoded input.
+    """
     import cv2
     import imageio
     import numpy as np

@@ -21,13 +21,13 @@ Split policy: by EPISODE (no within-episode leakage).
 """
 
 from __future__ import annotations
+
 import os
 from pathlib import Path
-from typing import Optional, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 
 # ---------------------------------------------------------------------------
@@ -55,13 +55,13 @@ class SyntheticDataset(Dataset):
         vel_dim: int = 3,
         seed: int = 42,
         device: str = 'cpu',
-    ):
+    ) -> None:
         super().__init__()
         self.n = n_samples
         rng = torch.Generator()
         rng.manual_seed(seed)
 
-        def R(*shape):
+        def R(*shape: int) -> torch.Tensor:
             return torch.randn(*shape, generator=rng)
 
         # Pre-generate all samples on device (GPU-resident for speed)
@@ -135,7 +135,7 @@ class LeRobotDataset(Dataset):
         img_size: int = 128,
         in_ch: int = 3,
         proprio_dim: int = 55,
-    ):
+    ) -> None:
         super().__init__()
         try:
             import h5py
@@ -279,9 +279,9 @@ class ParquetDataset(Dataset):
         img_size: int = 128,
         in_ch: int = 3,
         proprio_dim: int = 55,
-        lang_cache_path: Optional[str] = None,
+        lang_cache_path: str | None = None,
         load_video: bool = True,
-    ):
+    ) -> None:
         super().__init__()
         import json
 
@@ -295,7 +295,7 @@ class ParquetDataset(Dataset):
         self.lang_cache_path = lang_cache_path
 
         # Load lang cache if provided
-        self._lang_cache: Optional[dict] = None
+        self._lang_cache: dict | None = None
         if lang_cache_path and os.path.exists(lang_cache_path):
             import pickle
             with open(lang_cache_path, "rb") as f:
@@ -362,7 +362,7 @@ class ParquetDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def _get_video_frame(self, video_path: Optional[str], t: int) -> torch.Tensor:
+    def _get_video_frame(self, video_path: str | None, t: int) -> torch.Tensor:
         """Decode frame t from mp4 → (3, img_size, img_size) float [0,1]."""
         if video_path is None or not self.load_video:
             return torch.zeros(self.in_ch, self.img_size, self.img_size)
@@ -436,16 +436,36 @@ def make_dataloader(
     num_workers: int = 0,
     pin_memory: bool = True,
     device: str = 'cpu',           # for synthetic GPU-resident tensors
-    repo_path: Optional[str] = None,
-    lang_cache_path: Optional[str] = None,
+    repo_path: str | None = None,
+    lang_cache_path: str | None = None,
     **dataset_kwargs,
 ) -> DataLoader:
-    """
-    Create a DataLoader for the given mode.
+    """Create a DataLoader for the given mode.
 
     For 'synthetic', tensors are pre-generated (overfit gate).
     For 'lerobot', reads from HDF5 disk.
     For 'parquet', reads from S3b parquet + mp4 format (default for real training).
+
+    Args:
+        mode: Dataset backend to use — 'synthetic', 'lerobot', or 'parquet'.
+        split: 'train' or 'val' (controls shuffling and, for lerobot/parquet,
+            the episode split).
+        batch_size: DataLoader batch size.
+        num_workers: DataLoader worker count (ignored for 'synthetic', which
+            forces 0 since its tensors are GPU-resident).
+        pin_memory: DataLoader pin_memory flag (forced False for 'synthetic').
+        device: Device for synthetic GPU-resident tensors.
+        repo_path: Dataset repo path, required for 'lerobot' and 'parquet' modes.
+        lang_cache_path: Optional path to a pre-built language embedding cache
+            (only used by 'parquet' mode).
+        **dataset_kwargs: Forwarded to the underlying Dataset constructor.
+
+    Returns:
+        A configured DataLoader for the requested mode.
+
+    Raises:
+        ValueError: If `mode` is unknown, or if `repo_path` is None for the
+            'lerobot' or 'parquet' modes.
     """
     if mode == 'synthetic':
         ds = SyntheticDataset(device=device, **dataset_kwargs)

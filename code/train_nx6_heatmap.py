@@ -39,17 +39,39 @@ if str(_REPO) not in sys.path:
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-from code.nx6_heatmap_model import TinyHeatmapUNet, N_CLASS, N_COLOR, TARGET_W, TARGET_H
 from code.nx6_heatmap_data import (SplitCache, build_example_index, HeatmapDataset, collate,
                                    oversample_far_or_wide)
 from code.nx6_heatmap_eval_utils import run_inference, select_threshold, presence_only_pr
+from code.nx6_heatmap_model import TinyHeatmapUNet, N_CLASS, N_COLOR, TARGET_W, TARGET_H
 
 
-def focal_heatmap_loss(heat_logit, heat_target, peak_mask, alpha=2.0, beta=4.0, eps=1e-6):
+def focal_heatmap_loss(
+    heat_logit: torch.Tensor,
+    heat_target: torch.Tensor,
+    peak_mask: torch.Tensor,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """CenterNet-style penalty-reduced focal loss. Uses an elementwise mask-multiply
     (not advanced indexing / gather) to pick out the per-example GT-peak pixel --
     measured ~10x cheaper backward than `tensor[idx_b, py, px]` gather on this GPU
-    (see docs/nx6_train_heatmap.md perf note)."""
+    (see docs/nx6_train_heatmap.md perf note).
+
+    Args:
+        heat_logit: Predicted heatmap logits, shape (B, H, W).
+        heat_target: Gaussian-encoded GT heatmap, shape (B, H, W).
+        peak_mask: Binary mask, 1 at the GT-peak pixel (0 elsewhere; all-zero
+            for negative examples), shape (B, H, W).
+        alpha: Focal-loss exponent applied to the predicted probability.
+        beta: Penalty-reduction exponent applied to the negative weight.
+        eps: Numerical-stability epsilon for the log terms.
+
+    Returns:
+        A tuple (total_neg, pos_loss), each shape (B,): the summed negative
+        loss and summed positive (peak) loss per example. Caller normalizes
+        by n_pos.
+    """
     p = torch.sigmoid(heat_logit)
     neg_weight = (1.0 - heat_target).pow(beta)
     neg_loss_map = -neg_weight * p.pow(alpha) * torch.log(1.0 - p + eps)
@@ -60,7 +82,25 @@ def focal_heatmap_loss(heat_logit, heat_target, peak_mask, alpha=2.0, beta=4.0, 
     return total_neg, pos_loss  # caller normalizes by n_pos
 
 
-def compute_loss(heat_logit, dist_resid, batch, lambda_dist=1.0):
+def compute_loss(
+    heat_logit: torch.Tensor,
+    dist_resid: torch.Tensor,
+    batch: dict,
+    lambda_dist: float = 1.0,
+) -> tuple[torch.Tensor, dict]:
+    """Computes the combined heatmap focal loss + distance residual loss.
+
+    Args:
+        heat_logit: Predicted heatmap logits, shape (B, H, W).
+        dist_resid: Predicted distance residual map, shape (B, H, W).
+        batch: Batch dict with 'heat', 'peak_mask', 'has_target', and
+            'resid' tensors (see collate()).
+        lambda_dist: Weight applied to the distance residual loss term.
+
+    Returns:
+        A tuple (loss, parts): the total scalar loss tensor and a dict with
+        'heatmap_loss' and 'dist_loss' float values.
+    """
     device = heat_logit.device
     heat_target = batch["heat"].to(device)
     peak_mask = batch["peak_mask"].to(device)
@@ -79,7 +119,26 @@ def compute_loss(heat_logit, dist_resid, batch, lambda_dist=1.0):
     return loss, dict(heatmap_loss=float(heatmap_loss.item()), dist_loss=float(dist_loss.item()))
 
 
-def evaluate_val(model, val_cache, val_examples, device, tag=""):
+def evaluate_val(
+    model: TinyHeatmapUNet,
+    val_cache: SplitCache,
+    val_examples: list,
+    device: str,
+    tag: str = "",
+) -> tuple[dict, list]:
+    """Runs inference + threshold selection on the val split and logs a summary.
+
+    Args:
+        model: The TinyHeatmapUNet model to evaluate.
+        val_cache: SplitCache holding the val split's frames/rgb/depth/labels.
+        val_examples: Example index built via build_example_index().
+        device: Torch device string to run inference on.
+        tag: Optional suffix appended to the printed log line (e.g. epoch tag).
+
+    Returns:
+        A tuple (best, curve): the best operating point dict (from
+        select_threshold()) and the full threshold sweep curve.
+    """
     res = run_inference(model, val_cache, val_examples, device, batch_size=256, num_workers=2)
     best, curve = select_threshold(res, min_precision=0.9, bearing_tol=2.0, dist_tol=0.5)
     presence = presence_only_pr(res, tau=best["tau"])
@@ -90,7 +149,8 @@ def evaluate_val(model, val_cache, val_examples, device, tag=""):
     return best, curve
 
 
-def main():
+def main() -> None:
+    """Parses CLI args and runs NX-6 heatmap-model training end-to-end."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="dataset/det_v1")
     ap.add_argument("--out", default="runs/nx6_heatmap_A")

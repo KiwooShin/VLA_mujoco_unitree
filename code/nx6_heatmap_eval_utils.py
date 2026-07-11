@@ -20,12 +20,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from code.nx6_heatmap_data import HeatmapDataset, collate, SplitCache
-from code.nx6_heatmap_model import decode_single, TARGET_INTR, MAX_DEPTH_CLIP_M
+from code.nx6_heatmap_data import HeatmapDataset, SplitCache, collate
+from code.nx6_heatmap_model import MAX_DEPTH_CLIP_M, TARGET_INTR, decode_single
 
 
 @dataclass
 class InferenceResult:
+    """Per-example inference outputs and ground truth, aligned 1:1 with an example list."""
+
     confidence: np.ndarray
     dist_pred: np.ndarray
     bearing_pred: np.ndarray
@@ -39,10 +41,23 @@ class InferenceResult:
 
 
 @torch.no_grad()
-def run_inference(model, cache: SplitCache, examples: list, device: str,
+def run_inference(model: torch.nn.Module, cache: SplitCache, examples: list, device: str,
                   batch_size: int = 128, num_workers: int = 2) -> InferenceResult:
     """Runs the model (eval mode, no augmentation) over a fixed example list and
-    decodes each prediction. Returns arrays aligned 1:1 with `examples`."""
+    decodes each prediction.
+
+    Args:
+        model: Heatmap model (callable as `model(x, q) -> (heat_logit, dist_resid)`).
+        cache: SplitCache backing `examples`.
+        examples: Example index as built by `build_example_index` (and optionally
+            `oversample_far_or_wide`).
+        device: Torch device to run inference on.
+        batch_size: DataLoader batch size.
+        num_workers: DataLoader worker count.
+
+    Returns:
+        InferenceResult with arrays aligned 1:1 with `examples`.
+    """
     model.eval()
     ds = HeatmapDataset(cache, examples, train=False, seed=0)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate,
@@ -84,7 +99,19 @@ def run_inference(model, cache: SplitCache, examples: list, device: str,
     )
 
 
-def score_at_threshold(res: InferenceResult, tau: float, bearing_tol=2.0, dist_tol=0.5):
+def score_at_threshold(res: InferenceResult, tau: float, bearing_tol: float = 2.0,
+                       dist_tol: float = 0.5) -> dict:
+    """Scores one confidence threshold: detection precision/recall with localization gating.
+
+    Args:
+        res: Inference outputs from `run_inference`.
+        tau: Confidence threshold; a detection fires where confidence >= tau.
+        bearing_tol: Max bearing error (deg) for a detection to count as localized.
+        dist_tol: Max distance error (m) for a detection to count as localized.
+
+    Returns:
+        dict with tau, precision, recall, tp, fp, n_pos, n_detected.
+    """
     detected = res.confidence >= tau
     is_pos = res.has_target > 0.5
 
@@ -93,7 +120,8 @@ def score_at_threshold(res: InferenceResult, tau: float, bearing_tol=2.0, dist_t
     localized_ok = is_pos & (bearing_err < bearing_tol) & (dist_err < dist_tol)
 
     tp = detected & localized_ok
-    fp = detected & (~localized_ok)   # negative-frame detections OR mislocalized positive detections
+    # negative-frame detections OR mislocalized positive detections
+    fp = detected & (~localized_ok)
     n_pos = int(is_pos.sum())
     n_detected = int(detected.sum())
 
@@ -103,17 +131,30 @@ def score_at_threshold(res: InferenceResult, tau: float, bearing_tol=2.0, dist_t
                 tp=int(tp.sum()), fp=int(fp.sum()), n_pos=n_pos, n_detected=n_detected)
 
 
-def _angle_diff_deg(a, b):
+def _angle_diff_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Smallest signed difference a-b wrapped to (-180,180], vectorized, degrees."""
     d = (a - b + 180.0) % 360.0 - 180.0
     return d
 
 
-def select_threshold(res: InferenceResult, min_precision=0.9, bearing_tol=2.0, dist_tol=0.5,
-                     taus=None):
+def select_threshold(res: InferenceResult, min_precision: float = 0.9,
+                     bearing_tol: float = 2.0, dist_tol: float = 0.5,
+                     taus: np.ndarray | None = None) -> tuple[dict, list[dict]]:
     """Sweep confidence threshold; return the operating point with the highest recall
     subject to precision >= min_precision. If none clears the bar, return the point
-    with the highest precision achieved anywhere (honest fallback) with a flag."""
+    with the highest precision achieved anywhere (honest fallback) with a flag.
+
+    Args:
+        res: Inference outputs from `run_inference`.
+        min_precision: Minimum precision required for a threshold to be feasible.
+        bearing_tol: Max bearing error (deg) for a detection to count as localized.
+        dist_tol: Max distance error (m) for a detection to count as localized.
+        taus: Thresholds to sweep; defaults to `linspace(0.01, 0.99, 99)`.
+
+    Returns:
+        Tuple of (best score dict, full list of per-threshold score dicts). The
+        best dict has an added 'met_precision_gate' bool flag.
+    """
     if taus is None:
         taus = np.concatenate([np.linspace(0.01, 0.99, 99)])
     curve = [score_at_threshold(res, t, bearing_tol, dist_tol) for t in taus]
@@ -127,9 +168,17 @@ def select_threshold(res: InferenceResult, min_precision=0.9, bearing_tol=2.0, d
     return best, curve
 
 
-def presence_only_pr(res: InferenceResult, tau: float):
+def presence_only_pr(res: InferenceResult, tau: float) -> dict:
     """Simple presence detection precision/recall (ignores localization accuracy) --
-    supplementary diagnostic, not the selection metric."""
+    supplementary diagnostic, not the selection metric.
+
+    Args:
+        res: Inference outputs from `run_inference`.
+        tau: Confidence threshold; a detection fires where confidence >= tau.
+
+    Returns:
+        dict with precision, recall, tp, fp, fn.
+    """
     detected = res.confidence >= tau
     is_pos = res.has_target > 0.5
     tp = detected & is_pos
@@ -137,4 +186,5 @@ def presence_only_pr(res: InferenceResult, tau: float):
     fn = (~detected) & is_pos
     precision = float(tp.sum()) / max(1, int(detected.sum()))
     recall = float(tp.sum()) / max(1, int(is_pos.sum()))
-    return dict(precision=precision, recall=recall, tp=int(tp.sum()), fp=int(fp.sum()), fn=int(fn.sum()))
+    return dict(precision=precision, recall=recall, tp=int(tp.sum()), fp=int(fp.sum()),
+                fn=int(fn.sum()))

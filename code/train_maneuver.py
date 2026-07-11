@@ -34,7 +34,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -46,25 +45,31 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.small_vla import GroundedNav, DEFAULTS
+from code.action_stats import compute_action_stats, DEFAULT_ANGLES, STD_FLOOR
 from code.dataset_maneuver import (
     make_maneuver_dataloader, ManeuverParquetDataset,
     PROPRIO_DIM_MANEUVER,
 )
-from code.action_stats import compute_action_stats, DEFAULT_ANGLES, STD_FLOOR
+from code.small_vla import GroundedNav, DEFAULTS
 from code.train_gaitfix import GaitFixLoss, _run_epoch
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PROPRIO_DIM = PROPRIO_DIM_MANEUVER   # 62
+PROPRIO_DIM: int = PROPRIO_DIM_MANEUVER   # 62
 
 
-def _expand_proprio_enc(model: GroundedNav, old_dim: int, new_dim: int):
-    """
-    Expand the proprio encoder's GRU input_size from old_dim to new_dim.
-    Re-initializes only the input_weight rows for the new dims; keeps old weights.
-    This allows loading a 57-d checkpoint and expanding to 62-d.
+def _expand_proprio_enc(model: GroundedNav, old_dim: int, new_dim: int) -> None:
+    """Expands the proprio encoder's GRU input_size from old_dim to new_dim.
+
+    Re-initializes only the input_weight columns for the new dims; keeps old
+    weights. This allows loading a 57-d checkpoint and expanding to 62-d.
+
+    Args:
+        model: The GroundedNav model whose proprio_enc GRU is expanded
+            in place.
+        old_dim: Original GRU input size (e.g. 57).
+        new_dim: New GRU input size (e.g. 62).
     """
     old_gru = model.proprio_enc.gru
     hidden  = old_gru.hidden_size
@@ -86,15 +91,21 @@ def _expand_proprio_enc(model: GroundedNav, old_dim: int, new_dim: int):
           f"(old weights preserved, new cols orthogonal-init)", flush=True)
 
 
-def load_loco_checkpoint(ckpt_path: str, device: torch.device) -> GroundedNav:
-    """
-    Load a locomotion checkpoint (proprio_dim=57) and expand to maneuver model (62-d).
+def load_loco_checkpoint(ckpt_path: str, device: torch.device) -> tuple[GroundedNav, dict]:
+    """Loads a locomotion checkpoint (proprio_dim=57) and expands it to the
+    maneuver model (62-d).
 
     Steps:
     1. Build GroundedNav with proprio_dim=57 (match checkpoint exactly).
     2. Load state dict strictly.
     3. Expand proprio_enc GRU input: 57→62 (preserving old weights).
-    Returns the expanded model on device.
+
+    Args:
+        ckpt_path: Path to the locomotion checkpoint file.
+        device: Torch device to move the expanded model to.
+
+    Returns:
+        A tuple of (expanded model on device, raw checkpoint dict).
     """
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     ckpt_proprio_dim = ckpt.get('proprio_dim', 57)
@@ -143,6 +154,28 @@ def run_overfit_gate(
     swing_weight: float = 2.0,
     verbose:      bool  = True,
 ) -> dict:
+    """Runs the maneuver overfit gate on a small subset of real data.
+
+    Trains ``GroundedNav`` (proprio_dim=62) on a small fixed subset until
+    the action loss drops below ``target_loss`` or ``max_epochs`` is reached.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: Path to the maneuver dataset repo.
+        action_stats: Action normalization statistics (mean/std/etc.).
+        batch_size: Batch size for the overfit subset loader.
+        overfit_n: Number of samples to overfit on.
+        max_epochs: Maximum number of overfit epochs before declaring FAIL.
+        target_loss: Action loss threshold to declare PASS.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        verbose: Whether to print periodic progress lines.
+
+    Returns:
+        A dict with keys 'status' ('PASS' or 'FAIL'), 'epoch', 'action_loss',
+        and 'elapsed' (seconds).
+    """
     print(f"\n{'='*60}")
     print(f"  MANEUVER OVERFIT GATE — Arch {arch}  proprio_dim={PROPRIO_DIM}")
     print(f"  repo={repo_path}  n_samples={overfit_n}  target_loss={target_loss}")
@@ -199,7 +232,7 @@ def run_overfit_gate(
 def train_full(
     arch:           str,
     device:         torch.device,
-    repo_path:      "str | list[str]",
+    repo_path:      str | list[str],
     action_stats:   dict,
     out_dir:        Path,
     n_epochs:       int   = 20,
@@ -208,8 +241,33 @@ def train_full(
     swing_weight:   float = 2.0,
     train_fraction: float = 0.9,
     num_workers:    int   = 0,
-    resume_ckpt:    Optional[str] = None,
+    resume_ckpt:    str | None = None,
 ) -> list:
+    """Runs full maneuver fine-tuning/training.
+
+    Loads a locomotion checkpoint (if given) and expands its proprio encoder
+    to 62-d, then trains with ``GaitFixLoss``, saving a per-epoch checkpoint
+    plus a running-best checkpoint to ``out_dir``, and a ``curves.json`` log
+    of per-epoch train/val metrics.
+
+    Args:
+        arch: Model architecture variant ('A' or 'C').
+        device: Torch device to train on.
+        repo_path: One or more maneuver dataset repo paths.
+        action_stats: Action normalization statistics (mean/std/etc.).
+        out_dir: Directory to write checkpoints and logs to.
+        n_epochs: Number of training epochs.
+        batch_size: Batch size for train/val loaders.
+        lr: Learning rate for the AdamW optimizer.
+        swing_weight: Swing-joint upweighting factor for GaitFixLoss.
+        train_fraction: Fraction of frames used for the train split.
+        num_workers: Number of DataLoader worker processes.
+        resume_ckpt: Optional locomotion checkpoint path to fine-tune from.
+            If missing/None, trains a fresh model from scratch.
+
+    Returns:
+        A list of per-epoch metric dicts (epoch, train, val, elapsed_s).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Accept single string or list of repo paths
@@ -311,7 +369,8 @@ def train_full(
     return log
 
 
-def main():
+def main() -> None:
+    """Parses CLI args and runs the maneuver overfit gate and/or training."""
     ap = argparse.ArgumentParser(
         description='Maneuver trainer (fine-tune from demo_dart_A, proprio_dim=62)'
     )

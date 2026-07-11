@@ -62,38 +62,36 @@ import mujoco
 import numpy as np
 import pandas as pd
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_HERE: Path = Path(__file__).resolve().parent
+_REPO: Path = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.teacher import (
-    WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
-    NUM_ACTIONS, SIM_DT, CONTROL_DECIMATION,
-)
 from code.arena import build_arena
-from code.scene import sample_scene, derive_rng
-from code.steer import steer as steer_cmd, goal_vec
+from code.scene import derive_rng, sample_scene
+from code.steer import goal_vec, steer as steer_cmd
+from code.teacher import (
+    CONTROL_DECIMATION, DEFAULT_ANGLES, KDS, KPS, NUM_ACTIONS, SIM_DT, WBCTeacher, _yaw_of,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FPS           = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))   # 50 Hz
-SETTLE_STEPS  = 80
-FALL_HEIGHT   = 0.50
-HOLD_STEPS    = 5
-PROPRIO_DIM   = 55
+FPS: int          = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))   # 50 Hz
+SETTLE_STEPS: int = 80
+FALL_HEIGHT: float = 0.50
+HOLD_STEPS: int   = 5
+PROPRIO_DIM: int  = 55
 
 # Left ankle pitch index in lower-body joint positions (index 4, per dataset.md)
-LEFT_ANKLE_PITCH_IDX  = 4    # in qpos[7:22]
-LEFT_ANKLE_DEFAULT    = -0.2  # from teacher.py default angles
+LEFT_ANKLE_PITCH_IDX: int  = 4    # in qpos[7:22]
+LEFT_ANKLE_DEFAULT: float  = -0.2  # from teacher.py default angles
 
 
 # ---------------------------------------------------------------------------
 # Phase extractor — running zero-crossing counter on ankle pitch oscillation
 # ---------------------------------------------------------------------------
 class GaitPhaseTracker:
-    """
-    Tracks gait phase phi in [0, 2pi] using left ankle pitch zero-crossings.
+    """Tracks gait phase phi in [0, 2pi] using left ankle pitch zero-crossings.
 
     The ankle pitch oscillates sinusoidally during walking. Positive-going
     zero-crossings of (ankle_pitch - default) mark the start of each cycle.
@@ -102,7 +100,13 @@ class GaitPhaseTracker:
     Output: (sin(phi), cos(phi)) — 2-d unit-circle encoding.
     """
 
-    def __init__(self, freq_hz: float = 1.8):
+    def __init__(self, freq_hz: float = 1.8) -> None:
+        """Initializes the phase tracker.
+
+        Args:
+            freq_hz: Estimated walking gait frequency in Hz, used to
+                advance phase between zero-crossings.
+        """
         self._phi: float = 0.0
         self._prev_q: float = 0.0
         self._initialized: bool = False
@@ -110,11 +114,13 @@ class GaitPhaseTracker:
         self._dt: float = SIM_DT * CONTROL_DECIMATION  # 0.02 s
 
     def update(self, q_lb: np.ndarray) -> tuple[float, float]:
-        """
-        Update phase from lower-body joint positions.
+        """Updates phase from lower-body joint positions.
 
-        q_lb : (15,) joint positions (same order as dataset).
-        Returns: (sin_phi, cos_phi)
+        Args:
+            q_lb: (15,) joint positions (same order as dataset).
+
+        Returns:
+            A tuple (sin_phi, cos_phi) encoding the current gait phase.
         """
         q_ankle = float(q_lb[LEFT_ANKLE_PITCH_IDX]) - LEFT_ANKLE_DEFAULT
 
@@ -140,6 +146,17 @@ class GaitPhaseTracker:
 # Proprio builder (identical to gen_dataset.py)
 # ---------------------------------------------------------------------------
 def build_proprio(data: mujoco.MjData, prev_action: np.ndarray) -> np.ndarray:
+    """Builds the 55-d proprioceptive observation vector from physics state.
+
+    Args:
+        data: MuJoCo data holding the current physics state.
+        prev_action: Previous joint-target action (15-d), appended as part
+            of the observation.
+
+    Returns:
+        A (55,) float32 array: [q_lb(15), dq_lb(15), quat(4), ang_v(3),
+        lin_v(3), prev_action(15)].
+    """
     q_lb   = data.qpos[7:22].copy()
     dq_lb  = data.qvel[6:21].copy()
     quat   = data.qpos[3:7].copy()
@@ -165,11 +182,10 @@ def run_dart_episode(
     global_frame_offset: int,
     noise_sigma: float = 0.07,
     hard_maxsteps: int = 300,
-    rng_noise: np.random.Generator = None,
+    rng_noise: np.random.Generator | None = None,
     verbose: bool = False,
 ) -> dict | None:
-    """
-    DART episode: teacher determines clean action; noisy action is executed.
+    """Runs one DART episode: teacher determines clean action; noisy action is executed.
 
     Strategy:
       1. Save physics state before each step.
@@ -184,7 +200,24 @@ def run_dart_episode(
     Supervision: proprio is built from the NOISY-executed physics state;
                  action label = clean_targets.
 
-    Returns dict with rows (including 'phase' column), or None if fallen.
+    Args:
+        teacher: WBCTeacher instance to step; its model/data are replaced
+            with the arena built from `scene_cfg`.
+        scene_cfg: Scene configuration dict from `sample_scene`.
+        episode_idx: Episode index recorded in the `episode_index` column.
+        global_frame_offset: Running frame count offset added to the
+            per-frame `index` column.
+        noise_sigma: Standard deviation of the joint-target noise applied
+            for DART.
+        hard_maxsteps: Maximum number of control steps before the episode
+            ends (if not already reached or fallen).
+        rng_noise: Random generator used for the DART noise. If None, a
+            fresh default generator is created.
+        verbose: If True, prints periodic progress lines every 50 steps.
+
+    Returns:
+        A dict with keys `rows` (including the `phase` column), `reached`,
+        and `n_steps`, or None if the robot fell during the episode.
     """
     if rng_noise is None:
         rng_noise = np.random.default_rng()
@@ -333,11 +366,20 @@ def run_dart_episode(
 # Add gait phase to clean dataset (post-processing existing parquet)
 # ---------------------------------------------------------------------------
 def add_phase_to_clean_dataset(in_dir: str, out_dir: str) -> int:
-    """
-    Read each episode parquet from in_dir, compute gait phase from proprio,
-    write new parquet with 'phase' column to out_dir.
+    """Adds a gait-phase column to an existing clean dataset.
 
-    Returns total frames processed.
+    Reads each episode parquet from `in_dir`, computes gait phase from the
+    proprio column, and writes a new parquet with a `phase` column to
+    `out_dir`.
+
+    Args:
+        in_dir: Input dataset directory (data/chunk-000/*.parquet plus a
+            meta/ directory).
+        out_dir: Output dataset directory for the phase-augmented parquet
+            files and copied meta files.
+
+    Returns:
+        Total number of frames processed.
     """
     import shutil
 
@@ -378,9 +420,19 @@ def add_phase_to_clean_dataset(in_dir: str, out_dir: str) -> int:
 # Combine DART + clean datasets into a single merged parquet dataset
 # ---------------------------------------------------------------------------
 def combine_datasets(clean_dir: str, dart_dir: str, out_dir: str) -> dict:
-    """
-    Merge clean (with phase) + DART datasets into one combined dataset.
-    Re-indexes episode_index and global index.
+    """Merges clean (with phase) and DART datasets into one combined dataset.
+
+    Re-indexes `episode_index` and the global frame `index` across both
+    sources.
+
+    Args:
+        clean_dir: Directory of the clean (phase-augmented) dataset.
+        dart_dir: Directory of the DART dataset.
+        out_dir: Output directory for the combined dataset.
+
+    Returns:
+        The `info` dict written to `meta/info.json`, describing dataset
+        composition and stats.
     """
     out_path  = Path(out_dir)
     data_out  = out_path / "data" / "chunk-000"
@@ -462,7 +514,8 @@ def combine_datasets(clean_dir: str, dart_dir: str, out_dir: str) -> dict:
     arr_a = np.array(all_actions, dtype=np.float32) if all_actions else np.zeros((1, 15))
     arr_p = np.array(all_proprio, dtype=np.float32) if all_proprio else np.zeros((1, 55))
 
-    def _stat(a):
+    def _stat(a: np.ndarray) -> dict[str, list[float]]:
+        """Computes per-dimension mean/std/min/max for stats.json."""
         return {"mean": a.mean(0).tolist(), "std": (a.std(0) + 1e-6).tolist(),
                 "min": a.min(0).tolist(), "max": a.max(0).tolist()}
 
@@ -503,7 +556,14 @@ def combine_datasets(clean_dir: str, dart_dir: str, out_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # Main DART generation
 # ---------------------------------------------------------------------------
-def main_generate(args):
+def main_generate(args: argparse.Namespace) -> None:
+    """Generates a DART dataset and writes it to `args.out`.
+
+    Args:
+        args: Parsed command-line arguments (see `main`), with fields
+            `difficulty`, `seed`, `num_episodes`, `noise`, `maxsteps`,
+            `out`, and `verbose`.
+    """
     t0 = time.time()
 
     out_path = Path(args.out)
@@ -605,7 +665,8 @@ def main_generate(args):
     arr_p = np.array(all_proprio, dtype=np.float32) if all_proprio else np.zeros((1, 55))
     arr_a = np.array(all_actions, dtype=np.float32) if all_actions else np.zeros((1, 15))
 
-    def _stat(a):
+    def _stat(a: np.ndarray) -> dict[str, list[float]]:
+        """Computes per-dimension mean/std/min/max for stats.json."""
         return {"mean": a.mean(0).tolist(), "std": (a.std(0)+1e-6).tolist(),
                 "min": a.min(0).tolist(), "max": a.max(0).tolist()}
 
@@ -661,7 +722,14 @@ def main_generate(args):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """Parses CLI arguments and dispatches to the requested subcommand.
+
+    Subcommands: `generate`, `add-phase`, `combine` (see module docstring).
+
+    Raises:
+        SystemExit: If no subcommand is given (prints help and exits 1).
+    """
     ap = argparse.ArgumentParser(
         description="DART dataset generator (no-render, gait-phase aware)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

@@ -32,11 +32,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 PROPRIO_DIM_BASE     = 55    # standard proprio (no phase, no maneuver)
 PHASE_DIM            = 2     # [sin(phi), cos(phi)]
@@ -45,10 +44,17 @@ PROPRIO_DIM_PHASE    = PROPRIO_DIM_BASE + PHASE_DIM          # 57 (locomotion mo
 PROPRIO_DIM_MANEUVER = PROPRIO_DIM_BASE + PHASE_DIM + MANEUVER_DIM   # 62
 
 
-def _build_maneuver_features(row) -> np.ndarray:
-    """
-    Extract 5-d maneuver features from a dataframe row.
-    Returns np.float32[5].
+def _build_maneuver_features(row: dict) -> np.ndarray:
+    """Extract 5-d maneuver features from a dataframe row.
+
+    Args:
+        row: Dict-like row (supports `.get(key, default)`) with optional
+            'subgoal_index', 'cos_target', 'sin_target', 'heading_err', and
+            'landmark_passed' keys.
+
+    Returns:
+        np.float32[5]: [subgoal_norm, cos_target, sin_target,
+        heading_err_norm, landmark_passed].
     """
     subgoal_idx    = float(row.get("subgoal_index",  0)) / 2.0   # normalize to [0, 1]
     cos_target     = float(row.get("cos_target",     1.0))
@@ -78,8 +84,8 @@ class ManeuverParquetDataset(Dataset):
         chunk_H: int = 1,
         img_size: int = 128,
         in_ch: int = 3,
-        lang_cache_path: Optional[str] = None,
-    ):
+        lang_cache_path: str | None = None,
+    ) -> None:
         super().__init__()
         if isinstance(repo_paths, str):
             repo_paths = [repo_paths]
@@ -92,7 +98,7 @@ class ManeuverParquetDataset(Dataset):
 
         import pandas as pd
 
-        self._lang_cache: Optional[dict] = None
+        self._lang_cache: dict | None = None
         if lang_cache_path and os.path.exists(lang_cache_path):
             import pickle
             with open(lang_cache_path, "rb") as f:
@@ -252,9 +258,23 @@ def make_maneuver_dataloader(
     batch_size: int = 64,
     train_fraction: float = 0.9,
     num_workers: int = 0,
-    lang_cache_path: Optional[str] = None,
+    lang_cache_path: str | None = None,
     **kwargs,
 ) -> DataLoader:
+    """Create a DataLoader for the maneuver-aware dataset.
+
+    Args:
+        repo_paths: One repo path or a list of paths to combine.
+        split: 'train' or 'val'.
+        batch_size: DataLoader batch size.
+        train_fraction: Fraction of episodes (per repo) used for training.
+        num_workers: DataLoader worker count.
+        lang_cache_path: Optional path to a pre-built language embedding cache.
+        **kwargs: Forwarded to `ManeuverParquetDataset`.
+
+    Returns:
+        A configured DataLoader over `ManeuverParquetDataset`.
+    """
     ds = ManeuverParquetDataset(
         repo_paths      = repo_paths,
         split           = split,

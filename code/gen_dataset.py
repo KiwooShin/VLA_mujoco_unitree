@@ -47,48 +47,47 @@ proprio (55-d):
 Videos: ego_rgb mp4 (per-episode, 50 fps) + side-by-side (ego|tp).
 """
 
+import argparse
+import json
+import math
 import os
 import sys
-import math
-import json
-import argparse
 import time
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-import numpy as np
-import mujoco
 import imageio.v2 as imageio
+import mujoco
+import numpy as np
 import pandas as pd
 
 # Local modules
-_HERE      = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
+_HERE: str      = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT: str = os.path.dirname(_HERE)
 sys.path.insert(0, _REPO_ROOT)
 
-from code.teacher import WBCTeacher, _yaw_of, DEFAULT_ANGLES, SIM_DT, CONTROL_DECIMATION
-from code.arena   import build_arena, ArenaRenderer, EGO_W, EGO_H
-from code.scene   import sample_scene, derive_rng
-from code.steer   import steer as steer_cmd, goal_vec
+from code.arena import ArenaRenderer, EGO_H, EGO_W, build_arena
+from code.scene import derive_rng, sample_scene
+from code.steer import goal_vec, steer as steer_cmd
+from code.teacher import CONTROL_DECIMATION, DEFAULT_ANGLES, SIM_DT, WBCTeacher, _yaw_of
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FPS          = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))  # 50
-SETTLE_STEPS = 80       # steps to settle before logging begins (zero vel cmd)
-FALL_HEIGHT  = 0.50     # pelvis z below this → fallen → discard
-HOLD_STEPS   = 5        # consecutive steps within stop_r → success (short: 5 steps = 0.1s)
-MAXSTEPS     = {"easy": 600, "demo": 1400}  # HARD per-episode step cap (never exceeded)
+FPS: int          = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))  # 50
+SETTLE_STEPS: int = 80       # steps to settle before logging begins (zero vel cmd)
+FALL_HEIGHT: float = 0.50     # pelvis z below this → fallen → discard
+HOLD_STEPS: int   = 5        # consecutive steps within stop_r → success (short: 5 steps = 0.1s)
+MAXSTEPS: dict[str, int] = {"easy": 600, "demo": 1400}  # HARD per-episode step cap (never exceeded)
 
-PROPRIO_DIM  = 55       # full proprio vector length
+PROPRIO_DIM: int  = 55       # full proprio vector length
 
 # ---------------------------------------------------------------------------
 # Proprio builder
 # ---------------------------------------------------------------------------
 def build_proprio(data: mujoco.MjData, prev_action: np.ndarray) -> np.ndarray:
-    """
-    Build the 55-d proprio vector from MuJoCo data.
+    """Builds the 55-d proprio vector from MuJoCo data.
 
     Layout:
       [0:15]   lower-body joint positions
@@ -97,6 +96,14 @@ def build_proprio(data: mujoco.MjData, prev_action: np.ndarray) -> np.ndarray:
       [34:37]  base angular velocity (rad/s)
       [37:40]  base linear velocity (proxy for accel) [vx,vy,vz] in world frame
       [40:55]  prev_action (15 joint targets)
+
+    Args:
+        data: MuJoCo data holding the current physics state.
+        prev_action: Previous joint-target action (15-d), appended as part
+            of the observation.
+
+    Returns:
+        A (55,) float32 array with the layout described above.
     """
     q_lb   = data.qpos[7:22].copy()      # 15 lower-body joint positions
     dq_lb  = data.qvel[6:21].copy()      # 15 lower-body joint velocities
@@ -126,27 +133,39 @@ def run_episode(
     render_depth: bool = True,
     verbose: bool = False,
 ) -> dict | None:
-    """
-    Drive the WBC teacher to the target object and collect data.
+    """Drives the WBC teacher to the target object and collects data.
 
-    Speed notes
-    -----------
-    - render_tp=False (default): skips third-person rendering (~530ms/step saved).
-      Set True only for the demo side-by-side video.
-    - render_depth=True (default): renders depth for grounding. Set False to
-      further speed up (pure-RGB collection).
+    Speed notes:
+      - render_tp=False (default): skips third-person rendering (~530ms/step
+        saved). Set True only for the demo side-by-side video.
+      - render_depth=True (default): renders depth for grounding. Set False
+        to further speed up (pure-RGB collection).
 
-    Returns
-    -------
-    dict with:
-        rows         : list of row dicts (one per control step)
-        ego_rgb_seq  : list of np.uint8 (H,W,3)
-        ego_dep_seq  : list of np.float32 (H,W) or empty list if render_depth=False
-        tp_rgb_seq   : list of np.uint8  (H,W,3) or empty list if render_tp=False
-        reached      : bool
-        n_steps      : int
+    Args:
+        teacher: WBCTeacher instance to step; its model/data are replaced
+            with the arena built from `scene_cfg`.
+        scene_cfg: Scene configuration dict from `sample_scene`.
+        episode_idx: Episode index recorded in the `episode_index` column.
+        global_frame_offset: Running frame count offset added to the
+            per-frame `index` column.
+        noise_sigma: DART-style exec-noise std (rad) added to the velocity
+            command. 0.0 disables noise.
+        render_tp: If True, also renders third-person frames.
+        render_depth: If True, also renders depth for grounding.
+        verbose: If True, prints periodic progress lines every 50 steps.
 
-    Returns None if the episode fell (discard) or exceeded MAXSTEPS cap (discard).
+    Returns:
+        A dict with keys:
+            rows: list of row dicts (one per control step).
+            ego_rgb_seq: list of np.uint8 (H,W,3) ego RGB frames.
+            ego_dep_seq: list of np.float32 (H,W) depth frames, or an empty
+                list if `render_depth` is False.
+            tp_rgb_seq: list of np.uint8 (H,W,3) third-person frames, or an
+                empty list if `render_tp` is False.
+            reached: bool, whether the episode reached the goal.
+            n_steps: int, number of logged steps.
+        Returns None if the episode fell (discard) or exceeded the
+        MAXSTEPS cap (discard).
     """
     difficulty   = scene_cfg.get("difficulty", "easy")
     hard_maxsteps = MAXSTEPS.get(difficulty, 600)
@@ -296,7 +315,8 @@ def run_episode(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """Parses CLI arguments and runs deterministic dataset generation."""
     ap = argparse.ArgumentParser(description="G1Nav deterministic dataset generator")
     ap.add_argument("--difficulty",    choices=["easy", "demo"], required=True)
     ap.add_argument("--seed",          type=int, required=True)
@@ -456,7 +476,8 @@ def main():
     arr_p = np.array(all_proprio, dtype=np.float32)
     arr_a = np.array(all_actions, dtype=np.float32)
 
-    def _stat(a: np.ndarray) -> dict:
+    def _stat(a: np.ndarray) -> dict[str, list[float]]:
+        """Computes per-dimension mean/std/min/max for stats.json."""
         return {
             "mean": a.mean(0).tolist(),
             "std":  (a.std(0) + 1e-6).tolist(),
@@ -566,12 +587,19 @@ def main():
 # Determinism check helper (importable by test scripts)
 # ---------------------------------------------------------------------------
 def check_determinism(difficulty: str, seed: int, n_check: int = 3) -> bool:
-    """
-    Run two independent passes and verify identical parquet outputs.
+    """Runs two independent passes and verifies identical parquet outputs.
 
-    Returns True if deterministic, False otherwise.
+    Args:
+        difficulty: Scene difficulty, forwarded to `sample_scene`.
+        seed: Base seed forwarded to `derive_rng`.
+        n_check: Number of episodes to check per pass.
+
+    Returns:
+        True if deterministic (identical actions across both passes),
+        False otherwise.
     """
-    import tempfile, shutil
+    import shutil
+    import tempfile
 
     results = []
     for run in range(2):

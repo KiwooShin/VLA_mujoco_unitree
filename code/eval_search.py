@@ -49,7 +49,6 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -92,8 +91,7 @@ SCAN_ALIGNED_THR_DEG = 40.0
 # ---------------------------------------------------------------------------
 
 def sample_search_scene(rng: np.random.Generator, episode_idx: int) -> dict:
-    """
-    Sample a search scene where the target is OUTSIDE the initial FOV.
+    """Sample a search scene where the target is OUTSIDE the initial FOV.
 
     Strategy:
       - Robot near centre, facing +X (yaw=0)
@@ -102,6 +100,16 @@ def sample_search_scene(rng: np.random.Generator, episode_idx: int) -> dict:
       - 3 objects total (1 target + 2 distractors)
 
     The FOV constraint ensures scan is REQUIRED to find the target.
+
+    Args:
+        rng: NumPy random Generator for deterministic sampling.
+        episode_idx: Episode index (unused by the sampling logic itself;
+            kept for caller-side bookkeeping/logging).
+
+    Returns:
+        Scene config dict with arena_size, robot_xy, robot_yaw, objects,
+        target_index, instruction, stop_r, horizon, lighting, difficulty,
+        and init_bearing_deg.
     """
     from code.arena import COLORS, SHAPES
     from code.scene import _make_instruction
@@ -261,7 +269,7 @@ class SearchResult:
     final_dist:      float
     fell:            bool
     ms_per_step:     float
-    video_path:      Optional[str] = None
+    video_path:      str | None = None
     avoid_bias_active_frac: float = 0.0   # NX-9: fraction of grounding cycles with |bias|>0
 
 
@@ -270,19 +278,32 @@ class SearchResult:
 # ---------------------------------------------------------------------------
 
 def _run_search_rollout(
-    inf,                            # Inferencer instance (goal_source='classical')
+    inf: Inferencer,                # Inferencer instance (goal_source='classical')
     scene_cfg:    dict,
     instruction:  str,
     maxsteps:     int = MAXSTEPS_SEARCH,
     render_video: bool = False,
-    video_path:   Optional[str] = None,
+    video_path:   str | None = None,
 ) -> dict:
-    """
-    Run one search rollout using the existing Inferencer.
+    """Run one search rollout using the existing Inferencer.
+
     Tracks when the target is first spotted (scan_active → False).
 
-    Returns dict with: success, spotted, scan_steps, failure_tag, steps,
-                        final_dist, fell, ms_per_step, video_path
+    Args:
+        inf: Inferencer instance (goal_source='classical') providing the
+            model and any cached keyframe/action-stats state.
+        scene_cfg: Scene configuration from sample_search_scene (robot pose,
+            objects, target_index, stop_r, etc.).
+        instruction: Natural-language instruction for the episode (unused
+            by the rollout logic itself; kept for caller-side logging).
+        maxsteps: Maximum number of control steps before terminating.
+        render_video: Whether to render ego/third-person frames for video.
+        video_path: Output path for the rendered video, or None to skip
+            writing.
+
+    Returns:
+        Dict with: success, spotted, scan_steps, failure_tag, steps,
+        final_dist, fell, ms_per_step, video_path, avoid_bias_active_frac.
     """
     # We run the standard rollout, which already has the H3 scan-and-acquire logic.
     # To track "spotted", we monkey-patch the verbose flag and capture scan exit.
@@ -461,7 +482,7 @@ def _run_search_rollout(
     _avoid_cycles_total  = 0
     _avoid_cycles_active = 0
 
-    def _lock_drop_and_rescan():
+    def _lock_drop_and_rescan() -> None:
         """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
         clear EMA/last-known-goal, and re-enter scan via a FRESH
         ReacquisitionScan. Not the same `_scan_sched` instance used for the
@@ -865,7 +886,7 @@ from code.inferencer import _write_video
 # ---------------------------------------------------------------------------
 
 def evaluate_search(
-    checkpoint_path: Optional[str] = None,
+    checkpoint_path: str | None = None,
     n_scenes:    int   = 15,
     device:      str   = 'cpu',
     out_dir:     str   = 'eval/search',
@@ -873,9 +894,23 @@ def evaluate_search(
     smoke:       bool  = False,
     seed:        int   = 999,
 ) -> dict:
-    """
-    Run search evaluation: target starts outside initial FOV.
-    Returns summary dict with spot_rate, reach_rate, success_rate.
+    """Run search evaluation: target starts outside initial FOV.
+
+    Args:
+        checkpoint_path: Path to a .pt checkpoint, or None to use the
+            default GOTO_CKPT.
+        n_scenes: Number of held-out scenes to evaluate.
+        device: Torch device string for inference ('cpu' or 'cuda').
+        out_dir: Output directory for videos and the summary JSON.
+        render_video: Whether to render video for the first N_RENDER
+            episodes.
+        smoke: If True, run a single scene with a 200-step cap.
+        seed: Eval seed (default=999, held-out).
+
+    Returns:
+        Summary dict with spot_rate, reach_rate, success_rate, per-outcome
+        counts, and the full per-episode list (also written to a JSON file
+        under out_dir).
     """
     from code.inferencer import Inferencer
 
@@ -896,7 +931,7 @@ def evaluate_search(
         n_scenes = 1
         print(f"[search_eval] SMOKE MODE: 1 scene, MAXSTEPS=200", flush=True)
 
-    results: List[SearchResult] = []
+    results: list[SearchResult] = []
     ep_results = []
 
     for ep_i in range(n_scenes):
@@ -1021,7 +1056,8 @@ def evaluate_search(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
+    """Parse CLI arguments and run the search evaluation."""
     ap = argparse.ArgumentParser(description="Search skill evaluator")
     ap.add_argument("--checkpoint", default=None, help="Path to goto checkpoint")
     ap.add_argument("--n",          type=int, default=15, help="Number of scenes")

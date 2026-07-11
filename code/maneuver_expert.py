@@ -31,8 +31,8 @@ NOTE: The expert drives the WBCTeacher directly via vel_cmd, NOT joint-level con
 The teacher handles low-level locomotion; the expert provides high-level velocity commands.
 """
 
-import math
 from enum import IntEnum
+import math
 
 import numpy as np
 
@@ -81,7 +81,14 @@ class ManeuverExpert:
         fsm_state: int
     """
 
-    def __init__(self, scene_cfg: dict):
+    def __init__(self, scene_cfg: dict) -> None:
+        """Initialize the FSM expert from a maneuver scene config.
+
+        Args:
+            scene_cfg: dict produced by maneuver_scene.sample_maneuver_scene(),
+                must contain "landmark_xy", "target_heading", "turn_direction",
+                and optionally "pass_margin".
+        """
         self._scene = scene_cfg
         lm_xy = scene_cfg["landmark_xy"]
         self._landmark_x = float(lm_xy[0])
@@ -93,23 +100,21 @@ class ManeuverExpert:
         self._state = State.STRAIGHT
         self._pass_triggered = False
 
-    def reset(self):
+    def reset(self) -> None:
+        """Reset the FSM to its initial STRAIGHT state."""
         self._state = State.STRAIGHT
         self._pass_triggered = False
 
-    def step(self, robot_xy, robot_yaw: float) -> tuple:
-        """
-        Compute velocity command and privileged state for the current FSM state.
+    def step(self, robot_xy: tuple[float, float], robot_yaw: float) -> tuple[np.ndarray, dict]:
+        """Compute velocity command and privileged state for the current FSM state.
 
-        Parameters
-        ----------
-        robot_xy : (x, y) robot position
-        robot_yaw : float  robot heading (rad)
+        Args:
+            robot_xy: (x, y) robot position.
+            robot_yaw: Robot heading (rad).
 
-        Returns
-        -------
-        vel_cmd : np.ndarray (3,)  [vx, vy, wz]
-        priv    : dict with privileged state
+        Returns:
+            vel_cmd: np.ndarray (3,)  [vx, vy, wz]
+            priv: dict with privileged state
         """
         rx, ry = float(robot_xy[0]), float(robot_xy[1])
 
@@ -172,10 +177,12 @@ class ManeuverExpert:
 
     @property
     def state(self) -> State:
+        """Current FSM state."""
         return self._state
 
     @property
     def landmark_passed(self) -> bool:
+        """Whether the robot has passed the landmark trigger."""
         return self._pass_triggered
 
 

@@ -58,7 +58,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any, Callable, Iterator
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -72,7 +72,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # CUDA helper (defined before use)
 # ---------------------------------------------------------------------------
-def _check_cuda():
+def _check_cuda() -> bool:
+    """Return True if CUDA is available, False otherwise (or if torch import fails)."""
     try:
         import torch
         return torch.cuda.is_available()
@@ -117,9 +118,15 @@ MANEUVER_DIRECTIONS = ["left", "right"]
 # ---------------------------------------------------------------------------
 # Language cache (GR00T-LM embeddings)
 # ---------------------------------------------------------------------------
-_lang_cache: Optional[Dict[str, np.ndarray]] = None
+_lang_cache: dict[str, np.ndarray] | None = None
 
-def _load_lang_cache() -> Optional[Dict[str, np.ndarray]]:
+def _load_lang_cache() -> dict[str, np.ndarray] | None:
+    """Lazily load and cache the GR00T-LM instruction embedding table.
+
+    Returns:
+        The cached embedding dict, or None if the cache file is missing or
+        fails to load.
+    """
     global _lang_cache
     if _lang_cache is not None:
         return _lang_cache
@@ -134,7 +141,7 @@ def _load_lang_cache() -> Optional[Dict[str, np.ndarray]]:
     return None
 
 
-def _get_lang_emb(instruction: str) -> Optional[np.ndarray]:
+def _get_lang_emb(instruction: str) -> np.ndarray | None:
     """Look up GR00T-LM embedding from cache; None if not found."""
     cache = _load_lang_cache()
     if cache is None:
@@ -151,7 +158,7 @@ class SceneManager:
     exposes the object list (color, shape, position) visible at start.
     """
 
-    def __init__(self, difficulty: str = "easy", seed_offset: int = 0):
+    def __init__(self, difficulty: str = "easy", seed_offset: int = 0) -> None:
         self.difficulty   = difficulty
         self.seed_offset  = seed_offset
         self._ep_count    = 0
@@ -166,7 +173,7 @@ class SceneManager:
         return self._scene_cfg
 
     @property
-    def scene_cfg(self) -> Optional[dict]:
+    def scene_cfg(self) -> dict | None:
         return self._scene_cfg
 
     def describe_scene(self) -> str:
@@ -184,7 +191,7 @@ class SceneManager:
             )
         return "\n".join(lines)
 
-    def object_list(self) -> List[Dict[str, Any]]:
+    def object_list(self) -> list[dict[str, Any]]:
         """Return list of object dicts."""
         if self._scene_cfg is None:
             return []
@@ -198,12 +205,12 @@ class SceneManager:
 class SubGoal:
     """A single primitive sub-goal."""
     skill:       str           # 'goto' | 'maneuver' | 'search' (stubbed)
-    color:       Optional[str] = None
-    shape:       Optional[str] = None
-    direction:   Optional[str] = None   # for maneuver: 'left' | 'right'
+    color:       str | None = None
+    shape:       str | None = None
+    direction:   str | None = None   # for maneuver: 'left' | 'right'
     description: str           = ""
     status:      str           = "pending"   # 'pending' | 'running' | 'done' | 'failed'
-    result:      Optional[Any] = None
+    result:      Any | None = None
 
     def __str__(self) -> str:
         if self.skill == "goto":
@@ -240,14 +247,14 @@ class Planner:
       - If a part is ambiguous, returns clarify question (subsequent parts queued)
     """
 
-    def __init__(self, scene_manager: SceneManager):
+    def __init__(self, scene_manager: SceneManager) -> None:
         self.scene  = scene_manager
         # Queued parts for multi-goal: when a part triggers clarification, we
         # store remaining parts here and resume after clarification is resolved.
-        self._pending_parts: List[str] = []
-        self._pending_goals: List[SubGoal] = []
+        self._pending_parts: list[str] = []
+        self._pending_goals: list[SubGoal] = []
 
-    def parse(self, instruction: str) -> tuple[List[SubGoal], Optional[str]]:
+    def parse(self, instruction: str) -> tuple[list[SubGoal], str | None]:
         """
         Parse instruction into sub-goals.
 
@@ -289,7 +296,9 @@ class Planner:
 
         return goals, None
 
-    def parse_clarification(self, original_instr: str, clarify_answer: str) -> tuple[List[SubGoal], Optional[str]]:
+    def parse_clarification(
+        self, original_instr: str, clarify_answer: str
+    ) -> tuple[list[SubGoal], str | None]:
         """
         Re-parse after user provides a clarification answer.
 
@@ -333,7 +342,7 @@ class Planner:
         # Fall back to treating the answer as a fresh instruction
         return self.parse(clarify_answer)
 
-    def _parse_part(self, instr: str) -> tuple[List[SubGoal], Optional[str]]:
+    def _parse_part(self, instr: str) -> tuple[list[SubGoal], str | None]:
         """Parse a single instruction part into sub-goals."""
         goals = []
 
@@ -393,7 +402,7 @@ class Planner:
 
     # ---- Pattern detectors ----
 
-    def _detect_goto(self, instr: str) -> Optional[tuple[str, str]]:
+    def _detect_goto(self, instr: str) -> tuple[str, str] | None:
         """Detect goto(color, shape) from instruction.
         NOTE: 'find'/'search for'/'look for' are routed to the SEARCH skill (checked first
         in _parse_part) and are NOT included here. This keeps search DISTINCT from goto.
@@ -433,7 +442,7 @@ class Planner:
 
         return None
 
-    def _detect_maneuver(self, instr: str) -> Optional[tuple[str, str, str]]:
+    def _detect_maneuver(self, instr: str) -> tuple[str, str, str] | None:
         """Detect maneuver(dir, color, shape) from instruction."""
         # Pattern: "turn {left|right} after [passing] [the] {color} {shape}"
         m = re.search(
@@ -483,7 +492,7 @@ class Planner:
 
         return None
 
-    def _detect_search(self, instr: str) -> Optional[tuple[str, str]]:
+    def _detect_search(self, instr: str) -> tuple[str, str] | None:
         """Detect search(color, shape) from instruction.
         C3: search is routed here when instruction uses find/search/look_for.
         DISTINCT from goto — search requires target to be out-of-FOV initially.
@@ -507,8 +516,8 @@ class Planner:
         return None
 
     def _resolve_referent(
-        self, color: Optional[str], shape: Optional[str], role: str
-    ) -> tuple[Optional[Dict], Optional[str]]:
+        self, color: str | None, shape: str | None, role: str
+    ) -> tuple[dict | None, str | None]:
         """
         Resolve (color, shape) to a scene object.
 
@@ -561,7 +570,9 @@ class ManeuverInferencer:
     Uses hybrid_vel: GT vel injection during TURN_PHASE only.
     """
 
-    def __init__(self, checkpoint_path: str, device: str = "cpu", use_keyframe: bool = True):
+    def __init__(
+        self, checkpoint_path: str, device: str = "cpu", use_keyframe: bool = True
+    ) -> None:
         self.checkpoint_path = checkpoint_path
         self.device_str      = device
         self._model          = None
@@ -571,7 +582,7 @@ class ManeuverInferencer:
         # H4: WBC-free settle — load offline stand keyframe (same as Inferencer in inferencer.py)
         # When use_keyframe=True and checkpoint/stand_keyframe.npz exists, skip the WBC settle
         # and instead restore physics from the offline keyframe. No WBC ONNX called at runtime.
-        self._keyframe: Optional[dict] = None
+        self._keyframe: dict | None = None
         _kf_path = str(_REPO / "checkpoint" / "stand_keyframe.npz")
         if use_keyframe and os.path.isfile(_kf_path):
             _kf = np.load(_kf_path)
@@ -587,7 +598,7 @@ class ManeuverInferencer:
             print(f"[maneuver_inferencer] Keyframe init: {_kf_path} not found, "
                   f"falling back to WBC settle")
 
-    def _load_model(self):
+    def _load_model(self) -> None:
         """Lazy-load model on first use."""
         if self._loaded:
             return
@@ -637,9 +648,9 @@ class ManeuverInferencer:
         instruction: str,
         maxsteps: int = MAXSTEPS_MANEUVER,
         render_video: bool = False,
-        video_path: Optional[str] = None,
-        progress_cb = None,
-    ) -> Dict[str, Any]:
+        video_path: str | None = None,
+        progress_cb: Callable[[dict], None] | None = None,
+    ) -> dict[str, Any]:
         """
         Run one closed-loop maneuver episode.
 
@@ -880,18 +891,18 @@ class ManeuverInferencer:
 class EventBus:
     """Simple thread-safe event bus for UI updates."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock   = threading.Lock()
         self._events = collections.deque(maxlen=200)
         self._state  = {}
 
-    def emit(self, event: dict):
+    def emit(self, event: dict) -> None:
         with self._lock:
             event['_ts'] = time.time()
             self._events.append(event)
             self._state.update(event)
 
-    def get_events(self, since_ts: float = 0.0) -> List[dict]:
+    def get_events(self, since_ts: float = 0.0) -> list[dict]:
         with self._lock:
             return [e for e in self._events if e.get('_ts', 0) > since_ts]
 
@@ -919,7 +930,7 @@ class Executor:
         out_dir: str = str(DEMO_OUT_DIR),
         maxsteps_goto: int = MAXSTEPS_GOTO,
         maxsteps_maneuver: int = MAXSTEPS_MANEUVER,
-    ):
+    ) -> None:
         self.scene      = scene_manager
         self.bus        = bus
         self.device     = device
@@ -931,7 +942,8 @@ class Executor:
         self._maneuver_inferencer = None
         self._ep_count = 0
 
-    def _get_goto_inferencer(self):
+    def _get_goto_inferencer(self) -> Inferencer:
+        """Lazily construct (and cache) the goto skill's Inferencer."""
         if self._goto_inferencer is None:
             from code.inferencer import Inferencer
             self._goto_inferencer = Inferencer(
@@ -944,7 +956,8 @@ class Executor:
             print(f"[executor] goto inferencer loaded: {GOTO_CKPT}", flush=True)
         return self._goto_inferencer
 
-    def _get_maneuver_inferencer(self):
+    def _get_maneuver_inferencer(self) -> ManeuverInferencer:
+        """Lazily construct (and cache) the maneuver skill's inferencer."""
         if self._maneuver_inferencer is None:
             self._maneuver_inferencer = ManeuverInferencer(
                 checkpoint_path=str(MANEUVER_CKPT),
@@ -952,7 +965,7 @@ class Executor:
             )
         return self._maneuver_inferencer
 
-    def execute(self, goals: List[SubGoal]) -> List[Dict[str, Any]]:
+    def execute(self, goals: list[SubGoal]) -> list[dict[str, Any]]:
         """Execute all sub-goals; returns list of result dicts."""
         results = []
         self._ep_count += 1
@@ -1013,7 +1026,7 @@ class Executor:
 
         return results
 
-    def _run_goto(self, goal: SubGoal, ep_id: int, gi: int) -> Dict[str, Any]:
+    def _run_goto(self, goal: SubGoal, ep_id: int, gi: int) -> dict[str, Any]:
         """Run goto skill using Inferencer."""
         scene_cfg    = self.scene.scene_cfg
         if scene_cfg is None:
@@ -1042,7 +1055,7 @@ class Executor:
                 f"ep{ep_id:03d}_goal{gi:02d}_goto_{goal.color}_{goal.shape}.mp4"
             )
 
-        def _progress_cb(info):
+        def _progress_cb(info: dict) -> None:
             self.bus.emit({
                 "type": "goto_progress",
                 "goal_idx": gi,
@@ -1082,7 +1095,7 @@ class Executor:
             "video_path":    result.video_path,
         }
 
-    def _run_maneuver(self, goal: SubGoal, ep_id: int, gi: int) -> Dict[str, Any]:
+    def _run_maneuver(self, goal: SubGoal, ep_id: int, gi: int) -> dict[str, Any]:
         """Run maneuver skill."""
         from code.maneuver_scene import sample_maneuver_scene, derive_rng
 
@@ -1127,7 +1140,7 @@ class Executor:
                 f"ep{ep_id:03d}_goal{gi:02d}_maneuver_{goal.direction}_{goal.color}_{goal.shape}.mp4"
             )
 
-        def _progress_cb(info):
+        def _progress_cb(info: dict) -> None:
             self.bus.emit({
                 "type": "maneuver_progress",
                 "goal_idx": gi,
@@ -1152,7 +1165,7 @@ class Executor:
         result['wall_time_s'] = dt
         return result
 
-    def _run_search_stub(self, goal: SubGoal, ep_id: int, gi: int) -> Dict[str, Any]:
+    def _run_search_stub(self, goal: SubGoal, ep_id: int, gi: int) -> dict[str, Any]:
         """
         search_then_goto: student-driven CCW scan to find the target (out-of-FOV),
         then GOTO once it enters the FOV.
@@ -1256,8 +1269,12 @@ class Executor:
 # Web UI (Flask MJPEG streaming + REST API)
 # ---------------------------------------------------------------------------
 def _start_web_ui(bus: EventBus, executor: Executor, planner: Planner,
-                   scene_manager: SceneManager, port: int = WEB_PORT):
-    """Start Flask web server in background thread."""
+                   scene_manager: SceneManager, port: int = WEB_PORT) -> threading.Thread | None:
+    """Start Flask web server in background thread.
+
+    Returns:
+        The background server thread, or None if Flask is not installed.
+    """
     try:
         from flask import Flask, Response, request, jsonify, render_template_string
     except ImportError:
@@ -1430,7 +1447,7 @@ pollEvents();
     _stream_frame    = [None]  # latest JPEG frame for MJPEG stream
     _stream_lock     = threading.Lock()
 
-    def _run_execute(instruction: str):
+    def _run_execute(instruction: str) -> None:
         nonlocal _current_goals
         # Parse
         goals, clarify = planner.parse(instruction)
@@ -1454,20 +1471,20 @@ pollEvents();
         })
 
     @app.route("/")
-    def index():
+    def index() -> str:
         return render_template_string(HTML)
 
     @app.route("/scene_info")
-    def scene_info():
+    def scene_info() -> Response:
         return jsonify({"scene_desc": scene_manager.describe_scene()})
 
     @app.route("/new_scene", methods=["POST"])
-    def new_scene():
+    def new_scene() -> Response:
         scene_manager.new_scene()
         return jsonify({"scene_desc": scene_manager.describe_scene()})
 
     @app.route("/execute", methods=["POST"])
-    def execute():
+    def execute() -> Response | tuple[Response, int]:
         nonlocal _exec_thread
         data        = request.get_json() or {}
         instruction = data.get("instruction", "").strip()
@@ -1501,15 +1518,15 @@ pollEvents();
         })
 
     @app.route("/events")
-    def events():
+    def events() -> Response:
         since = float(request.args.get("since", 0))
         evts  = bus.get_events(since_ts=since)
         return jsonify({"events": evts})
 
     @app.route("/stream")
-    def stream():
+    def stream() -> Response:
         """MJPEG stream (static placeholder — real video saved as MP4)."""
-        def gen():
+        def gen() -> Iterator[bytes]:
             while True:
                 with _stream_lock:
                     frame = _stream_frame[0]
@@ -1534,7 +1551,7 @@ pollEvents();
         except Exception:
             return b''
 
-    def _run_flask():
+    def _run_flask() -> None:
         import logging
         log = logging.getLogger('werkzeug')
         log.setLevel(logging.ERROR)
@@ -1555,7 +1572,7 @@ def _terminal_repl(
     executor: Executor,
     bus: EventBus,
     out_dir: str,
-):
+) -> None:
     """Interactive terminal REPL."""
     print("\n" + "=" * 60, flush=True)
     print("G1Nav Interactive Demo REPL", flush=True)
@@ -1672,7 +1689,7 @@ def _terminal_repl(
 # Smoke test (canned instructions)
 # ---------------------------------------------------------------------------
 def _smoke_test(out_dir: str, device: str, maxsteps_goto: int, maxsteps_maneuver: int,
-                render_video: bool = True):
+                render_video: bool = True) -> list[dict[str, Any]]:
     """
     Run 4 canned instructions end-to-end headless (S10 polish):
       1. goto (demo-distance, 4-9m)
@@ -1680,6 +1697,10 @@ def _smoke_test(out_dir: str, device: str, maxsteps_goto: int, maxsteps_maneuver
       3. search (out-of-FOV find)
       4. multi-goal compound (goto then search)
     Saves videos and prints summary.
+
+    Returns:
+        List of per-goal result summaries (label, instruction, skill, success,
+        failure_tag, steps, wall_time_s, video_path).
     """
     print("\n" + "=" * 60, flush=True)
     print("G1Nav Demo — SMOKE TEST (4 canned instructions incl. multi-goal)", flush=True)
@@ -1819,7 +1840,8 @@ def _smoke_test(out_dir: str, device: str, maxsteps_goto: int, maxsteps_maneuver
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """CLI entry point: parses args and runs smoke test, web UI, or terminal REPL."""
     parser = argparse.ArgumentParser(description="G1Nav Interactive Demo")
     parser.add_argument("--web",    action="store_true", help="Start web UI on port 5000")
     parser.add_argument("--port",   type=int, default=WEB_PORT)

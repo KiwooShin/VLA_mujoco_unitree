@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -44,11 +45,11 @@ from code.grounding import get_ego_intrinsics_rendered, cam_to_egocentric
 # just the index into code.arena.SHAPES / code.arena.COLORS — verified against
 # dataset/det_v1/train/labels.parquet: color_id=6 <-> 'cyan', class_id=1 <-> 'cube').
 # ---------------------------------------------------------------------------
-CLASS_NAMES = [s[0] for s in SHAPES]          # ['ball','cube','cylinder','cone']
-COLOR_NAMES = [c[0] for c in COLORS]          # ['red','yellow','blue','green','orange','purple','cyan']
+CLASS_NAMES: list[str] = [s[0] for s in SHAPES]   # ['ball','cube','cylinder','cone']
+COLOR_NAMES: list[str] = [c[0] for c in COLORS]   # ['red','yellow','blue','green','orange','purple','cyan']
 N_CLASS = len(CLASS_NAMES)
 N_COLOR = len(COLOR_NAMES)
-SIZE_M = dict(SHAPES)                          # nominal diameter (m) per shape, e.g. ball:0.24
+SIZE_M: dict[str, float] = dict(SHAPES)        # nominal diameter (m) per shape, e.g. ball:0.24
 
 # Both cameras are rendered at FOVY=45deg (code/grounding.py:get_ego_intrinsics_rendered);
 # both native resolutions (480x360 grounding, 320x240 proximity) are already 4:3, so a
@@ -56,15 +57,23 @@ SIZE_M = dict(SHAPES)                          # nominal diameter (m) per shape,
 # exactly -- intrinsics for the resized canvas are just get_ego_intrinsics_rendered(TARGET_W,
 # TARGET_H), independent of which camera the frame came from.
 TARGET_W, TARGET_H = 192, 144
-TARGET_INTR = get_ego_intrinsics_rendered(TARGET_W, TARGET_H)
+TARGET_INTR: dict = get_ego_intrinsics_rendered(TARGET_W, TARGET_H)
 
-PITCH_BY_CAM = {"grounding": GROUNDING_PITCH, "proximity": PROXIMITY_PITCH}
+PITCH_BY_CAM: dict[str, float] = {"grounding": GROUNDING_PITCH, "proximity": PROXIMITY_PITCH}
 
 MAX_DEPTH_CLIP_M = 12.0   # depth-input normalization clip (matches grounding.py's MAX_DEPTH_M)
 
 
 def encode_query(class_id: int, color_id: int) -> np.ndarray:
-    """(class_id, color_id) -> 11-d one-hot float32 vector [4 class | 7 color]."""
+    """Build the model's 11-d one-hot query vector.
+
+    Args:
+        class_id: Index into CLASS_NAMES (0..3).
+        color_id: Index into COLOR_NAMES (0..6).
+
+    Returns:
+        Float32 array of shape (11,): [4 class one-hot | 7 color one-hot].
+    """
     v = np.zeros(N_CLASS + N_COLOR, dtype=np.float32)
     v[class_id] = 1.0
     v[N_CLASS + color_id] = 1.0
@@ -74,7 +83,8 @@ def encode_query(class_id: int, color_id: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-def _conv_bn_relu(cin, cout, stride=1):
+def _conv_bn_relu(cin: int, cout: int, stride: int = 1) -> nn.Sequential:
+    """Return a Conv2d -> BatchNorm2d -> ReLU block."""
     return nn.Sequential(
         nn.Conv2d(cin, cout, 3, stride=stride, padding=1, bias=False),
         nn.BatchNorm2d(cout),
@@ -85,7 +95,16 @@ def _conv_bn_relu(cin, cout, stride=1):
 class TinyHeatmapUNet(nn.Module):
     """Small from-scratch query-conditioned U-Net. Target: <5M params (actual ~0.9M)."""
 
-    def __init__(self, in_ch=4, base=32, embed_dim=64, query_dim=N_CLASS + N_COLOR):
+    def __init__(self, in_ch: int = 4, base: int = 32, embed_dim: int = 64,
+                 query_dim: int = N_CLASS + N_COLOR) -> None:
+        """Build the network.
+
+        Args:
+            in_ch: Number of input channels (RGBD = 4).
+            base: Base channel width; the encoder stages use base*(1,2,3,4).
+            embed_dim: Query MLP embedding dimension.
+            query_dim: Query one-hot vector length (N_CLASS + N_COLOR).
+        """
         super().__init__()
         c1, c2, c3, c4 = base, base * 2, base * 3, base * 4  # 32,64,96,128
 
@@ -113,8 +132,16 @@ class TinyHeatmapUNet(nn.Module):
         nn.init.constant_(self.head.bias[0], -3.0)
         nn.init.constant_(self.head.bias[1], 0.0)
 
-    def forward(self, x, query):
-        """x: (B,4,H,W) float32. query: (B, 11) one-hot float32."""
+    def forward(self, x: torch.Tensor, query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the U-Net forward pass.
+
+        Args:
+            x: (B, 4, H, W) float32 RGBD input.
+            query: (B, 11) one-hot float32 query vector (see encode_query).
+
+        Returns:
+            Tuple of (heatmap_logit, dist_residual), each (B, H, W) float32.
+        """
         s1 = self.stem(x)
         s2 = self.down1(s1)
         s3 = self.down2(s2)
@@ -134,16 +161,27 @@ class TinyHeatmapUNet(nn.Module):
         out = self.head(u1)
         return out[:, 0], out[:, 1]   # heatmap_logit (B,H,W), dist_residual (B,H,W)
 
-    def num_params(self):
+    def num_params(self) -> int:
+        """Return the total parameter count."""
         return sum(p.numel() for p in self.parameters())
 
 
 # ---------------------------------------------------------------------------
 # Decode: prediction -> (present, dist_m, bearing_deg, confidence, peak_uv)
 # ---------------------------------------------------------------------------
-def _refine_peak(heat_np: np.ndarray, py: int, px: int, win: int = 2):
+def _refine_peak(heat_np: np.ndarray, py: int, px: int, win: int = 2) -> tuple[float, float]:
     """Sub-pixel refinement: intensity-weighted center-of-mass in a (2*win+1) window
-    around the hard-argmax pixel. heat_np: (H,W) sigmoid probabilities in [0,1]."""
+    around the hard-argmax pixel.
+
+    Args:
+        heat_np: (H,W) sigmoid probabilities in [0,1].
+        py: Hard-argmax row index.
+        px: Hard-argmax column index.
+        win: Half-width of the refinement window.
+
+    Returns:
+        (cx, cy) sub-pixel-refined peak location.
+    """
     H, W = heat_np.shape
     y0, y1 = max(0, py - win), min(H, py + win + 1)
     x0, x1 = max(0, px - win), min(W, px + win + 1)
@@ -159,25 +197,24 @@ def _refine_peak(heat_np: np.ndarray, py: int, px: int, win: int = 2):
 
 def decode_single(heat_logit: np.ndarray, dist_resid: np.ndarray, depth_m: np.ndarray,
                    class_id: int, cam_type: str, conf_thresh: float = 0.5,
-                   refine_win: int = 2):
+                   refine_win: int = 2) -> dict[str, Any]:
     """
     Decode one example's raw network output to a detection.
 
-    Parameters
-    ----------
-    heat_logit : (H,W) float32 — raw logits (pre-sigmoid) at TARGET_H x TARGET_W.
-    dist_resid : (H,W) float32 — predicted distance residual (metres).
-    depth_m    : (H,W) float32 — the (possibly aug/dropout-corrupted at train time,
-                 raw metric depth at inference) depth channel *as fed to the network*,
-                 resized to TARGET_H x TARGET_W.
-    class_id   : query class id (0..3) -- selects the nominal object radius correction.
-    cam_type   : 'grounding' or 'proximity' -- selects the un-pitch angle.
-    conf_thresh: sigmoid confidence threshold for "present".
+    Args:
+        heat_logit: (H,W) float32 -- raw logits (pre-sigmoid) at TARGET_H x TARGET_W.
+        dist_resid: (H,W) float32 -- predicted distance residual (metres).
+        depth_m: (H,W) float32 -- the (possibly aug/dropout-corrupted at train time,
+            raw metric depth at inference) depth channel *as fed to the network*,
+            resized to TARGET_H x TARGET_W.
+        class_id: Query class id (0..3) -- selects the nominal object radius correction.
+        cam_type: 'grounding' or 'proximity' -- selects the un-pitch angle.
+        conf_thresh: Sigmoid confidence threshold for "present".
+        refine_win: Half-width of the sub-pixel refinement window (see _refine_peak).
 
-    Returns
-    -------
-    dict(present: bool, confidence: float, dist_m: float, bearing_deg: float,
-         peak_px: (x,y))
+    Returns:
+        dict(present: bool, confidence: float, dist_m: float, bearing_deg: float,
+             peak_px: (x,y)).
     """
     prob = 1.0 / (1.0 + np.exp(-heat_logit))
     py, px = np.unravel_index(np.argmax(prob), prob.shape)
@@ -221,7 +258,8 @@ class HeatmapDetector:
     `depth_m_f32`: (H,W) float32/float16 metric depth from the same camera pose.
     """
 
-    def __init__(self, model: TinyHeatmapUNet, device: str = "cpu"):
+    def __init__(self, model: TinyHeatmapUNet, device: str = "cpu") -> None:
+        """Wrap `model`, moving it to `device` and setting eval mode."""
         self.model = model.to(device).eval()
         self.device = device
         # VF-1 (docs/vf1_showpiece.md): render-side-only cache of the last
@@ -232,7 +270,17 @@ class HeatmapDetector:
         self.last_heat_meta = None   # dict(class_name, color_name, cam_type) or None
 
     @classmethod
-    def load(cls, ckpt_path: str, device: str = "cpu"):
+    def load(cls, ckpt_path: str, device: str = "cpu") -> HeatmapDetector:
+        """Load a checkpoint and construct a HeatmapDetector.
+
+        Args:
+            ckpt_path: Path to a checkpoint saved with keys 'model_cfg' and
+                'model_state'.
+            device: Torch device string to place the model on.
+
+        Returns:
+            A HeatmapDetector wrapping the loaded model.
+        """
         ckpt = torch.load(ckpt_path, map_location="cpu")
         cfg = ckpt.get("model_cfg", {})
         model = TinyHeatmapUNet(**cfg)
@@ -241,7 +289,22 @@ class HeatmapDetector:
 
     @torch.no_grad()
     def infer(self, rgb_uint8: np.ndarray, depth_m: np.ndarray, class_name: str,
-              color_name: str, cam_type: str, conf_thresh: float = 0.5):
+              color_name: str, cam_type: str, conf_thresh: float = 0.5) -> dict[str, Any]:
+        """Run inference on one RGBD frame for a given (class, color) query.
+
+        Args:
+            rgb_uint8: (H,W,3) uint8 RGB image, any resolution matching the
+                source camera's native 4:3 aspect.
+            depth_m: (H,W) float32/float16 metric depth from the same camera pose.
+            class_name: Target class name (must be in CLASS_NAMES).
+            color_name: Target color name (must be in COLOR_NAMES).
+            cam_type: 'grounding' or 'proximity' -- selects the un-pitch angle.
+            conf_thresh: Sigmoid confidence threshold for "present".
+
+        Returns:
+            dict(present, confidence, dist_m, bearing_deg, peak_px) -- see
+            decode_single.
+        """
         import cv2
         class_id = CLASS_NAMES.index(class_name)
         color_id = COLOR_NAMES.index(color_name)
@@ -270,8 +333,18 @@ class HeatmapDetector:
                               conf_thresh=conf_thresh)
 
     @torch.no_grad()
-    def infer_batch_tensor(self, x_t: torch.Tensor, q_t: torch.Tensor):
-        """Raw batched forward for eval/benchmark code. Returns (heat_logit, dist_resid)."""
+    def infer_batch_tensor(
+        self, x_t: torch.Tensor, q_t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Raw batched forward for eval/benchmark code.
+
+        Args:
+            x_t: (B, 4, H, W) float32 RGBD input tensor.
+            q_t: (B, 11) one-hot float32 query tensor.
+
+        Returns:
+            (heat_logit, dist_resid) tensors from the wrapped model.
+        """
         return self.model(x_t.to(self.device), q_t.to(self.device))
 
 

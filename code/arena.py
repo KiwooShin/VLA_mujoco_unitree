@@ -28,19 +28,19 @@ import mujoco
 # ---------------------------------------------------------------------------
 # Canonical paths
 # ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_WBC_ROOT = os.path.join(
+_HERE: str = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT: str = os.path.dirname(_HERE)
+_WBC_ROOT: str = os.path.join(
     _REPO_ROOT,
     "third_party/Isaac-GR00T/external_dependencies/"
     "GR00T-WholeBodyControl/gr00t_wbc/sim2mujoco/resources/robots/g1",
 )
-G1_XML = os.path.join(_WBC_ROOT, "g1_gear_wbc.xml")
+G1_XML: str = os.path.join(_WBC_ROOT, "g1_gear_wbc.xml")
 
 # ---------------------------------------------------------------------------
 # Fixed color palette  (name, RGB-uint8)
 # ---------------------------------------------------------------------------
-COLORS = [
+COLORS: list[tuple[str, tuple[int, int, int]]] = [
     ("red",     (220,  40,  40)),
     ("yellow",  (235, 205,  40)),
     ("blue",    ( 50,  90, 220)),
@@ -51,7 +51,7 @@ COLORS = [
 ]
 
 # Shape definitions  (name, half-size for placement radius)
-SHAPES = [
+SHAPES: list[tuple[str, float]] = [
     ("ball",     0.24),   # sphere
     ("cube",     0.24),   # box
     ("cylinder", 0.22),   # cylinder
@@ -111,7 +111,7 @@ PROXIMITY_PITCH = 58.0                # steep downward tilt — covers ~0.22-1.8
 # its default, every code path below that reads CAMERA_MODE is a no-op and behaviour
 # is byte-identical to CAM-2. Set env var CAMERA_MODE=widefov to activate CAM-1 instead
 # (single camera, same head mount, no proximity cam, no Schmitt handoff).
-CAMERA_MODE = os.environ.get("CAMERA_MODE", "cam2").strip().lower()
+CAMERA_MODE: str = os.environ.get("CAMERA_MODE", "cam2").strip().lower()
 if CAMERA_MODE not in ("cam2", "widefov"):
     raise ValueError(f"Unknown CAMERA_MODE={CAMERA_MODE!r} (expected 'cam2' or 'widefov')")
 
@@ -133,7 +133,24 @@ TP_W, TP_H   = 640, 480
 # ---------------------------------------------------------------------------
 # Helper: add a geom to a worldbody spec
 # ---------------------------------------------------------------------------
-def _add_geom(wb, gtype, size, pos, rgba, name=None):
+def _add_geom(wb: mujoco.MjsBody, gtype: mujoco.mjtGeom,
+              size: list[float] | tuple[float, ...],
+              pos: list[float] | tuple[float, ...],
+              rgba: list[float] | tuple[float, ...],
+              name: str | None = None) -> mujoco.MjsGeom:
+    """Add a geom to a worldbody spec.
+
+    Args:
+        wb: Worldbody spec to add the geom to.
+        gtype: MuJoCo geom type (e.g. mujoco.mjtGeom.mjGEOM_BOX).
+        size: Geom size parameters (meaning depends on gtype).
+        pos: (x, y, z) position of the geom.
+        rgba: (r, g, b, a) color, each channel in [0, 1].
+        name: Optional geom name.
+
+    Returns:
+        The newly created geom spec.
+    """
     g = wb.add_geom()
     g.type  = gtype
     g.size  = list(size)
@@ -144,7 +161,8 @@ def _add_geom(wb, gtype, size, pos, rgba, name=None):
     return g
 
 
-def _rgb255_to_rgba1(rgb, alpha=1.0):
+def _rgb255_to_rgba1(rgb: tuple[int, int, int], alpha: float = 1.0) -> list[float]:
+    """Convert a 0-255 RGB tuple to a 0-1 RGBA list."""
     return [rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, alpha]
 
 
@@ -152,18 +170,17 @@ def _rgb255_to_rgba1(rgb, alpha=1.0):
 # Build the MjModel from a scene config produced by scene.py
 # ---------------------------------------------------------------------------
 def build_arena(scene_cfg: dict) -> mujoco.MjModel:
-    """
-    Parameters
-    ----------
-    scene_cfg : dict produced by scene.sample_scene(), must contain:
-        arena_size  : float  — half-width of the square arena (m)
-        objects     : list of dicts with keys:
-                        color_name, color_rgb, shape_name, size, x, y
-        lighting    : optional dict with 'ambient' float
+    """Build a compiled MjModel from a scene config.
 
-    Returns
-    -------
-    mujoco.MjModel  (compiled, ready for mujoco.MjData)
+    Args:
+        scene_cfg: dict produced by scene.sample_scene(), must contain:
+            arena_size  : float  — half-width of the square arena (m)
+            objects     : list of dicts with keys:
+                            color_name, color_rgb, shape_name, size, x, y
+            lighting    : optional dict with 'ambient' float
+
+    Returns:
+        Compiled mujoco.MjModel, ready for mujoco.MjData.
     """
     arena_size = float(scene_cfg["arena_size"])
     objects    = scene_cfg["objects"]
@@ -288,11 +305,13 @@ def _set_ego_cam(cam: mujoco.MjvCamera, qpos: np.ndarray, yaw: float,
                  pitch_deg: float = CAM_PITCH) -> None:
     """Position the free camera to simulate a robot-head ego camera.
 
-    Parameters
-    ----------
-    pitch_deg : downward camera tilt in degrees (default=CAM_PITCH=32°).
-                For grounding renders, use GROUNDING_PITCH=20° so distant targets
-                (4-9m) appear in the image rather than falling below the bottom edge.
+    Args:
+        cam: MjvCamera to position in-place.
+        qpos: Robot qpos array; qpos[0:3] is the pelvis (x, y, z) position.
+        yaw: Robot heading (rad).
+        pitch_deg: Downward camera tilt in degrees (default=CAM_PITCH=32°).
+            For grounding renders, use GROUNDING_PITCH=20° so distant targets
+            (4-9m) appear in the image rather than falling below the bottom edge.
     """
     px, py, pz = qpos[0], qpos[1], qpos[2]
     # Camera origin: slightly forward + at head height
@@ -325,12 +344,15 @@ def _set_ego_cam(cam: mujoco.MjvCamera, qpos: np.ndarray, yaw: float,
 
 def get_ego_intrinsics(w: int = EGO_W, h: int = EGO_H,
                        fovy_deg: float = EGO_FOVY) -> dict:
-    """
-    Return pinhole camera intrinsics for the ego camera.
+    """Return pinhole camera intrinsics for the ego camera.
 
-    Returns
-    -------
-    dict with keys: fx, fy, cx, cy (all in pixels)
+    Args:
+        w: Image width in pixels.
+        h: Image height in pixels.
+        fovy_deg: Vertical field of view in degrees.
+
+    Returns:
+        dict with keys: fx, fy, cx, cy (all in pixels), width, height, fovy_deg.
     """
     fovy_rad = math.radians(fovy_deg)
     fy = (h / 2.0) / math.tan(fovy_rad / 2.0)
@@ -362,7 +384,24 @@ class ArenaRenderer:
                  grounding_w: int = GROUNDING_W, grounding_h: int = GROUNDING_H,
                  proximity_w: int = PROXIMITY_W, proximity_h: int = PROXIMITY_H,
                  tp_w: int = TP_W, tp_h: int = TP_H,
-                 widefov_w: int = WIDEFOV_W, widefov_h: int = WIDEFOV_H):
+                 widefov_w: int = WIDEFOV_W, widefov_h: int = WIDEFOV_H) -> None:
+        """Allocate the ego/grounding/proximity/TP renderers and cameras.
+
+        Args:
+            model: Compiled arena MjModel to render.
+            ego_w: Ego camera render width.
+            ego_h: Ego camera render height.
+            grounding_w: Grounding camera render width.
+            grounding_h: Grounding camera render height.
+            proximity_w: Proximity camera render width.
+            proximity_h: Proximity camera render height.
+            tp_w: Third-person camera render width.
+            tp_h: Third-person camera render height.
+            widefov_w: Wide-FOV camera render width (only used when
+                CAMERA_MODE=='widefov').
+            widefov_h: Wide-FOV camera render height (only used when
+                CAMERA_MODE=='widefov').
+        """
         self._model    = model
         self._ego_w    = ego_w
         self._ego_h    = ego_h
@@ -401,19 +440,18 @@ class ArenaRenderer:
             self._widefov_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 
     def render_ego(self, data: mujoco.MjData, yaw: float,
-                   render_depth: bool = True):
-        """
-        Render the ego (head) camera at native 320x240 resolution.
+                   render_depth: bool = True) -> tuple[np.ndarray, np.ndarray | None, dict]:
+        """Render the ego (head) camera at native 320x240 resolution.
 
-        Parameters
-        ----------
-        render_depth : if False, skip depth rendering (saves ~15ms/frame on EGL).
+        Args:
+            data: MuJoCo simulation data (provides qpos for camera placement).
+            yaw: Robot heading (rad) used to orient the ego camera.
+            render_depth: If False, skip depth rendering (saves ~15ms/frame on EGL).
 
-        Returns
-        -------
-        rgb   : np.ndarray  shape (H,W,3)  uint8
-        depth : np.ndarray  shape (H,W)    float32   (metres) or None
-        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg}
+        Returns:
+            rgb: np.ndarray  shape (H,W,3)  uint8
+            depth: np.ndarray  shape (H,W)  float32  (metres) or None
+            intr: dict  {fx,fy,cx,cy,width,height,fovy_deg}
         """
         _set_ego_cam(self._egc, data.qpos, yaw)
 
@@ -431,9 +469,8 @@ class ArenaRenderer:
         return rgb, depth, intr
 
     def render_grounding(self, data: mujoco.MjData, yaw: float,
-                         render_depth: bool = True):
-        """
-        Render at higher-resolution (480x360) with shallower pitch for demo-distance grounding.
+                         render_depth: bool = True) -> tuple[np.ndarray, np.ndarray | None, dict]:
+        """Render at higher-resolution (480x360) with shallower pitch for demo-distance grounding.
 
         V2 key changes vs render_ego:
         1. Resolution: 480x360 (1.5x) → targets are 2.25x larger in pixel area.
@@ -444,11 +481,15 @@ class ArenaRenderer:
         Bearing calculation: cam_to_egocentric() must use GROUNDING_PITCH (not CAM_PITCH)
         to correctly un-pitch the camera frame. This is handled in grounding.py.
 
-        Returns
-        -------
-        rgb   : np.ndarray  shape (360,480,3)  uint8
-        depth : np.ndarray  shape (360,480)    float32   (metres) or None
-        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg}
+        Args:
+            data: MuJoCo simulation data (provides qpos for camera placement).
+            yaw: Robot heading (rad) used to orient the grounding camera.
+            render_depth: If False, skip depth rendering.
+
+        Returns:
+            rgb: np.ndarray  shape (360,480,3)  uint8
+            depth: np.ndarray  shape (360,480)  float32  (metres) or None
+            intr: dict  {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg}
         """
         _set_ego_cam(self._gr_cam, data.qpos, yaw, pitch_deg=GROUNDING_PITCH)
 
@@ -470,9 +511,8 @@ class ArenaRenderer:
         return rgb, depth, intr
 
     def render_proximity(self, data: mujoco.MjData, yaw: float,
-                         render_depth: bool = True):
-        """
-        CAM-2 (Phase 1): render the steep-pitch proximity camera, same head mount as
+                         render_depth: bool = True) -> tuple[np.ndarray, np.ndarray | None, dict]:
+        """CAM-2 (Phase 1): render the steep-pitch proximity camera, same head mount as
         render_ego/render_grounding (only PROXIMITY_PITCH differs — no XML change, no
         new offset calibration needed post-P0, see arena.py constants comment).
 
@@ -481,11 +521,15 @@ class ArenaRenderer:
         already fallen below the frame. Selected by the Schmitt-trigger handoff in
         inferencer.py — NOT rendered every cycle, only when active_cam==PROXIMITY.
 
-        Returns
-        -------
-        rgb   : np.ndarray  shape (PROXIMITY_H,PROXIMITY_W,3)  uint8
-        depth : np.ndarray  shape (PROXIMITY_H,PROXIMITY_W)    float32   (metres) or None
-        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_proximity}
+        Args:
+            data: MuJoCo simulation data (provides qpos for camera placement).
+            yaw: Robot heading (rad) used to orient the proximity camera.
+            render_depth: If False, skip depth rendering.
+
+        Returns:
+            rgb: np.ndarray  shape (PROXIMITY_H,PROXIMITY_W,3)  uint8
+            depth: np.ndarray  shape (PROXIMITY_H,PROXIMITY_W)  float32  (metres) or None
+            intr: dict  {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_proximity}
         """
         _set_ego_cam(self._prox_cam, data.qpos, yaw, pitch_deg=PROXIMITY_PITCH)
 
@@ -509,9 +553,8 @@ class ArenaRenderer:
         return rgb, depth, intr
 
     def render_widefov(self, data: mujoco.MjData, yaw: float,
-                       render_depth: bool = True):
-        """
-        CAM-1 (Phase 2, toggle, docs/cam_opt1_widefov.md / docs/cam_p2.md): render the
+                       render_depth: bool = True) -> tuple[np.ndarray, np.ndarray | None, dict]:
+        """CAM-1 (Phase 2, toggle, docs/cam_opt1_widefov.md / docs/cam_p2.md): render the
         single wide-FOV camera, same head mount as render_ego/render_grounding
         (CAM_HEAD_Z, CAM_FWD unchanged), pitch=WIDEFOV_PITCH, FOVY=WIDEFOV_FOVY (the
         actual rendered FOVY, set at build time via spec.visual.global_.fovy in
@@ -521,11 +564,15 @@ class ArenaRenderer:
         No proximity camera, no handoff — this single render is the entire grounding
         camera for CAM-1.
 
-        Returns
-        -------
-        rgb   : np.ndarray  shape (WIDEFOV_H,WIDEFOV_W,3)  uint8
-        depth : np.ndarray  shape (WIDEFOV_H,WIDEFOV_W)    float32   (metres) or None
-        intr  : dict        {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_widefov}
+        Args:
+            data: MuJoCo simulation data (provides qpos for camera placement).
+            yaw: Robot heading (rad) used to orient the wide-FOV camera.
+            render_depth: If False, skip depth rendering.
+
+        Returns:
+            rgb: np.ndarray  shape (WIDEFOV_H,WIDEFOV_W,3)  uint8
+            depth: np.ndarray  shape (WIDEFOV_H,WIDEFOV_W)  float32  (metres) or None
+            intr: dict  {fx,fy,cx,cy,width,height,fovy_deg,pitch_deg,is_widefov}
         """
         _set_ego_cam(self._widefov_cam, data.qpos, yaw, pitch_deg=WIDEFOV_PITCH)
 
@@ -548,12 +595,13 @@ class ArenaRenderer:
         intr['is_widefov'] = True
         return rgb, depth, intr
 
-    def render_tp(self, data: mujoco.MjData, tp_cam: mujoco.MjvCamera):
+    def render_tp(self, data: mujoco.MjData, tp_cam: mujoco.MjvCamera) -> np.ndarray:
         """Render third-person view (for video only)."""
         self._tp_rend.update_scene(data, tp_cam)
         return self._tp_rend.render().copy()
 
     def make_tp_cam(self) -> mujoco.MjvCamera:
+        """Create a default third-person MjvCamera (not yet tracking any body)."""
         cam        = mujoco.MjvCamera()
         cam.type   = mujoco.mjtCamera.mjCAMERA_FREE
         cam.distance  = 5.0
@@ -570,7 +618,8 @@ class ArenaRenderer:
         tp_cam.azimuth    = 135.0
         tp_cam.elevation  = -20.0
 
-    def close(self):
+    def close(self) -> None:
+        """Close all underlying EGL renderers."""
         self._ego_rend.close()
         self._gr_rend.close()
         self._prox_rend.close()
@@ -583,14 +632,18 @@ class ArenaRenderer:
 # Back-projection helper (used by grounding.py)
 # ---------------------------------------------------------------------------
 def backproject_pixel(u: float, v: float, depth_m: float, intr: dict) -> np.ndarray:
-    """
-    Back-project image pixel (u,v) at given depth (metres) to camera-frame 3D point.
+    """Back-project image pixel (u,v) at given depth (metres) to camera-frame 3D point.
 
     Camera frame: x=right, y=down, z=forward (OpenCV convention).
 
-    Returns
-    -------
-    np.ndarray shape (3,)  [x_cam, y_cam, z_cam]
+    Args:
+        u: Pixel column (x, right).
+        v: Pixel row (y, down).
+        depth_m: Depth at (u, v) in metres.
+        intr: Camera intrinsics dict with keys fx, fy, cx, cy.
+
+    Returns:
+        np.ndarray shape (3,)  [x_cam, y_cam, z_cam]
     """
     x = (u - intr["cx"]) * depth_m / intr["fx"]
     y = (v - intr["cy"]) * depth_m / intr["fy"]

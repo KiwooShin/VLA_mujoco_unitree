@@ -37,12 +37,23 @@ if str(_REPO) not in sys.path:
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-from code.nx6_heatmap_model import TinyHeatmapUNet, N_CLASS, N_COLOR, TARGET_W, TARGET_H, CLASS_NAMES, COLOR_NAMES
 from code.nx6_heatmap_data import SplitCache, load_failcase_cache, build_example_index, ALL_COMBOS
-from code.nx6_heatmap_eval_utils import run_inference, select_threshold, presence_only_pr, score_at_threshold, _angle_diff_deg
+from code.nx6_heatmap_eval_utils import (InferenceResult, run_inference, select_threshold,
+                                         presence_only_pr, score_at_threshold, _angle_diff_deg)
+from code.nx6_heatmap_model import (TinyHeatmapUNet, N_CLASS, N_COLOR, TARGET_W, TARGET_H,
+                                    CLASS_NAMES, COLOR_NAMES)
 
 
-def load_model(ckpt_path, device):
+def load_model(ckpt_path: str, device: str) -> tuple[TinyHeatmapUNet, dict]:
+    """Loads a TinyHeatmapUNet model and its checkpoint dict.
+
+    Args:
+        ckpt_path: Path to the model checkpoint file.
+        device: Torch device string to move the model to.
+
+    Returns:
+        A tuple of (model in eval mode on device, raw checkpoint dict).
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model = TinyHeatmapUNet(**ckpt.get("model_cfg", {}))
     model.load_state_dict(ckpt["model_state"])
@@ -50,7 +61,30 @@ def load_model(ckpt_path, device):
     return model, ckpt
 
 
-def eval_split(model, data_root, split, device, neg_per_object_frame=3, neg_per_empty_frame=6, seed=999):
+def eval_split(
+    model: TinyHeatmapUNet,
+    data_root: str,
+    split: str,
+    device: str,
+    neg_per_object_frame: int = 3,
+    neg_per_empty_frame: int = 6,
+    seed: int = 999,
+) -> tuple[dict, InferenceResult]:
+    """Evaluates the model on one dataset split (e.g. 'val' or 'test').
+
+    Args:
+        model: The TinyHeatmapUNet model to evaluate.
+        data_root: Root directory of the dataset (e.g. dataset/det_v1).
+        split: Split name to load via SplitCache (e.g. 'val', 'test').
+        device: Torch device string to run inference on.
+        neg_per_object_frame: Negative examples sampled per labeled-object frame.
+        neg_per_empty_frame: Negative examples sampled per empty frame.
+        seed: RNG seed for example-index sampling.
+
+    Returns:
+        A tuple (summary, res): a dict of split/precision/recall/etc. metrics,
+        and the raw InferenceResult.
+    """
     cache = SplitCache(data_root, split)
     rng = np.random.default_rng(seed)
     examples = build_example_index(cache, rng, neg_per_object_frame=neg_per_object_frame,
@@ -63,10 +97,20 @@ def eval_split(model, data_root, split, device, neg_per_object_frame=3, neg_per_
     }, presence_precision=presence["precision"], presence_recall=presence["recall"]), res
 
 
-def build_instructed_target_examples(cache):
+def build_instructed_target_examples(
+    cache: SplitCache,
+) -> list[tuple[int, int, int, dict | None]]:
     """One example per failcase frame: query = the episode's instructed (color,shape).
     has_target/dist_gt/bearing_gt come from the is_instructed_target=True label row if
-    present in that frame (object actually visible), else 'not present'."""
+    present in that frame (object actually visible), else 'not present'.
+
+    Args:
+        cache: SplitCache holding the failcases split's frames/labels.
+
+    Returns:
+        A list of (row_i, class_id, color_id, label_or_none) tuples, one per
+        frame in ``cache``.
+    """
     examples = []
     for i in range(len(cache.frames)):
         cname = str(cache.target_color[i])
@@ -82,7 +126,23 @@ def build_instructed_target_examples(cache):
     return examples
 
 
-def eval_failcases(model, device, data_root="dataset/det_failcases"):
+def eval_failcases(
+    model: TinyHeatmapUNet,
+    device: str,
+    data_root: str = "dataset/det_failcases",
+) -> dict:
+    """Runs the failcases acid-test suite: overall PR, per-episode instructed-target
+    query behavior, and the ep12 twin-hijack conditioning check.
+
+    Args:
+        model: The TinyHeatmapUNet model to evaluate.
+        device: Torch device string to run inference on.
+        data_root: Root directory of the failcases dataset.
+
+    Returns:
+        A dict with keys 'overall', 'per_episode', 'per_frame_instructed_target',
+        and 'ep12_twin'.
+    """
     cache = load_failcase_cache(data_root)
 
     # (a) overall precision/recall: every labeled object as a positive + sampled negatives
@@ -175,7 +235,19 @@ def eval_failcases(model, device, data_root="dataset/det_failcases"):
     )
 
 
-def benchmark_latency(model, device):
+def benchmark_latency(model: TinyHeatmapUNet, device: str) -> float:
+    """Benchmarks single-frame (batch=1) eval-mode inference latency.
+
+    Runs a warmup pass (cuDNN algo search etc.) followed by 100 timed
+    steady-state iterations.
+
+    Args:
+        model: The TinyHeatmapUNet model to benchmark (put in eval mode).
+        device: Torch device string ('cuda' or 'cpu') to run inference on.
+
+    Returns:
+        Mean steady-state latency per inference call, in milliseconds.
+    """
     x = torch.randn(1, 4, TARGET_H, TARGET_W, device=device)
     q = torch.zeros(1, N_CLASS + N_COLOR, device=device)
     q[0, 1] = 1.0
@@ -196,7 +268,8 @@ def benchmark_latency(model, device):
     return dt * 1000.0  # ms
 
 
-def main():
+def main() -> None:
+    """Parses CLI args and runs the full NX-6 heatmap-model evaluation suite."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="runs/nx6_heatmap_A/model_best.pt")
     ap.add_argument("--data", default="dataset/det_v1")

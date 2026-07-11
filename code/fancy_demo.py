@@ -108,19 +108,19 @@ BEV_AZIMUTH    = 225.0   # degrees diagonal (SW view → robot in frame, facing 
 BEV_LOOKAT_Z   = 0.3     # lookat height (ground-level scene)
 
 # Overlay colors (BGR for cv2)
-COLOR_PATH_TRAIL   = (0,   220, 100)   # green path line
-COLOR_TARGET_RING  = (0,   80,  255)   # bright orange ring
-COLOR_FOV_CONE     = (255, 255,  80)   # yellow FOV wedge
-COLOR_BANNER_BG    = (30,   30,  30)
-COLOR_STATE_SEARCH = (0,   200, 255)   # cyan text — SEARCHING
-COLOR_STATE_LOCATE = (50,  255,  50)   # green — LOCATED
-COLOR_STATE_MOVE   = (255, 165,   0)   # orange — MOVING
-COLOR_STATE_REACH  = (255,  80,  80)   # red-pink — REACHED
+COLOR_PATH_TRAIL: tuple[int, int, int]   = (0,   220, 100)   # green path line
+COLOR_TARGET_RING: tuple[int, int, int]  = (0,   80,  255)   # bright orange ring
+COLOR_FOV_CONE: tuple[int, int, int]     = (255, 255,  80)   # yellow FOV wedge
+COLOR_BANNER_BG: tuple[int, int, int]    = (30,   30,  30)
+COLOR_STATE_SEARCH: tuple[int, int, int] = (0,   200, 255)   # cyan text — SEARCHING
+COLOR_STATE_LOCATE: tuple[int, int, int] = (50,  255,  50)   # green — LOCATED
+COLOR_STATE_MOVE: tuple[int, int, int]   = (255, 165,   0)   # orange — MOVING
+COLOR_STATE_REACH: tuple[int, int, int]  = (255,  80,  80)   # red-pink — REACHED
 
 # Reliable color palette (avoid cyan/blue — wall HSV collision)
 # See docs/grounding_dist.md: red/orange/yellow/purple = 87-100% detection at demo distances
-RELIABLE_COLORS = ["red", "orange", "yellow", "purple"]
-RELIABLE_SHAPES = ["ball", "cube", "cylinder", "cone"]
+RELIABLE_COLORS: list[str] = ["red", "orange", "yellow", "purple"]
+RELIABLE_SHAPES: list[str] = ["ball", "cube", "cylinder", "cone"]
 
 # State machine states
 STATE_IDLE      = "IDLE"
@@ -211,7 +211,7 @@ HUD_BAR_H       = 46    # extra strip appended below the two panels when FEAT_HU
 HEATMAP_ALPHA = 0.40
 
 # 5-stage skill breadcrumb shown in the HUD bar (item 3).
-SKILL_STAGES = ["SCAN", "LOCK", "WALK", "HANDOFF", "REACH"]
+SKILL_STAGES: list[str] = ["SCAN", "LOCK", "WALK", "HANDOFF", "REACH"]
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +227,26 @@ def world_to_bev_pixel(
     h: int = BEV_H,
     fovy_deg: float = 45.0,
 ) -> np.ndarray:
-    """
-    Project world XYZ points into BEV pixel coordinates.
+    """Project world XYZ points into BEV pixel coordinates.
 
-    Uses MuJoCo's camera view matrix + a pinhole projection.
-    Returns (N, 2) float array of (u, v) pixel coords.
-    Clips out-of-frame points but does not filter them.
+    Uses MuJoCo's camera view matrix + a pinhole projection. Clips
+    out-of-frame points but does not filter them.
+
+    Args:
+        world_pts: (N, 3) world XYZ points to project (or (3,) for a single
+            point, promoted to (1, 3)).
+        bev_cam: MuJoCo free camera (lookat/azimuth/elevation/distance) used
+            for the BEV follow-cam view.
+        model: MuJoCo model (unused in this function; kept for interface
+            parity with the other render helpers).
+        data: MuJoCo data (unused in this function; kept for interface
+            parity with the other render helpers).
+        w: Output image width in pixels.
+        h: Output image height in pixels.
+        fovy_deg: Vertical field of view in degrees.
+
+    Returns:
+        (N, 2) float32 array of (u, v) pixel coordinates.
     """
     import mujoco
 
@@ -311,7 +325,15 @@ def world_to_bev_pixel(
 # VF-1 small drawing helpers (pure cv2 pixel-pushing, no state reads beyond
 # their arguments)
 # ---------------------------------------------------------------------------
-def _dashed_line(img, p0, p1, color, thickness=2, dash_len=9, gap_len=7):
+def _dashed_line(
+    img: np.ndarray,
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    dash_len: int = 9,
+    gap_len: int = 7,
+) -> None:
     """Draw a dashed line segment from p0 to p1 (both (x,y) int tuples)."""
     import cv2
     x0, y0 = p0
@@ -331,23 +353,24 @@ def _dashed_line(img, p0, p1, color, thickness=2, dash_len=9, gap_len=7):
         pos += dash_len + gap_len
 
 
-def _lerp_color_bgr(c_cool, c_warm, t: float):
+def _lerp_color_bgr(
+    c_cool: tuple[int, int, int], c_warm: tuple[int, int, int], t: float
+) -> tuple[int, int, int]:
     """Linear-interpolate two BGR color tuples, t in [0,1] (0=cool, 1=warm)."""
     t = max(0.0, min(1.0, t))
     return tuple(int(round(a + (b - a) * t)) for a, b in zip(c_cool, c_warm))
 
 
 # Path-trail gradient endpoints (BGR): cool blue (old) -> warm orange/red (recent).
-TRAIL_COOL_BGR = (230, 120, 40)   # blue-ish
-TRAIL_WARM_BGR = (30,  90, 255)   # warm orange-red
+TRAIL_COOL_BGR: tuple[int, int, int] = (230, 120, 40)   # blue-ish
+TRAIL_WARM_BGR: tuple[int, int, int] = (30,  90, 255)   # warm orange-red
 
 
 def draw_avoid_overlay(bev_img: np.ndarray, robot_xy: np.ndarray, robot_yaw: float,
                        bev_cam: "mujoco.MjvCamera", model: "mujoco.MjModel",
                        data: "mujoco.MjData", avoid_bias_wz: float,
                        avoid_info: Optional[dict], fovy_deg: float = 45.0) -> np.ndarray:
-    """
-    VF-1 item 2: visualize NX-9 AVOID's obstacle-repulsion bias on the BEV panel.
+    """VF-1 item 2: visualize NX-9 AVOID's obstacle-repulsion bias on the BEV panel.
 
     Pure render-side read of the ALREADY-COMPUTED `avoid_bias_wz` / `avoid_info`
     (code/avoid.py's compute_obstacle_bias() return values, cached by the caller
@@ -355,6 +378,25 @@ def draw_avoid_overlay(bev_img: np.ndarray, robot_xy: np.ndarray, robot_yaw: flo
     itself and never influences the value fed back into steer.py's control law.
 
     No-op (returns bev_img unchanged) when the bias is within the deadband.
+
+    Args:
+        bev_img: (H, W, 3) uint8 BGR BEV frame to draw on (mutated in place).
+        robot_xy: (2,) current robot world position.
+        robot_yaw: Current robot yaw, in radians.
+        bev_cam: MuJoCo free camera used for the BEV follow-cam view.
+        model: MuJoCo model, forwarded to world_to_bev_pixel().
+        data: MuJoCo data, forwarded to world_to_bev_pixel().
+        avoid_bias_wz: Already-computed AVOID yaw-rate bias (positive = steer
+            left, negative = steer right; same sign convention as steer.py).
+        avoid_info: compute_obstacle_bias()'s own debug dict (`left`/`right`
+            severities), or None when AVOID has no active bias this cycle.
+        fovy_deg: Vertical field of view in degrees, forwarded to
+            world_to_bev_pixel().
+
+    Returns:
+        The BGR frame with the AVOID overlay drawn (same array as `bev_img`
+        when a bias was drawn; `bev_img` unchanged when there is nothing to
+        draw).
     """
     import cv2
     from code import avoid as _avoid
@@ -365,7 +407,8 @@ def draw_avoid_overlay(bev_img: np.ndarray, robot_xy: np.ndarray, robot_yaw: flo
     img = bev_img
     H, W = img.shape[:2]
 
-    def w2p(xy):
+    def w2p(xy: np.ndarray) -> tuple[int, int]:
+        """World (x, y) to BEV pixel (u, v), rounded to the nearest int."""
         pix = world_to_bev_pixel(np.array([[xy[0], xy[1], 0.0]]), bev_cam, model, data, W, H, fovy_deg)
         return (int(round(pix[0, 0])), int(round(pix[0, 1])))
 
@@ -447,8 +490,7 @@ def draw_bev_overlays(
     avoid_bias_wz: float = 0.0,
     avoid_info: Optional[dict] = None,
 ) -> np.ndarray:
-    """
-    Draw all BEV overlays on bev_img (in-place + return).
+    """Draw all BEV overlays on bev_img (in-place + return).
 
     Overlays:
       (a) PATH TRAIL — green polyline (VF-1: gradient cool->warm when FEAT_TRAIL)
@@ -456,13 +498,45 @@ def draw_bev_overlays(
       (c) FOV CONE — yellow wedge on ground
       (d) STATUS BANNER — bottom banner with state + distance
       (e) VF-1: AVOID repulsion viz (item 2), dashed goal line in target color (item 4)
+
+    Args:
+        bev_img: (H, W, 3) uint8 BGR BEV frame (a copy is drawn on, not
+            mutated in place -- the annotated copy is returned).
+        path_trail: List of (x, y) world positions, oldest first.
+        target_xy: (2,) world position of the current sub-goal target, or
+            None if there is no target to highlight.
+        robot_xy: (2,) current robot world position.
+        robot_yaw: Current robot yaw, in radians.
+        bev_cam: MuJoCo free camera used for the BEV follow-cam view.
+        model: MuJoCo model, forwarded to world_to_bev_pixel().
+        data: MuJoCo data, forwarded to world_to_bev_pixel().
+        state: Current state-machine state (one of the STATE_* constants),
+            used for the status banner and for gating the goal line.
+        prompt: Typed instruction text shown in the status banner.
+        dist_to_target: Current distance to target in meters, or None.
+        fovy_deg: Vertical field of view in degrees, forwarded to
+            world_to_bev_pixel().
+        goal_idx: Zero-based index of the current sub-goal (multi-goal runs).
+        n_goals: Total number of sub-goals in this episode.
+        completed_targets: World (x, y) positions of already-reached targets,
+            drawn as green check marks.
+        target_color_bgr: The current target's own BGR color, used for the
+            dashed goal line (VF-1 item 4); None falls back to the plain
+            magenta line.
+        avoid_bias_wz: Already-computed AVOID yaw-rate bias, forwarded to
+            draw_avoid_overlay().
+        avoid_info: compute_obstacle_bias()'s own debug dict, forwarded to
+            draw_avoid_overlay().
+
+    Returns:
+        A new (H, W, 3) uint8 BGR frame with all overlays drawn.
     """
     import cv2
 
     img = bev_img.copy()
     H, W = img.shape[:2]
 
-    def w2p(world_xyz):
+    def w2p(world_xyz: np.ndarray) -> tuple[int, int]:
         """World XYZ (or XY with Z=0) to pixel (u,v) as int tuple."""
         if len(world_xyz) == 2:
             world_xyz = np.array([world_xyz[0], world_xyz[1], 0.0])
@@ -674,7 +748,7 @@ def draw_bev_overlays(
     return img
 
 
-_STATE_COLOR_MAP = {
+_STATE_COLOR_MAP: dict[str, tuple[int, int, int]] = {
     STATE_SEARCHING: COLOR_STATE_SEARCH,
     STATE_LOCATED:   COLOR_STATE_LOCATE,
     STATE_MOVING:    COLOR_STATE_MOVE,
@@ -684,11 +758,14 @@ _STATE_COLOR_MAP = {
 }
 
 
-def draw_detector_heatmap_overlay(ego_bgr: np.ndarray, heatmap_cache: Optional[dict],
-                                  target_color: str, target_shape: str,
-                                  alpha: float = HEATMAP_ALPHA):
-    """
-    VF-1 item 1: blend the NX-6 GROUND_NET detector's OWN confidence heatmap
+def draw_detector_heatmap_overlay(
+    ego_bgr: np.ndarray,
+    heatmap_cache: Optional[dict],
+    target_color: str,
+    target_shape: str,
+    alpha: float = HEATMAP_ALPHA,
+) -> tuple[np.ndarray, Optional[float]]:
+    """VF-1 item 1: blend the NX-6 GROUND_NET detector's OWN confidence heatmap
     (cached by code/grounding.py's _ground_net() the same cycle it already ran
     the forward pass for detection -- ZERO extra inference here) onto the ego
     panel as a semi-transparent color map.
@@ -699,7 +776,23 @@ def draw_detector_heatmap_overlay(ego_bgr: np.ndarray, heatmap_cache: Optional[d
     cache belongs to a different target than the one THIS episode is
     pursuing), or the cached cycle did not accept a detection.
 
-    Returns (blended_bgr, confidence_or_None).
+    Args:
+        ego_bgr: (H, W, 3) uint8 BGR ego panel frame to blend onto.
+        heatmap_cache: get_ground_net_last_heatmap()'s cache dict (`prob`,
+            `color`, `shape`, `accepted`, `confidence`), or None if GROUND_NET
+            was never invoked.
+        target_color: This episode's target color name, used to check the
+            cache matches the currently-pursued target.
+        target_shape: This episode's target shape name, used to check the
+            cache matches the currently-pursued target.
+        alpha: Maximum blend strength (per-pixel alpha is confidence-scaled,
+            capped at this value).
+
+    Returns:
+        Tuple of (blended_bgr, confidence): `blended_bgr` is a new frame with
+        the heatmap blended in, or `ego_bgr` unchanged when there is nothing
+        to draw; `confidence` is the cached detection confidence, or None
+        when nothing was drawn.
     """
     import cv2
     if heatmap_cache is None or heatmap_cache.get('prob') is None:
@@ -748,13 +841,35 @@ def compose_sbs_frame(
     # regardless of FEAT_HUD.
     hud_ctx: Optional[dict] = None,
 ) -> np.ndarray:
-    """
-    Compose side-by-side frame: ego (left, CAM-2 active-camera feed) | BEV (right)
+    """Compose side-by-side frame: ego (left, CAM-2 active-camera feed) | BEV (right)
     [+ VF-1 bottom HUD strip when FEAT_HUD and hud_ctx is given].
 
-    Returns (H, W, 3) uint8 BGR frame. When every VF-1 toggle is off (FANCY_PLAIN=1)
-    this reproduces the pre-VF1 frame byte-for-byte (same resize target, same badge
-    layout, same divider).
+    When every VF-1 toggle is off (FANCY_PLAIN=1) this reproduces the pre-VF1
+    frame byte-for-byte (same resize target, same badge layout, same divider).
+
+    Args:
+        ego_rgb: (EGO_H, EGO_W, 3) uint8 RGB CAM-2 active-camera feed.
+        bev_img: (BEV_H, BEV_W, 3) uint8 BGR BEV frame (with its own overlays
+            already drawn by draw_bev_overlays()).
+        state: Current state-machine state (one of the STATE_* constants).
+        prompt: Typed instruction text (unused directly here; forwarded to
+            draw_bev_overlays() by the caller).
+        dist_to_target: Current distance to target in meters, or None.
+        goal_idx: Zero-based index of the current sub-goal (multi-goal runs).
+        n_goals: Total number of sub-goals in this episode.
+        active_cam: CAM-2 (docs/cam_p1.md) active camera name -- 'GROUNDING'
+            (head, far) or 'PROXIMITY' (near).
+        heatmap_cache: get_ground_net_last_heatmap()'s cache dict, forwarded
+            to draw_detector_heatmap_overlay(); None disables the overlay.
+        target_color: This episode's target color name, forwarded to
+            draw_detector_heatmap_overlay().
+        target_shape: This episode's target shape name, forwarded to
+            draw_detector_heatmap_overlay().
+        hud_ctx: HUD bar context dict (see draw_hud_bar()); None disables the
+            HUD bar regardless of FEAT_HUD.
+
+    Returns:
+        (H, W, 3) uint8 BGR composited frame.
     """
     import cv2
 
@@ -846,8 +961,7 @@ def compose_sbs_frame(
 
 
 def draw_hud_bar(width: int, ctx: dict) -> np.ndarray:
-    """
-    VF-1 item 3: bottom HUD strip spanning the full canvas width --
+    """VF-1 item 3: bottom HUD strip spanning the full canvas width --
       - typed instruction, verbatim (left)
       - live distance + bearing, step counter, walk speed (right)
       - 5-stage skill breadcrumb SCAN > LOCK > WALK > HANDOFF > REACH, active
@@ -857,6 +971,15 @@ def draw_hud_bar(width: int, ctx: dict) -> np.ndarray:
 
     Pure render-side function: every field in `ctx` is a read of state that
     already exists in run_fancy_rollout (see its call site in _render_sbs_frame).
+
+    Args:
+        width: Full canvas width in pixels (the HUD strip spans this width).
+        ctx: Context dict with keys `prompt`, `stage_idx`, `dist`,
+            `bearing_deg`, `step`, `walk_speed_mps`, `active_cam`,
+            `cam_flash` (see _render_sbs_frame's hud_ctx construction).
+
+    Returns:
+        (HUD_BAR_H, width, 3) uint8 BGR HUD strip.
     """
     import cv2
     h = HUD_BAR_H
@@ -927,11 +1050,14 @@ def draw_hud_bar(width: int, ctx: dict) -> np.ndarray:
 
 
 def _final_canvas_dims() -> Tuple[int, int]:
-    """
-    Mirrors compose_sbs_frame's own size arithmetic WITHOUT rendering anything,
+    """Mirrors compose_sbs_frame's own size arithmetic WITHOUT rendering anything,
     so the title/outro card frames (built before/after the simulation loop, with
     no ego/bev frame at hand) match the exact (H, W) of the per-step SBS frames
     -- required since every frame appended to one video must share one shape.
+
+    Returns:
+        (height, width) in pixels, matching compose_sbs_frame()'s output shape
+        for the current FEAT_HIRES / FEAT_HUD toggle state.
     """
     if FEAT_HIRES:
         w = PANEL_DISPLAY_W * 2 + 3
@@ -948,11 +1074,22 @@ def _final_canvas_dims() -> Tuple[int, int]:
 
 
 def make_title_card(instruction: str, scenario_title: str, frame_idx: int, n_frames: int) -> np.ndarray:
-    """
-    VF-1 item 5: ~1.5s pre-roll title card -- scenario name (large) + the
+    """VF-1 item 5: ~1.5s pre-roll title card -- scenario name (large) + the
     typed instruction, with a short fade-in over the first ~10 frames. Static
     content generated BEFORE the simulation loop starts (see its call site in
     run_fancy_rollout) -- purely additive frames, never interleaved with control.
+
+    Args:
+        instruction: Typed instruction text (or the combined multi-goal
+            instruction) shown under the scenario title.
+        scenario_title: Large scenario name shown at the top of the card.
+        frame_idx: Zero-based index of this frame within the title-card
+            sequence, used to compute the fade-in.
+        n_frames: Total number of frames in the title-card sequence (fade-in
+            completes at frame_idx >= 10, well before n_frames typically).
+
+    Returns:
+        (H, W, 3) uint8 BGR title-card frame, matching _final_canvas_dims().
     """
     import cv2
     h, w = _final_canvas_dims()
@@ -961,7 +1098,8 @@ def make_title_card(instruction: str, scenario_title: str, frame_idx: int, n_fra
 
     fade = min(1.0, frame_idx / 10.0)
 
-    def _fade(bgr):
+    def _fade(bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+        """Scale a BGR color tuple by the current fade-in level."""
         return tuple(int(c * fade) for c in bgr)
 
     title = scenario_title
@@ -991,11 +1129,21 @@ def make_title_card(instruction: str, scenario_title: str, frame_idx: int, n_fra
 
 def make_outro_card(last_frame: np.ndarray, sim_time_s: float, dist_traveled_m: float,
                     final_dist_m: float, steps: int) -> np.ndarray:
-    """
-    VF-1 item 5: ~2s freeze-frame on REACHED with a stats card overlay (elapsed
+    """VF-1 item 5: ~2s freeze-frame on REACHED with a stats card overlay (elapsed
     sim time, distance traveled, final distance to target, step count). Built
     from the ACTUAL last rendered SBS frame (scene/robot/target still visible)
     plus a semi-transparent stats panel -- never re-renders anything.
+
+    Args:
+        last_frame: The final rendered SBS frame of the episode (copied, not
+            mutated), used as the freeze-frame background.
+        sim_time_s: Elapsed simulated time in seconds.
+        dist_traveled_m: Total odometry distance traveled in meters.
+        final_dist_m: Final distance to target in meters.
+        steps: Total number of control steps taken.
+
+    Returns:
+        (H, W, 3) uint8 BGR outro-card frame, same shape as `last_frame`.
     """
     import cv2
     img = last_frame.copy()
@@ -1028,14 +1176,15 @@ def make_outro_card(last_frame: np.ndarray, sim_time_s: float, dist_traveled_m: 
 # ---------------------------------------------------------------------------
 
 def run_fancy_rollout(
-    inf,                          # Inferencer instance (goal_source='classical')
+    inf: "Inferencer",            # Inferencer instance (goal_source='classical')
     scene_cfg: dict,
     prompt: str,
     goto_ckpt_path: str = GOTO_CKPT_DEFAULT,
     maxsteps: int = MAXSTEPS_FANCY,
     render_video: bool = True,
     video_path: Optional[str] = None,
-    frame_callback=None,          # called each step with (sbs_bgr, state, dist, step)
+    # called each step with (sbs_bgr, state, dist, step)
+    frame_callback: "Callable[..., None] | None" = None,
     # FD2: multi-goal context
     goal_idx: int = 0,
     n_goals: int = 1,
@@ -1065,12 +1214,49 @@ def run_fancy_rollout(
     # sub-goal's `resume_ctx`. Only ever set by run_fancy_rollout_multi.
     keep_alive: bool = False,
 ) -> dict:
-    """
-    Search-then-goto rollout with ego|BEV side-by-side frames + 4 overlays.
+    """Search-then-goto rollout with ego|BEV side-by-side frames + 4 overlays.
 
     Always uses SEARCH behavior (student-driven bidirectional bounded scan,
     code/scan_sched.py, until target spotted — see docs/nx1_scan.md).
-    Returns dict: success, spotted, scan_steps, steps, final_dist, fell, video_path
+
+    Args:
+        inf: Inferencer instance (goal_source='classical').
+        scene_cfg: Scene config dict (objects, target_index, robot_xy/yaw,
+            stop_r, etc.) as produced by the sample_fancy_scene* functions.
+        prompt: Instruction text shown in the BEV status banner / HUD bar.
+        goto_ckpt_path: Goto/search checkpoint path (currently unused inside
+            this function -- the loaded policy comes from `inf`).
+        maxsteps: Hard step cap for this sub-goal.
+        render_video: Whether to render ego|BEV SBS frames at all.
+        video_path: Output MP4 path for this rollout's own clip, or None to
+            skip writing a per-call video (e.g. when the caller collects
+            frames itself, as run_fancy_rollout_multi does).
+        frame_callback: Optional callable invoked each rendered step with
+            (sbs_bgr, state, dist, step).
+        goal_idx: Zero-based index of this sub-goal (multi-goal runs).
+        n_goals: Total number of sub-goals in this episode.
+        path_trail_in: Path trail carried over from prior sub-goals, or None
+            to start a fresh trail.
+        completed_targets: World (x, y) positions of already-reached targets,
+            carried over from prior sub-goals.
+        scenario_title: Scenario name shown on the VF-1 title card (rendered
+            only when goal_idx == 0).
+        title_instruction: Full instruction text for the title card, if
+            different from the per-sub-goal `prompt` (e.g. multi-goal's
+            combined instruction); defaults to `prompt` when not given.
+        resume_ctx: Optional continuation context (live MuJoCo model/data/
+            teacher/renderer + carried policy state) from a prior sub-goal's
+            `live_ctx`, used only by run_fancy_rollout_multi. None rebuilds a
+            fresh arena and resets to scene_cfg's start state, as before VF-3.
+        keep_alive: When True, don't close the renderer / tear down the sim
+            at the end of this call -- instead return the live objects in the
+            result dict under 'live_ctx' for the next sub-goal's `resume_ctx`.
+
+    Returns:
+        Dict with keys: success, spotted, scan_steps, failure_tag, steps,
+        final_dist, fell, ms_per_step, video_path, frames_count,
+        path_trail_out, frames_sbs, avoid_bias_active_frac, and (only when
+        `keep_alive` and the robot didn't fall) live_ctx.
     """
     import cv2
     import mujoco
@@ -1313,7 +1499,9 @@ def run_fancy_rollout(
     _rescan_sched        = None
     _rescan_local_steps  = 0
 
-    def _lock_drop_and_rescan():
+    def _lock_drop_and_rescan() -> None:
+        """NX-16: drop a coast-expired lock and re-enter scan via a fresh
+        ReacquisitionScan (see the module comment above this closure)."""
         nonlocal _goal_ema, _last_known_goal, _frames_since_det
         nonlocal _scan_active, _using_rescan_sched, _rescan_sched, cached_goal_vec
         nonlocal _avoid_bias_wz, _rescan_local_steps
@@ -1429,7 +1617,7 @@ def run_fancy_rollout(
             return 4  # REACH
         return 3 if _active_cam == 'PROXIMITY' else 2  # HANDOFF vs WALK
 
-    def _update_bev_cam():
+    def _update_bev_cam() -> None:
         """Follow robot with BEV camera."""
         bxy = data_mj.qpos[0:2]
         bev_cam.lookat[:] = [bxy[0], bxy[1], BEV_LOOKAT_Z]
@@ -1437,7 +1625,7 @@ def run_fancy_rollout(
         bev_cam.azimuth   = BEV_AZIMUTH
         bev_cam.elevation = BEV_ELEVATION
 
-    def _render_sbs_frame():
+    def _render_sbs_frame() -> tuple[np.ndarray, float]:
         """Render ACTIVE-camera ego feed + BEV + overlays → SBS frame."""
         yaw_now = _yaw_of(data_mj.qpos[3:7])
         rxy     = data_mj.qpos[0:2].copy()
@@ -1976,8 +2164,8 @@ def run_fancy_rollout(
 # OTHER words in the clause match each candidate's attributes, tie -> one-line
 # clarification question; zero candidates -> "no <X> in this scene" + inventory.
 
-_ALL_COLORS = ["red", "yellow", "blue", "green", "orange", "purple", "cyan"]
-_ALL_SHAPES = RELIABLE_SHAPES  # ["ball", "cube", "cylinder", "cone"] -- full shape set
+_ALL_COLORS: list[str] = ["red", "yellow", "blue", "green", "orange", "purple", "cyan"]
+_ALL_SHAPES: list[str] = RELIABLE_SHAPES  # ["ball", "cube", "cylinder", "cone"] -- full shape set
 
 
 def _split_multi_goal_parts(instruction: str) -> List[str]:
@@ -1992,8 +2180,7 @@ def _split_multi_goal_parts(instruction: str) -> List[str]:
 
 
 def _extract_goal_hint(part: str) -> dict:
-    """
-    Extract a best-effort (color, shape) hint from one instruction clause.
+    """Extract a best-effort (color, shape) hint from one instruction clause.
 
     Scans the whole clause for known color/shape words (order-independent --
     handles "red ball", "the ball that is red", "red-colored ball", etc.) rather
@@ -2001,6 +2188,14 @@ def _extract_goal_hint(part: str) -> dict:
     when exactly one candidate word of that kind is present in the clause;
     `colors_mentioned`/`shapes_mentioned` keep the full sets for ambiguity
     scoring (see _resolve_goal_to_index).
+
+    Args:
+        part: One instruction clause (already split on then/and-then/etc.).
+
+    Returns:
+        Dict with keys `color` (str or None), `shape` (str or None),
+        `colors_mentioned` (set[str]), `shapes_mentioned` (set[str]), and
+        `prompt_part` (the stripped input clause).
     """
     part_l = part.lower()
     colors_mentioned = {c for c in _ALL_COLORS if re.search(r'\b' + c + r'\b', part_l)}
@@ -2015,14 +2210,21 @@ def _extract_goal_hint(part: str) -> dict:
 
 
 def _parse_multi_goal_fancy(instruction: str) -> List[dict]:
-    """
-    Rule-based multi-goal parser for fancy_demo (kept under its original name and
+    """Rule-based multi-goal parser for fancy_demo (kept under its original name and
     signature for backward compat). Splits on "then" conjunctions, extracts
     (color, shape) per part. Returns list of dicts: [{color, shape, prompt_part}, ...]
 
     NX-15: now implemented on top of _split_multi_goal_parts()/_extract_goal_hint()
     (the shared internals also used by resolve_live_instruction() below) instead of
     its own standalone regex -- same public contract as before.
+
+    Args:
+        instruction: Raw typed instruction, possibly compound (e.g. "find the
+            red ball then find the yellow cube").
+
+    Returns:
+        List of dicts [{color, shape, prompt_part}, ...], one per clause that
+        yielded at least one recognized color/shape word.
     """
     goals = []
     for part in _split_multi_goal_parts(instruction):
@@ -2034,13 +2236,19 @@ def _parse_multi_goal_fancy(instruction: str) -> List[dict]:
 
 
 def _resolve_goal_to_index(hint: dict, objects: List[dict]) -> tuple:
-    """
-    Resolve one (color, shape) hint against the current scene's object list.
+    """Resolve one (color, shape) hint against the current scene's object list.
 
-    Returns (obj_idx, clarify_question):
-      (idx, None)   -- unambiguous match (or unique best-attribute-match winner)
-      (None, msg)   -- ambiguous, msg is a one-line clarification question
-      (None, None)  -- no matching object in the scene
+    Args:
+        hint: One _extract_goal_hint() result (`color`, `shape`,
+            `colors_mentioned`, `shapes_mentioned`, `prompt_part`).
+        objects: The current scene's object list (`color_name`/`shape_name`/
+            `dist_from_robot` per object).
+
+    Returns:
+        Tuple (obj_idx, clarify_question):
+          (idx, None)   -- unambiguous match (or unique best-attribute-match winner)
+          (None, msg)   -- ambiguous, msg is a one-line clarification question
+          (None, None)  -- no matching object in the scene
     """
     color, shape = hint["color"], hint["shape"]
     if color is None and shape is None:
@@ -2077,20 +2285,24 @@ def _resolve_goal_to_index(hint: dict, objects: List[dict]) -> tuple:
 
 
 def resolve_live_instruction(instruction: str, scene_cfg: dict) -> dict:
-    """
-    NX-15: THE single shared instruction -> target resolver for both live entry
+    """NX-15: THE single shared instruction -> target resolver for both live entry
     points (_terminal_loop, Flask /execute). Never used by the scripted/headless
     entry points (run_smoke(), showcase/recording APIs), which continue to pass
     explicit scene_cfg['target_index'] values untouched -- that default remains
     ONLY the fallback for entry points that explicitly pass an index.
 
-    Returns a dict:
-      mode:            "single" | "multi" | "clarify" | "no_match" | "no_parse"
-      target_indices:  list[int]   resolved object indices, in goal order
-      goals:           list[{"color","shape","prompt_part"}]  resolved goal specs
-                        (color/shape are the ACTUAL matched object's attributes,
-                        not just the raw parsed hint)
-      message:         str or None  (clarify question / no-match / no-parse text)
+    Args:
+        instruction: Raw typed instruction, possibly compound.
+        scene_cfg: Current scene config dict (must contain `objects`).
+
+    Returns:
+        Dict with keys:
+          mode:            "single" | "multi" | "clarify" | "no_match" | "no_parse"
+          target_indices:  list[int]   resolved object indices, in goal order
+          goals:           list[{"color","shape","prompt_part"}]  resolved goal specs
+                           (color/shape are the ACTUAL matched object's attributes,
+                           not just the raw parsed hint)
+          message:         str or None  (clarify question / no-match / no-parse text)
     """
     objects = (scene_cfg or {}).get("objects", [])
     if not objects:
@@ -2139,30 +2351,48 @@ def resolve_live_instruction(instruction: str, scene_cfg: dict) -> dict:
 
 
 def run_fancy_rollout_multi(
-    inf,
+    inf: "Inferencer",
     goals: List[dict],           # [{color, shape, prompt_part}, ...]
     scene_cfg: dict,
     maxsteps: int = MAXSTEPS_FANCY,
     render_video: bool = True,
     video_path: Optional[str] = None,
-    frame_callback=None,
+    frame_callback: "Callable[..., None] | None" = None,
     # VF-1 item 5: title card params, forwarded to the FIRST sub-goal's
     # run_fancy_rollout() call (which is the only one that renders a title card).
     scenario_title: str = "G1Nav Autonomous Fetch",
 ) -> dict:
-    """
-    Execute sequential sub-goals on the SAME scene.
+    """Execute sequential sub-goals on the SAME scene.
+
     For each sub-goal:
       - Sets scene target_index to the matching object
       - Runs run_fancy_rollout() with path_trail carried over
       - BEV shows current target ring + completed target dots + goal N/M banner
 
-    Returns combined dict with per-goal results + overall success.
+    Args:
+        inf: Inferencer instance (goal_source='classical').
+        goals: List of dicts [{color, shape, prompt_part}, ...], in the order
+            the sub-goals should be pursued.
+        scene_cfg: Scene config dict shared by all sub-goals (only
+            `target_index` is overridden per sub-goal).
+        maxsteps: Hard step cap forwarded to each sub-goal's run_fancy_rollout().
+        render_video: Whether to render ego|BEV SBS frames at all.
+        video_path: Output MP4 path for the combined multi-goal video, or None
+            to skip writing one.
+        frame_callback: Optional callable forwarded to each sub-goal's
+            run_fancy_rollout(), invoked each rendered step with
+            (sbs_bgr, state, dist, step).
+        scenario_title: Scenario name shown on the VF-1 title card, forwarded
+            to the FIRST sub-goal's run_fancy_rollout() call.
+
+    Returns:
+        Dict with keys: success (overall), n_goals, goal_results (per-goal
+        result dicts), total_steps, video_path, frames_count.
     """
     n_goals = len(goals)
     objects = scene_cfg["objects"]
 
-    def _find_obj(color, shape):
+    def _find_obj(color: str, shape: str) -> Optional[int]:
         """Find object index in scene by color+shape (first match)."""
         for i, o in enumerate(objects):
             if o["color_name"] == color and o["shape_name"] == shape:
@@ -2298,7 +2528,7 @@ def run_fancy_rollout_multi(
 # Video writer
 # ---------------------------------------------------------------------------
 
-def _write_fancy_video(frames: list, path: str, fps: int = 25) -> str:
+def _write_fancy_video(frames: list[np.ndarray], path: str, fps: int = 25) -> str:
     """Write ego|BEV SBS frames to MP4. Returns path."""
     import cv2
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -2314,7 +2544,7 @@ def _write_fancy_video(frames: list, path: str, fps: int = 25) -> str:
     return path
 
 
-def _concat_reel(video_paths: list, reel_path: str) -> Optional[str]:
+def _concat_reel(video_paths: list[str], reel_path: str) -> Optional[str]:
     """Concatenate multiple MP4s into a showcase reel."""
     import cv2
     valid = [p for p in video_paths if p and os.path.isfile(p)]
@@ -2353,14 +2583,19 @@ def _concat_reel(video_paths: list, reel_path: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def sample_fancy_scene(rng: np.random.Generator, ep_idx: int) -> dict:
-    """
-    Sample a search scene with:
+    """Sample a search scene with:
     - Target OUTSIDE initial FOV (bearing > 45° from robot_yaw=0)
     - RELIABLE colors biased: orange, red, yellow, purple (avoid cyan/blue HSV wall collision)
     - Distance 2-4m (easy enough to reach but shows search phase)
     - Multiple objects placed non-overlapping
 
-    Returns scene_cfg dict compatible with run_fancy_rollout.
+    Args:
+        rng: NumPy random generator used for all sampling.
+        ep_idx: Episode index (unused directly here; kept for interface
+            parity with the other sample_fancy_* functions).
+
+    Returns:
+        scene_cfg dict compatible with run_fancy_rollout.
     """
     from code.arena import COLORS, SHAPES
     from code.eval_search import SEARCH_FOV_HALF_DEG, SEARCH_DIST_MIN, SEARCH_DIST_MAX
@@ -2497,8 +2732,7 @@ def sample_fancy_scene(rng: np.random.Generator, ep_idx: int) -> dict:
 def sample_fancy_scene_long(rng: np.random.Generator, ep_idx: int,
                              dist_min: float = DIST_MIN_LONG,
                              dist_max: float = DIST_MAX_LONG) -> dict:
-    """
-    Sample a long-distance search scene:
+    """Sample a long-distance search scene:
     - Target OUTSIDE initial FOV (bearing > 45° from robot_yaw=0)
     - RELIABLE colors ONLY: red, orange, yellow, purple
       (grounding_dist.md: 78% success at 4-9m for non-cyan/blue)
@@ -2507,6 +2741,16 @@ def sample_fancy_scene_long(rng: np.random.Generator, ep_idx: int,
     - Robot near origin (robot_xy ≈ 0)
 
     FD2: biases toward MEDIUM-LONG distances to make the reel impressive.
+
+    Args:
+        rng: NumPy random generator used for all sampling.
+        ep_idx: Episode index (unused directly here; kept for interface
+            parity with the other sample_fancy_* functions).
+        dist_min: Minimum target distance in meters.
+        dist_max: Maximum target distance in meters.
+
+    Returns:
+        scene_cfg dict compatible with run_fancy_rollout.
     """
     from code.arena import COLORS, SHAPES
     from code.eval_search import SEARCH_FOV_HALF_DEG
@@ -2635,12 +2879,16 @@ def sample_fancy_scene_long(rng: np.random.Generator, ep_idx: int,
 
 
 def sample_fancy_multi_goal_scene(rng: np.random.Generator, n_goals: int = 2) -> dict:
-    """
-    Sample a scene with n_goals objects at varied distances (2–6m), each
+    """Sample a scene with n_goals objects at varied distances (2–6m), each
     a distinct reliable color+shape. Robot at origin, yaw=0.
 
-    Returns scene_cfg; target_index=0 (first object is 1st sub-goal).
-    Multi-goal rollout iterates target_index across 0..n_goals-1.
+    Args:
+        rng: NumPy random generator used for all sampling.
+        n_goals: Number of distinct (color, shape) sub-goal objects to place.
+
+    Returns:
+        scene_cfg dict; target_index=0 (first object is 1st sub-goal).
+        Multi-goal rollout iterates target_index across 0..n_goals-1.
     """
     from code.arena import COLORS, SHAPES
     from code.eval_search import SEARCH_FOV_HALF_DEG
@@ -2768,10 +3016,10 @@ def sample_fancy_multi_goal_scene(rng: np.random.Generator, n_goals: int = 2) ->
 # ---------------------------------------------------------------------------
 # Shared stream state (for Flask MJPEG)
 # ---------------------------------------------------------------------------
-_stream_lock  = threading.Lock()
-_stream_frame = [None]    # bytes: latest MJPEG JPEG frame
-_status_lock  = threading.Lock()
-_status_state = {
+_stream_lock: threading.Lock = threading.Lock()
+_stream_frame: list[Optional[bytes]] = [None]    # bytes: latest MJPEG JPEG frame
+_status_lock: threading.Lock = threading.Lock()
+_status_state: dict[str, Any] = {
     "state": STATE_IDLE,
     "prompt": "",
     "dist": None,
@@ -2781,7 +3029,7 @@ _status_state = {
 }
 
 
-def _set_stream_frame(bgr_frame):
+def _set_stream_frame(bgr_frame: np.ndarray) -> None:
     """Encode BGR numpy frame to JPEG bytes and push to stream."""
     try:
         import cv2
@@ -2793,6 +3041,7 @@ def _set_stream_frame(bgr_frame):
 
 
 def _placeholder_frame(state: str = STATE_IDLE, prompt: str = "") -> bytes:
+    """Render a placeholder JPEG frame shown before the first rollout frame arrives."""
     try:
         import cv2
         img = np.zeros((BEV_H, STREAM_W + 3, 3), dtype=np.uint8)
@@ -3034,15 +3283,29 @@ poll();
 
 
 def _start_fancy_web_ui(
-    inf,
-    scene_manager,
+    inf: "Inferencer",
+    scene_manager: "FancySceneManager",
     out_dir: str,
     port: int = WEB_PORT,
     maxsteps: int = MAXSTEPS_FANCY,
     render_video: bool = True,
     scenario_title: str = "G1Nav Autonomous Fetch",
-):
-    """Start Flask web UI for fancy demo in a background thread."""
+) -> Optional[threading.Thread]:
+    """Start Flask web UI for fancy demo in a background thread.
+
+    Args:
+        inf: Inferencer instance (goal_source='classical').
+        scene_manager: FancySceneManager instance holding the current scene.
+        out_dir: Output directory for per-rollout MP4s.
+        port: TCP port to serve the Flask app on.
+        maxsteps: Hard step cap forwarded to each rollout.
+        render_video: Whether to render ego|BEV SBS frames at all.
+        scenario_title: Scenario name shown on the VF-1 title card.
+
+    Returns:
+        The daemon thread running the Flask app, or None if Flask isn't
+        installed.
+    """
     try:
         from flask import Flask, Response, request, jsonify, render_template_string
     except ImportError:
@@ -3054,7 +3317,7 @@ def _start_fancy_web_ui(
     _exec_lock   = threading.Lock()
     _exec_thread = [None]
 
-    def _scene_desc():
+    def _scene_desc() -> str:
         # NX-15: no more "<TARGET" marker -- the sampler's target_index is only a
         # fallback default for scripted/headless callers; in live mode the real
         # target is whatever object the typed instruction resolves to, so marking
@@ -3068,7 +3331,7 @@ def _start_fancy_web_ui(
                          f"dist={o['dist_from_robot']:.2f}m")
         return "\n".join(lines)
 
-    def _do_rollout(instruction: str, parsed: dict):
+    def _do_rollout(instruction: str, parsed: dict) -> None:
         """Run the rollout for an already-parsed+resolved instruction (see the
         /execute route below, which does the NX-15 parsing/resolution
         synchronously before launching this thread)."""
@@ -3086,7 +3349,7 @@ def _start_fancy_web_ui(
             _status_state['prompt'] = prompt
             _status_state['result'] = None
 
-        def _cb(frame_bgr, state, dist, step):
+        def _cb(frame_bgr: np.ndarray, state: str, dist: Optional[float], step: int) -> None:
             with _status_lock:
                 _status_state['state'] = state
                 _status_state['dist']  = dist
@@ -3156,20 +3419,20 @@ def _start_fancy_web_ui(
             _status_state['scene_desc'] = _scene_desc()
 
     @app.route("/")
-    def index():
+    def index() -> str:
         return render_template_string(_HTML_FANCY)
 
     @app.route("/scene_info")
-    def scene_info():
+    def scene_info() -> Response:
         return jsonify({"scene_desc": _scene_desc()})
 
     @app.route("/new_scene", methods=["POST"])
-    def new_scene():
+    def new_scene() -> Response:
         scene_manager.new_scene()
         return jsonify({"scene_desc": _scene_desc()})
 
     @app.route("/execute", methods=["POST"])
-    def execute():
+    def execute() -> Any:
         if _exec_thread[0] and _exec_thread[0].is_alive():
             return jsonify({"error": "Execution in progress"}), 429
         data        = request.get_json() or {}
@@ -3204,15 +3467,15 @@ def _start_fancy_web_ui(
                          "mode": parsed["mode"], "targets": targets})
 
     @app.route("/status")
-    def status():
+    def status() -> Response:
         with _status_lock:
             st = dict(_status_state)
         st['scene_desc'] = _scene_desc()
         return jsonify(st)
 
     @app.route("/stream")
-    def stream():
-        def gen():
+    def stream() -> Response:
+        def gen() -> "Iterator[bytes]":
             while True:
                 with _stream_lock:
                     frame = _stream_frame[0]
@@ -3227,7 +3490,7 @@ def _start_fancy_web_ui(
                 time.sleep(0.08)  # ~12 fps stream cap
         return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    def _run_flask():
+    def _run_flask() -> None:
         import logging
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
@@ -3244,7 +3507,7 @@ def _start_fancy_web_ui(
 class FancySceneManager:
     """Manages the current fancy search scene."""
 
-    def __init__(self, seed_offset: int = 0):
+    def __init__(self, seed_offset: int = 0) -> None:
         self.seed_offset = seed_offset
         self._ep_count   = 0
         self._scene_cfg  = None
@@ -3259,6 +3522,14 @@ class FancySceneManager:
         the post-rollout auto-resample, terminal 'new') is untouched and
         keeps drawing from the original random sequence -- only this one
         fixed first draw needed curating.
+
+        Args:
+            long_dist: Whether to sample from the long-distance (4-7m)
+                scene distribution (sample_fancy_scene_long) instead of the
+                shorter-range one (sample_fancy_scene).
+
+        Returns:
+            The newly sampled scene_cfg dict (also stored on `self._scene_cfg`).
         """
         if self._ep_count == 0:
             seed_seq = np.random.SeedSequence([FIRST_SCENE_SEED, 0])
@@ -3279,9 +3550,9 @@ class FancySceneManager:
         return self._scene_cfg
 
     @property
-    def _scene_cfg(self): return self.__scene_cfg
+    def _scene_cfg(self) -> Optional[dict]: return self.__scene_cfg
     @_scene_cfg.setter
-    def _scene_cfg(self, v): self.__scene_cfg = v
+    def _scene_cfg(self, v: Optional[dict]) -> None: self.__scene_cfg = v
 
 
 # ---------------------------------------------------------------------------
@@ -3295,9 +3566,8 @@ def run_smoke(
     render_video: bool = True,
     n_episodes: int = 6,
     scenario_title: str = "G1Nav Autonomous Fetch",
-):
-    """
-    FD2 Headless smoke: LONG-DISTANCE search episodes + multi-goal, saved as MP4s.
+) -> tuple[list[dict], Optional[str]]:
+    """FD2 Headless smoke: LONG-DISTANCE search episodes + multi-goal, saved as MP4s.
 
     Episode plan (default n=6):
       ep0: long single-goal search (4-7m)
@@ -3308,6 +3578,21 @@ def run_smoke(
       ep5: MULTI-GOAL (2 sub-goals, different reliable colors)
 
     Only SUCCESS episodes go into the showcase reel (fail-filtered).
+
+    Args:
+        out_dir: Output directory for per-episode MP4s + the showcase reel.
+        ckpt_path: Goto/search checkpoint path passed to Inferencer.
+        device: Torch device string ("cpu" or "cuda").
+        maxsteps: Hard step cap forwarded to each episode's rollout.
+        render_video: Whether to render ego|BEV SBS frames at all.
+        n_episodes: Number of smoke episodes to run (last one is multi-goal
+            when n_episodes >= 2).
+        scenario_title: Scenario name shown on each episode's VF-1 title card.
+
+    Returns:
+        Tuple (summary, reel_path): `summary` is the list of per-episode
+        result dicts; `reel_path` is the showcase reel's MP4 path, or None
+        if no episode produced a video.
     """
     from code.inferencer import Inferencer
 
@@ -3539,7 +3824,9 @@ def run_smoke(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """CLI entry point: dispatches to the headless smoke test, the Flask web
+    UI, or the interactive terminal loop, based on the parsed arguments."""
     parser = argparse.ArgumentParser(description="G1Nav Fancy Demo")
     parser.add_argument("--smoke",     action="store_true", help="Headless smoke test")
     parser.add_argument("--web",       action="store_true", help="Flask web UI")
@@ -3610,8 +3897,14 @@ def main():
                        scenario_title=args.scenario_title)
 
 
-def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video,
-                   scenario_title: str = "G1Nav Autonomous Fetch"):
+def _terminal_loop(
+    inf: "Inferencer",
+    scene_mgr: "FancySceneManager",
+    out_dir: str,
+    maxsteps: int,
+    render_video: bool,
+    scenario_title: str = "G1Nav Autonomous Fetch",
+) -> None:
     """Simple terminal loop."""
     print("\n" + "=" * 60, flush=True)
     print("G1Nav Fancy Demo — Terminal Mode", flush=True)
@@ -3717,7 +4010,8 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video,
         _concat_reel(vid_paths, reel)
 
 
-def _has_cuda():
+def _has_cuda() -> bool:
+    """Return True if a CUDA device is available to torch, else False."""
     try:
         import torch
         return torch.cuda.is_available()

@@ -17,9 +17,9 @@ Usage:
     # stats = {'mean': (15,), 'std': (15,), 'default_angles': (15,)}
 """
 from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -37,27 +37,29 @@ STD_FLOOR = 1e-3
 def compute_action_stats(
     repo_path: str,
     train_fraction: float = 0.9,
-    stats_path: Optional[str] = None,
+    stats_path: str | None = None,
     verbose: bool = True,
 ) -> dict:
-    """
-    Scan the parquet training split and compute per-joint delta statistics.
+    """Scan the parquet training split and compute per-joint delta statistics.
 
-    Parameters
-    ----------
-    repo_path      : path to dataset directory (easy_train80, etc.)
-    train_fraction : fraction of episodes used for training (same as training split)
-    stats_path     : if provided, save JSON to this path
-    verbose        : print progress
+    Args:
+        repo_path: Path to dataset directory (easy_train80, etc.).
+        train_fraction: Fraction of episodes used for training (same as
+            training split).
+        stats_path: If provided, save JSON to this path.
+        verbose: Print progress.
 
-    Returns
-    -------
-    dict with keys:
-        'mean'           : np.float32 (15,)  per-joint mean of delta
-        'std'            : np.float32 (15,)  per-joint std  of delta (floored at STD_FLOOR)
-        'default_angles' : np.float32 (15,)  default pose used
-        'n_frames'       : int               total frames scanned
-        'repo_path'      : str
+    Returns:
+        dict with keys:
+            'mean'           : np.float32 (15,)  per-joint mean of delta
+            'std'            : np.float32 (15,)  per-joint std  of delta (floored at STD_FLOOR)
+            'default_angles' : np.float32 (15,)  default pose used
+            'n_frames'       : int               total frames scanned
+            'repo_path'      : str
+
+    Raises:
+        FileNotFoundError: If no episodes are found in `repo_path`.
+        RuntimeError: If no valid parquet files are found in the training split.
     """
     import pandas as pd
 
@@ -150,7 +152,15 @@ def compute_action_stats(
 
 
 def load_action_stats(stats_path: str) -> dict:
-    """Load stats JSON and return arrays as np.float32."""
+    """Load stats JSON and return arrays as np.float32.
+
+    Args:
+        stats_path: Path to a JSON file previously saved by `compute_action_stats`.
+
+    Returns:
+        dict with 'mean', 'std', 'default_angles' (np.float32 arrays), plus
+        'n_frames' (int) and 'repo_path' (str).
+    """
     with open(stats_path) as f:
         raw = json.load(f)
     return {
@@ -163,10 +173,23 @@ def load_action_stats(stats_path: str) -> dict:
 
 
 def stats_from_checkpoint(ckpt: dict) -> dict:
-    """Extract action stats from a checkpoint dict (saved by train_gaitfix.py)."""
+    """Extract action stats from a checkpoint dict (saved by train_gaitfix.py).
+
+    Args:
+        ckpt: Checkpoint dict as produced by train_gaitfix.py.
+
+    Returns:
+        dict with 'mean', 'std', 'default_angles' (np.float32 arrays) and
+        'n_frames' (int).
+
+    Raises:
+        KeyError: If `ckpt` has no 'action_stats' entry (or it lacks 'mean'),
+            i.e. it was not trained with train_gaitfix.py.
+    """
     meta = ckpt.get('action_stats', {})
     if not meta or 'mean' not in meta:
-        raise KeyError("Checkpoint does not contain 'action_stats' — was it trained with train_gaitfix.py?")
+        raise KeyError(
+            "Checkpoint does not contain 'action_stats' — was it trained with train_gaitfix.py?")
     return {
         'mean':           np.array(meta['mean'],           dtype=np.float32),
         'std':            np.array(meta['std'],            dtype=np.float32),

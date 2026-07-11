@@ -23,21 +23,23 @@ Instruction template: "{go to|walk to|approach|head to} the {color} {shape}"
 """
 
 import math
+import os as _os
+import sys
+
 import numpy as np
 
-import sys, os as _os
 sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from code.arena import COLORS, SHAPES
 
 # ---------------------------------------------------------------------------
 # Instruction vocabulary
 # ---------------------------------------------------------------------------
-_VERBS = [
+_VERBS: list[str] = [
     "go to", "walk to", "approach", "head to",
     "head over to", "move to", "navigate to",
     "make your way to", "get to", "proceed to",
 ]
-_TEMPLATES = [
+_TEMPLATES: list[str] = [
     "{v} the {c} {s}",
     "{v} the {s} that is {c}",
     "{v} the {c}-colored {s}",
@@ -48,6 +50,7 @@ _TEMPLATES = [
 ]
 
 def _make_instruction(rng: np.random.Generator, color: str, shape: str) -> str:
+    """Render a random instruction template for the given target color/shape."""
     tpl = _TEMPLATES[int(rng.integers(len(_TEMPLATES)))]
     verb = _VERBS[int(rng.integers(len(_VERBS)))]
     return tpl.format(v=verb, c=color, s=shape)
@@ -56,7 +59,7 @@ def _make_instruction(rng: np.random.Generator, color: str, shape: str) -> str:
 # ---------------------------------------------------------------------------
 # Per-difficulty defaults
 # ---------------------------------------------------------------------------
-DIFFICULTY_PRESETS = {
+DIFFICULTY_PRESETS: dict[str, dict] = {
     "easy": dict(
         arena_half    = 4.0,      # half-side of square arena (m)
         n_objects     = 3,
@@ -93,27 +96,27 @@ DIFFICULTY_PRESETS = {
 # Main sampler
 # ---------------------------------------------------------------------------
 def sample_scene(rng: np.random.Generator, difficulty: str = "easy") -> dict:
-    """
-    Sample a deterministic scene configuration.
+    """Sample a deterministic scene configuration.
 
-    Parameters
-    ----------
-    rng        : np.random.Generator  (caller-owned, advances state)
-    difficulty : "easy" | "demo"
+    Args:
+        rng: Caller-owned RNG; advances state.
+        difficulty: One of "easy" | "demo".
 
-    Returns
-    -------
-    dict with keys:
-        arena_size      : float  (half-side, m)
-        robot_xy        : (float, float)
-        robot_yaw       : float  (rad)
-        objects         : list of object dicts
-        target_index    : int    (index into objects)
-        instruction     : str
-        stop_r          : float
-        horizon         : int
-        lighting        : dict  {"ambient": float}
-        difficulty      : str
+    Returns:
+        dict with keys:
+            arena_size      : float  (half-side, m)
+            robot_xy        : (float, float)
+            robot_yaw       : float  (rad)
+            objects         : list of object dicts
+            target_index    : int    (index into objects)
+            instruction     : str
+            stop_r          : float
+            horizon         : int
+            lighting        : dict  {"ambient": float}
+            difficulty      : str
+
+    Raises:
+        ValueError: If `difficulty` is not a known preset.
     """
     if difficulty not in DIFFICULTY_PRESETS:
         raise ValueError(f"Unknown difficulty {difficulty!r}. Choose from {list(DIFFICULTY_PRESETS)}")
@@ -165,15 +168,16 @@ def sample_scene(rng: np.random.Generator, difficulty: str = "easy") -> dict:
     # ---- Place objects ----
     objects = []
 
-    def _in_bounds(x, y, size):
+    def _in_bounds(x: float, y: float, size: float) -> bool:
         hs = size / 2.0
         return (abs(x) + hs + margin < arena_half and
                 abs(y) + hs + margin < arena_half)
 
-    def _no_overlap(x, y, placed, min_d):
+    def _no_overlap(x: float, y: float, placed: list[dict], min_d: float) -> bool:
         return all(math.hypot(x - o["x"], y - o["y"]) >= min_d for o in placed)
 
-    def _in_fov(x, y, robot_x, robot_y, robot_yaw_rad, half_deg):
+    def _in_fov(x: float, y: float, robot_x: float, robot_y: float,
+                robot_yaw_rad: float, half_deg: float) -> bool:
         dx, dy = x - robot_x, y - robot_y
         angle  = math.atan2(dy, dx)
         err    = math.atan2(math.sin(angle - robot_yaw_rad),

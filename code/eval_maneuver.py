@@ -47,7 +47,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -94,18 +93,30 @@ class ManeuverResult:
     final_state:        int     # FSM state at end
     ms_per_step:        float
     scene_cfg:          dict = field(default_factory=dict)
-    video_path:         Optional[str] = None
+    video_path:         str | None = None
 
 
 def _build_proprio_maneuver(data_mj: mujoco.MjData,
                              prev_action: np.ndarray,
                              phase_tracker: GaitPhaseTracker,
                              priv: dict) -> np.ndarray:
-    """
-    Build 62-d maneuver proprio:
+    """Build 62-d maneuver proprio.
+
+    Layout:
       [0:55]  base proprio
       [55:57] gait phase [sin, cos]
       [57:62] maneuver features [subgoal_norm, cos_target, sin_target, heading_err_norm, lm_passed]
+
+    Args:
+        data_mj: MuJoCo sim data to read qpos/qvel from.
+        prev_action: Previous step's target DOF vector, folded into the base
+            proprio.
+        phase_tracker: Gait phase tracker providing [sin, cos] phase features.
+        priv: Privileged maneuver state dict (subgoal_index, cos_target,
+            sin_target, heading_err, landmark_passed) from the FSM expert.
+
+    Returns:
+        Concatenated (62,) float32 proprio vector.
     """
     # Base 55-d
     p = np.empty(PROPRIO_DIM_BASE, dtype=np.float32)
@@ -133,7 +144,8 @@ def _build_proprio_maneuver(data_mj: mujoco.MjData,
     return np.concatenate([p, ph, man])   # (62,)
 
 
-def _apply_student_pd(data_mj: mujoco.MjData, target_dof: np.ndarray, nj: int):
+def _apply_student_pd(data_mj: mujoco.MjData, target_dof: np.ndarray, nj: int) -> None:
+    """Apply PD control torques toward target_dof, writing into data_mj.ctrl."""
     leg_tau = (
         (target_dof - data_mj.qpos[7:7 + NUM_ACTIONS]) * KPS
         + (0.0 - data_mj.qvel[6:6 + NUM_ACTIONS]) * KDS
@@ -154,14 +166,34 @@ def run_maneuver_rollout(
     scene_cfg:   dict,
     maxsteps:    int  = 1400,
     render_video: bool = False,
-    video_path:  Optional[str] = None,
-    vis_pooled_cache: Optional[torch.Tensor] = None,  # pre-computed TinyViT pooled (B=1, vit_dim)
+    video_path:  str | None = None,
+    vis_pooled_cache: torch.Tensor | None = None,  # pre-computed TinyViT pooled (B=1, vit_dim)
     free_vel:    bool = False,  # if True, use model's predicted vel (no teacher forcing)
     hybrid_vel:  bool = False,  # if True, TF only during TURN_PHASE (subgoal=1), free otherwise
 ) -> ManeuverResult:
     """Run one maneuver episode in closed-loop.
 
-    vis_pooled_cache: precomputed TinyViT output for zero image (speeds up CPU eval by ~2x).
+    Args:
+        model: GroundedNav student model to roll out.
+        action_stats: Dict with 'mean'/'std'/'default_angles' for de-normalizing
+            residual actions, or None to use raw model output.
+        device: Torch device to run inference on.
+        scene_cfg: Scene configuration (robot pose, landmark, objects, etc.)
+            from sample_maneuver_scene.
+        maxsteps: Maximum number of control steps before terminating.
+        render_video: Whether to render ego/third-person frames for video.
+        video_path: Output path for the rendered video, or None to skip
+            writing (still requires render_video=True to collect frames).
+        vis_pooled_cache: Precomputed TinyViT output for a zero image (speeds
+            up CPU eval by ~2x by bypassing the vision tower).
+        free_vel: If True, always use the model's predicted velocity (no
+            teacher forcing).
+        hybrid_vel: If True, teacher-force velocity only during TURN_PHASE
+            (subgoal_index == 1) and use the model's prediction otherwise.
+
+    Returns:
+        ManeuverResult summarizing success, failure tag, steps, and final
+        state for the episode.
     """
 
     # Build arena
@@ -381,7 +413,13 @@ def run_maneuver_rollout(
     )
 
 
-def _write_video(frames_ego, frames_tp, out_path, fps=50):
+def _write_video(
+    frames_ego: list[np.ndarray],
+    frames_tp: list[np.ndarray],
+    out_path: str,
+    fps: int = 50,
+) -> None:
+    """Write ego (optionally side-by-side with third-person) frames to an mp4."""
     try:
         import imageio.v2 as imageio
     except ImportError:
@@ -419,10 +457,30 @@ def evaluate_maneuver(
     free_vel: bool = False,   # if True, use model's predicted vel (no teacher forcing)
     hybrid_vel: bool = False, # if True, TF only during TURN_PHASE, free otherwise
 ) -> dict:
-    """
-    Run maneuver evaluation.
+    """Run maneuver evaluation.
 
-    Returns summary dict with success_rate, failure tag breakdown, etc.
+    Args:
+        checkpoint_path: Path to the .pt checkpoint to evaluate.
+        n_scenes: Number of held-out scenes to evaluate.
+        seed: Eval seed (default=999, held-out).
+        device_str: Torch device string ('cpu' or 'cuda').
+        out_dir: Output directory for videos, incremental results, and the
+            summary JSON.
+        render_n: Number of successful episodes to re-render as video.
+        smoke: If True, run a single episode with smoke_steps as the cap.
+        smoke_steps: Step cap used when smoke=True.
+        free_vel: If True, use the model's predicted velocity (no teacher
+            forcing).
+        hybrid_vel: If True, teacher-force velocity only during TURN_PHASE,
+            free otherwise.
+
+    Returns:
+        Summary dict with success_rate, failure tag breakdown, mean steps,
+        etc. (also written to out_dir/summary.json).
+
+    Raises:
+        FileNotFoundError: If checkpoint_path does not point to an existing
+            file.
     """
     device = torch.device(device_str)
     os.makedirs(out_dir, exist_ok=True)
@@ -617,7 +675,8 @@ def evaluate_maneuver(
     return summary
 
 
-def main():
+def main() -> None:
+    """Parse CLI arguments and run the maneuver evaluation."""
     ap = argparse.ArgumentParser(description="Maneuver skill evaluator")
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--n',          type=int,   default=15)

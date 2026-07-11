@@ -84,13 +84,13 @@ import math
 # ---------------------------------------------------------------------------
 # Shared constants (importable by eval_search.py / fancy_demo.py / demo.py)
 # ---------------------------------------------------------------------------
-SCAN_LEG_DEG      = 165.0   # max continuous same-direction rotation per leg (deg)
-SCAN_DWELL_STEPS  = 45      # stand-still steps between legs (in-distribution dwell;
-                             # upper end of the suggested 30-50 range, for extra
-                             # re-stabilization margin at the scan-exit handoff)
-SCAN_TIMEOUT      = 1150    # hard step cap (safety net; nominal full coverage pass
-                             # completes in ~810 steps at SCAN_RATE=0.6 -- see above --
-                             # with margin for observed real-world rotation lag)
+SCAN_LEG_DEG: float = 165.0     # max continuous same-direction rotation per leg (deg)
+SCAN_DWELL_STEPS: int = 45      # stand-still steps between legs (in-distribution dwell;
+                                # upper end of the suggested 30-50 range, for extra
+                                # re-stabilization margin at the scan-exit handoff)
+SCAN_TIMEOUT: int = 1150        # hard step cap (safety net; nominal full coverage pass
+                                # completes in ~810 steps at SCAN_RATE=0.6 -- see above --
+                                # with margin for observed real-world rotation lag)
 
 # Leg direction pattern, repeating every 4 legs: CCW, CW, CW, CCW, CCW, CW, CW, ...
 # leg 0: 0 -> +LEG_DEG        (CCW)
@@ -98,7 +98,7 @@ SCAN_TIMEOUT      = 1150    # hard step cap (safety net; nominal full coverage p
 # leg 2: 0 -> -LEG_DEG        (CW)   /  +LEG_DEG down to -LEG_DEG, split into
 #                                       two capped legs by the leg1/leg2 dwell
 # leg 3: -LEG_DEG -> 0        (CCW)  (repeat, extra passes if not yet found)
-_LEG_SIGNS = (+1, -1, -1, +1)
+_LEG_SIGNS: tuple[int, int, int, int] = (+1, -1, -1, +1)
 
 
 class BidirectionalScanSchedule:
@@ -114,7 +114,14 @@ class BidirectionalScanSchedule:
     """
 
     def __init__(self, scan_rate: float = 0.6, leg_deg: float = SCAN_LEG_DEG,
-                 dwell_steps: int = SCAN_DWELL_STEPS):
+                 dwell_steps: int = SCAN_DWELL_STEPS) -> None:
+        """Initialize the schedule.
+
+        Args:
+            scan_rate: Commanded yaw rate magnitude (rad/s) while rotating.
+            leg_deg: Max continuous same-direction rotation per leg (deg).
+            dwell_steps: Stand-still steps between legs.
+        """
         self.scan_rate   = scan_rate
         self.leg_deg     = leg_deg
         self.dwell_steps = dwell_steps
@@ -127,7 +134,14 @@ class BidirectionalScanSchedule:
         self._prev_yaw       = None  # last raw yaw (rad) seen, for delta integration
 
     def step(self, current_yaw_rad: float) -> float:
-        """Advance the schedule by one step; return commanded wz (rad/s)."""
+        """Advance the schedule by one step.
+
+        Args:
+            current_yaw_rad: Robot's current world yaw (radians).
+
+        Returns:
+            Commanded wz (rad/s) for this step.
+        """
         if self._prev_yaw is not None:
             dyaw = current_yaw_rad - self._prev_yaw
             dyaw = math.atan2(math.sin(dyaw), math.cos(dyaw))  # wrap to (-pi, pi]
@@ -153,8 +167,10 @@ class BidirectionalScanSchedule:
 
     @property
     def leg_idx(self) -> int:
+        """Index of the current (or most recently started) leg."""
         return self._leg_idx
 
     @property
     def is_dwelling(self) -> bool:
+        """True while the schedule is in a stand-still dwell between legs."""
         return self._dwelling

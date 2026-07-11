@@ -49,7 +49,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -90,6 +89,7 @@ SETTLE_STEPS       = 80       # warm-up steps using teacher (zero cmd)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
+    """Returns True iff environment variable `name` is set to the string "1"."""
     return os.environ.get(name, default).strip() == "1"
 
 
@@ -175,13 +175,19 @@ _LEFT_ANKLE_DEFAULT   = -0.2  # default angle (rad)
 # ---------------------------------------------------------------------------
 
 class _GaitPhaseTracker:
-    """
-    Tracks gait phase phi in [0, 2pi] from left ankle pitch zero-crossings.
+    """Tracks gait phase phi in [0, 2pi] from left ankle pitch zero-crossings.
+
     Returns (sin_phi, cos_phi) as a 2-d gait-phase encoding.
     Same implementation as gen_dart_dataset.py.
     """
 
-    def __init__(self, freq_hz: float = 1.8):
+    def __init__(self, freq_hz: float = 1.8) -> None:
+        """Initializes the tracker.
+
+        Args:
+            freq_hz: Nominal gait frequency (Hz) used to advance phase between
+                zero-crossings.
+        """
         self._phi: float = 0.0
         self._prev_q: float = 0.0
         self._initialized: bool = False
@@ -189,7 +195,14 @@ class _GaitPhaseTracker:
         self._dt = SIM_DT * CONTROL_DECIMATION   # 0.02 s
 
     def update(self, q_lb: np.ndarray) -> np.ndarray:
-        """q_lb: (15,) lower-body joint positions. Returns np.float32[2]."""
+        """Advances the phase estimate by one control step.
+
+        Args:
+            q_lb: (15,) lower-body joint positions.
+
+        Returns:
+            np.float32[2] array [sin(phi), cos(phi)].
+        """
         q_ankle = float(q_lb[_LEFT_ANKLE_PITCH_IDX]) - _LEFT_ANKLE_DEFAULT
         if not self._initialized:
             self._prev_q = q_ankle
@@ -209,14 +222,21 @@ class _GaitPhaseTracker:
 # ---------------------------------------------------------------------------
 
 def _build_proprio(data: mujoco.MjData, prev_action: np.ndarray) -> np.ndarray:
-    """
-    55-d proprio vector (exact layout from dataset.md / gen_dataset.py).
+    """Builds the 55-d proprio vector (exact layout from dataset.md / gen_dataset.py).
+
       [0:15]  lower-body joint positions
       [15:30] lower-body joint velocities
       [30:34] base IMU quaternion [w,x,y,z]
       [34:37] base angular velocity (rad/s)
       [37:40] base linear velocity (world frame)
       [40:55] prev_action (15 joint targets)
+
+    Args:
+        data: MuJoCo data holding the current physics state.
+        prev_action: (15,) previous step's joint targets.
+
+    Returns:
+        (55,) float32 proprio vector.
     """
     p = np.empty(PROPRIO_DIM, dtype=np.float32)
     p[0:15]  = data.qpos[7:22]
@@ -228,8 +248,14 @@ def _build_proprio(data: mujoco.MjData, prev_action: np.ndarray) -> np.ndarray:
     return p
 
 
-def _apply_student_pd(data: mujoco.MjData, target_dof: np.ndarray, nj: int):
-    """Apply PD torques from student joint targets (mirrored exactly from teacher.py)."""
+def _apply_student_pd(data: mujoco.MjData, target_dof: np.ndarray, nj: int) -> None:
+    """Applies PD torques from student joint targets (mirrored exactly from teacher.py).
+
+    Args:
+        data: MuJoCo data; `data.ctrl` is written in place.
+        target_dof: (NUM_ACTIONS,) commanded lower-body joint targets.
+        nj: Total number of actuated joints (lower-body + optional upper-body).
+    """
     leg_tau = (
         (target_dof - data.qpos[7:7 + NUM_ACTIONS]) * KPS
         + (0.0 - data.qvel[6:6 + NUM_ACTIONS]) * KDS
@@ -245,7 +271,7 @@ def _apply_student_pd(data: mujoco.MjData, target_dof: np.ndarray, nj: int):
 
 
 def _rgb_to_tensor(rgb: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Convert (H,W,3) uint8 RGB → (1,3,128,128) float32 [0,1] tensor."""
+    """Converts (H,W,3) uint8 RGB to a (1,3,128,128) float32 [0,1] tensor."""
     img = rgb.astype(np.float32) / 255.0
     if img.shape[0] != IMG_SIZE or img.shape[1] != IMG_SIZE:
         import cv2
@@ -255,16 +281,25 @@ def _rgb_to_tensor(rgb: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def _label_active_cam(rgb: np.ndarray, active_cam: str, dist: float,
-                      resize_to: Optional[Tuple[int, int]] = None) -> np.ndarray:
-    """
-    CAM-2 (Phase 1) demo visualization: overlay which grounding camera is currently
-    active + the EMA'd distance onto a video frame, so the GROUNDING<->PROXIMITY
-    handoff (docs/cam_opt2_multicam.md Schmitt trigger) is visible in rendered clips.
+                      resize_to: tuple[int, int] | None = None) -> np.ndarray:
+    """CAM-2 (Phase 1) demo visualization overlay.
+
+    Overlays which grounding camera is currently active + the EMA'd distance
+    onto a video frame, so the GROUNDING<->PROXIMITY handoff
+    (docs/cam_opt2_multicam.md Schmitt trigger) is visible in rendered clips.
     Video-only — never called on the numeric eval path (render_video=False there).
 
-    resize_to : optional (W,H) to resize BEFORE labeling (so the label stays a fixed
-                font size regardless of which camera's native resolution fed it —
-                the grounding cam is 480x360, the proximity cam 320x240).
+    Args:
+        rgb: (H,W,3) uint8 RGB frame to label.
+        active_cam: Name of the currently active camera (e.g. 'GROUNDING',
+            'PROXIMITY').
+        dist: EMA'd distance to target (m), shown in the overlay text.
+        resize_to: Optional (W,H) to resize BEFORE labeling (so the label stays
+            a fixed font size regardless of which camera's native resolution fed
+            it — the grounding cam is 480x360, the proximity cam 320x240).
+
+    Returns:
+        Labeled (H,W,3) uint8 RGB frame (resized if `resize_to` given).
     """
     import cv2
     out = rgb
@@ -286,6 +321,27 @@ def _label_active_cam(rgb: np.ndarray, active_cam: str, dist: float,
 
 @dataclass
 class RolloutResult:
+    """Outcome of one closed-loop `Inferencer.rollout()` episode.
+
+    Attributes:
+        success: True if the episode reached the target and stayed upright.
+        failure_tag: One of 'success'|'fall'|'didnt-reach'|'lost-target'|'wrong-object'.
+        steps: Number of student control steps executed.
+        final_dist: Final distance to target (m).
+        fell: True if the robot fell during the rollout.
+        upright: True if the robot ended the episode upright.
+        ms_per_step: Mean wall-clock time per control step (ms).
+        grounding_hz: Effective grounding update rate (Hz); 0.0 for arch 'C'.
+        goal_source: 'learned'|'classical'|'gt'.
+        vel_source: 'predicted'|'gt' — Fix 2 flag.
+        residual_action: True if checkpoint uses residual+standardized Fix 1.
+        action_osc_std: Per-step std of commanded joint motion (gait oscillation).
+        forward_disp: Forward displacement from start (m).
+        scene_cfg: Scene configuration this episode was rolled out on.
+        video_path: Path the rendered video was written to, if any.
+        stall_break_triggers: NX-8 STALL_BREAK trigger count this episode (0 when off).
+        avoid_bias_active_frac: NX-9 fraction of grounding cycles with |bias|>0 (0 when off).
+    """
     success:       bool
     failure_tag:   str    # 'success'|'fall'|'didnt-reach'|'lost-target'|'wrong-object'
     steps:         int
@@ -300,7 +356,7 @@ class RolloutResult:
     action_osc_std: float = 0.0      # per-step std of commanded joint motion (gait oscillation)
     forward_disp:  float = 0.0       # forward displacement from start (m)
     scene_cfg:     dict = field(default_factory=dict)
-    video_path:    Optional[str] = None
+    video_path:    str | None = None
     stall_break_triggers: int = 0    # NX-8: STALL_BREAK trigger count this episode (0 when off)
     avoid_bias_active_frac: float = 0.0  # NX-9: fraction of grounding cycles with |bias|>0 (0 when off)
 
@@ -310,13 +366,17 @@ class RolloutResult:
 # ---------------------------------------------------------------------------
 
 def _compute_gt_goal(data_mj: mujoco.MjData, target_xy: np.ndarray) -> np.ndarray:
-    """
-    Compute privileged GT goal (dist, cosθ, sinθ) from simulation state.
+    """Computes the privileged GT goal (dist, cosθ, sinθ) from simulation state.
 
     The goal is egocentric: direction from robot to target in the robot's
     horizontal body frame (yaw-aligned).
 
-    Returns np.float32[3]: (dist, cos(yaw_err), sin(yaw_err))
+    Args:
+        data_mj: MuJoCo data holding the current physics state.
+        target_xy: (2,) target position in world frame (m).
+
+    Returns:
+        np.float32[3]: (dist, cos(yaw_err), sin(yaw_err)).
     """
     robot_xy = data_mj.qpos[0:2].copy()
     delta = target_xy - robot_xy  # world-frame vector to target
@@ -333,25 +393,26 @@ def _compute_gt_goal(data_mj: mujoco.MjData, target_xy: np.ndarray) -> np.ndarra
 
 
 class Inferencer:
-    """
-    Closed-loop rollout harness for GroundedNav student.
+    """Closed-loop rollout harness for GroundedNav student.
 
-    Parameters
-    ----------
-    checkpoint_path : path to a GroundedNav .pt (None = random-init for harness test)
-    arch            : 'A' or 'C'
-    device          : 'cpu' | 'cuda'
-    chunk_H         : action chunking horizon (1 = no chunking)
-    goal_source     : 'learned' | 'classical' | 'gt' (Arch A only)
-                      'learned'  — model's own grounding head (default)
-                      'classical' — HSV+depth classical grounding
-                      'gt'       — privileged goal from sim state (upper bound)
-    verbose         : per-step print
+    Args:
+        checkpoint_path: Path to a GroundedNav .pt (None = random-init for
+            harness test).
+        arch: 'A' or 'C'.
+        device: 'cpu' | 'cuda'.
+        chunk_H: Action chunking horizon (1 = no chunking).
+        goal_source: 'learned' | 'classical' | 'gt' (Arch A only).
+            'learned'   — model's own grounding head (default).
+            'classical' — HSV+depth classical grounding.
+            'gt'        — privileged goal from sim state (upper bound).
+        vel_source: 'predicted' | 'gt' (Fix 2 upper bound).
+        verbose: Per-step print.
+        use_keyframe: True → load stand_keyframe.npz (WBC-free settle).
     """
 
     def __init__(
         self,
-        checkpoint_path: Optional[str] = None,
+        checkpoint_path: str | None = None,
         arch:        str  = 'A',
         device:      str  = 'cpu',
         chunk_H:     int  = 1,
@@ -359,7 +420,7 @@ class Inferencer:
         vel_source:  str  = 'predicted',   # 'predicted' | 'gt' (Fix 2 upper bound)
         verbose:     bool = False,
         use_keyframe: bool = True,          # True → load stand_keyframe.npz (WBC-free settle)
-    ):
+    ) -> None:
         self.device      = torch.device(device)
         self.verbose     = verbose
         self.arch        = arch
@@ -377,7 +438,7 @@ class Inferencer:
         # keyframe. The keyframe was generated offline by running WBC settle once.
         # Legality: WBC used only offline to make the keyframe (like a physics config step),
         # not called during any episode rollout.
-        self._keyframe: Optional[dict] = None
+        self._keyframe: dict | None = None
         if use_keyframe and os.path.isfile(KEYFRAME_PATH):
             _kf = np.load(KEYFRAME_PATH)
             self._keyframe = {
@@ -395,7 +456,7 @@ class Inferencer:
         # ---- Fix 1: action stats (residual + standardized) ----
         # Loaded from checkpoint if present (train_gaitfix.py embeds them).
         # If not present, falls back to raw absolute action (old behaviour).
-        self._action_stats: Optional[dict] = None   # {mean, std, default_angles} as np arrays
+        self._action_stats: dict | None = None   # {mean, std, default_angles} as np arrays
 
         # ---- Fix 4: gait phase input ----
         # If checkpoint was trained with proprio_dim=57 (dart_phase flag), the inferencer
@@ -512,19 +573,40 @@ class Inferencer:
         self,
         scene_cfg:    dict,
         instruction:  str,
-        lang_emb:     Optional[np.ndarray] = None,
+        lang_emb:     np.ndarray | None = None,
         maxsteps:     int   = 600,
         render_video: bool  = False,
-        video_path:   Optional[str] = None,
+        video_path:   str | None = None,
         render_tp:    bool  = True,
-        stop_r:       Optional[float] = None,
+        stop_r:       float | None = None,
     ) -> RolloutResult:
-        """
-        Run one closed-loop episode.
+        """Runs one closed-loop episode.
 
         The WBC teacher is used ONLY for the settle phase (SETTLE_STEPS with zero
         velocity command) to bring the G1 to a stable standing pose.
         After settle, the STUDENT drives the robot: student output → PD → physics.
+
+        Args:
+            scene_cfg: Scene configuration dict (objects, target_index, robot_xy,
+                robot_yaw, stop_r, difficulty, ...) as produced by code/scene.py.
+            instruction: Natural-language instruction for this episode (unused
+                directly here beyond bookkeeping; language conditioning comes from
+                `lang_emb`).
+            lang_emb: Optional (2048,) language embedding. If None, a zero vector
+                is used, or (for a trained grounding head with 'learned' goal
+                source) a one-hot color+shape encoding is built instead.
+            maxsteps: Hard cap on the number of student control steps.
+            render_video: If True, record ego (and optionally third-person) frames
+                for video output.
+            video_path: Output path for the rendered video (required if
+                `render_video` is True and any frames were recorded).
+            render_tp: If True (and `render_video` is True), also record
+                third-person frames.
+            stop_r: Success radius (m). Defaults to `scene_cfg['stop_r']` (or 0.6)
+                when None.
+
+        Returns:
+            RolloutResult summarizing the episode outcome.
         """
         if stop_r is None:
             stop_r = float(scene_cfg.get('stop_r', 0.6))
@@ -840,7 +922,7 @@ class Inferencer:
         _avoid_cycles_total        = 0     # diagnostic: grounding cycles AVOID evaluated
         _avoid_cycles_active       = 0     # diagnostic: cycles with |bias| > 0 after this cycle
 
-        def _lock_drop_and_rescan():
+        def _lock_drop_and_rescan() -> None:
             """M4 (divergence) / M5 (coast-expiry) shared action: drop the lock,
             clear EMA/last-known-goal, and re-enter scan via NX-1's bounded
             BidirectionalScanSchedule (never unbounded rotation -- see
@@ -1618,7 +1700,26 @@ class Inferencer:
 # Video writer
 # ---------------------------------------------------------------------------
 
-def _write_video(frames_ego: list, frames_tp: list, out_path: str, fps: int = 50):
+def _write_video(
+    frames_ego: list[np.ndarray],
+    frames_tp: list[np.ndarray],
+    out_path: str,
+    fps: int = 50,
+) -> None:
+    """Writes recorded ego (and optional third-person) frames to a video file.
+
+    If `frames_tp` is non-empty and matches `frames_ego` in length, each output
+    frame is the ego frame with the (height-matched) third-person frame
+    concatenated alongside it; otherwise only the ego frames are written.
+
+    Args:
+        frames_ego: List of (H,W,3) uint8 ego-camera frames.
+        frames_tp: List of (H,W,3) uint8 third-person-camera frames (may be
+            empty).
+        out_path: Output video file path; parent directories are created if
+            missing.
+        fps: Output frame rate.
+    """
     try:
         import imageio.v2 as imageio
     except ImportError:

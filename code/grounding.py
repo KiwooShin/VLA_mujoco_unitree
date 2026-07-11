@@ -33,12 +33,14 @@ import os
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-import numpy as np
-import cv2
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any
 
-import sys as _sys, os as _os
+import cv2
+import numpy as np
+
+import os as _os
+import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from code.arena import (backproject_pixel, EGO_FOVY, EGO_W, EGO_H, get_ego_intrinsics,
                         GROUNDING_W, GROUNDING_H, SHAPES)
@@ -49,8 +51,16 @@ from code.arena import (backproject_pixel, EGO_FOVY, EGO_W, EGO_H, get_ego_intri
 # Override here for grounding only (training pipeline is unaffected).
 EGO_FOVY_RENDERED = 45.0  # degrees — actual rendered FOVY (model.vis.global_.fovy)
 
-def get_ego_intrinsics_rendered(w=EGO_W, h=EGO_H):
-    """Return intrinsics for the ACTUAL rendered image (FOVY=45 deg, not 90)."""
+def get_ego_intrinsics_rendered(w: int = EGO_W, h: int = EGO_H) -> dict:
+    """Return intrinsics for the ACTUAL rendered image (FOVY=45 deg, not 90).
+
+    Args:
+        w: Rendered image width in pixels.
+        h: Rendered image height in pixels.
+
+    Returns:
+        dict with keys fx, fy, cx, cy, width, height, fovy_deg.
+    """
     import math as _math
     fovy_rad = _math.radians(EGO_FOVY_RENDERED)
     fy = (h / 2.0) / _math.tan(fovy_rad / 2.0)
@@ -196,8 +206,8 @@ MIN_VALID_DEPTH_PX = 3   # was 5, reduced for 480x360 high-res render of distant
 #   cone      : base radius=size/2 -> diameter(width)=size; total height (base
 #               cylinder + narrow tip box, see build_arena()'s "cone" branch) =
 #               ((size/2)*2.2)*1.9 = size*2.09
-_SHAPE_SIZE_M = dict(SHAPES)   # {"ball":0.24, "cube":0.24, "cylinder":0.22, "cone":0.26}
-NOMINAL_DIMS_M = {
+_SHAPE_SIZE_M: dict[str, float] = dict(SHAPES)   # {"ball":0.24, "cube":0.24, "cylinder":0.22, "cone":0.26}
+NOMINAL_DIMS_M: dict[str, tuple[float, float]] = {
     "ball":     (_SHAPE_SIZE_M["ball"],     _SHAPE_SIZE_M["ball"]),
     "sphere":   (_SHAPE_SIZE_M["ball"],     _SHAPE_SIZE_M["ball"]),
     "cube":     (_SHAPE_SIZE_M["cube"],     _SHAPE_SIZE_M["cube"]),
@@ -239,6 +249,7 @@ M6_NEAR_DEPTH_M = 1.2   # metres; matches inferencer.py's CAM_D_LO handoff bound
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
+    """Return True iff env var `name` equals "1" (falling back to `default` if unset)."""
     return os.environ.get(name, default).strip() == "1"
 
 
@@ -617,30 +628,37 @@ def cam_to_egocentric(x_cam: float, y_cam: float, z_cam: float,
     then add the camera-to-robot forward offset so the returned values
     are relative to the robot's pelvis origin (matching training data convention).
 
-    Parameters
-    ----------
-    pitch_deg : camera downward tilt in degrees.
-                Use 32° for standard ego render, 20° for grounding render (V2).
-                The grounding render uses a shallower pitch so distant targets appear
-                in frame; cam_to_egocentric must use the same pitch to un-rotate correctly.
-    use_corrected_unpitch : CAM-2/Phase-1 finding (docs/cam_p1.md). The forward-distance
-                term below (`z_robot = y_cam*sin + z_cam*cos`) has the WRONG SIGN on the
-                y_cam term -- verified by a ground-truth distance sweep (known target
-                positions vs. reported dist): at the existing shallow pitches (26°/32°)
-                the resulting error is small enough that it hides inside the previously
-                -documented "MuJoCo z-buffer underestimation" and the P0 gate still
-                passed, but at the new PROXIMITY_PITCH=58° camera the SAME bug makes the
-                reported distance *decrease* as the true distance *increases* (completely
-                unusable). The geometrically-correct term is `z_cam*cos - y_cam*sin`
-                (re-derived from the OpenGL look-at camera convention MuJoCo's free
-                camera actually uses, and confirmed empirically: distance now increases
-                monotonically with true distance and matches ground truth to within the
-                object's own near-surface offset). This flag is threaded from
-                `intrinsics['is_proximity']` in ground() below so it activates ONLY for
-                the new proximity camera -- the existing, gated 26°/32° grounding/ego
-                paths are left byte-for-byte unchanged (zero regression risk). Fixing
-                this bug for the grounding camera too is flagged as follow-on work, out
-                of scope for this Phase-1 (CAM-2) change.
+    Args:
+        x_cam: Camera-frame x coordinate (metres, + = image right).
+        y_cam: Camera-frame y coordinate (metres, + = down).
+        z_cam: Camera-frame z coordinate (metres, + = forward, before pitch).
+        pitch_deg: camera downward tilt in degrees.
+            Use 32° for standard ego render, 20° for grounding render (V2).
+            The grounding render uses a shallower pitch so distant targets appear
+            in frame; cam_to_egocentric must use the same pitch to un-rotate correctly.
+        use_corrected_unpitch: CAM-2/Phase-1 finding (docs/cam_p1.md). The forward-distance
+            term below (`z_robot = y_cam*sin + z_cam*cos`) has the WRONG SIGN on the
+            y_cam term -- verified by a ground-truth distance sweep (known target
+            positions vs. reported dist): at the existing shallow pitches (26°/32°)
+            the resulting error is small enough that it hides inside the previously
+            -documented "MuJoCo z-buffer underestimation" and the P0 gate still
+            passed, but at the new PROXIMITY_PITCH=58° camera the SAME bug makes the
+            reported distance *decrease* as the true distance *increases* (completely
+            unusable). The geometrically-correct term is `z_cam*cos - y_cam*sin`
+            (re-derived from the OpenGL look-at camera convention MuJoCo's free
+            camera actually uses, and confirmed empirically: distance now increases
+            monotonically with true distance and matches ground truth to within the
+            object's own near-surface offset). This flag is threaded from
+            `intrinsics['is_proximity']` in ground() below so it activates ONLY for
+            the new proximity camera -- the existing, gated 26°/32° grounding/ego
+            paths are left byte-for-byte unchanged (zero regression risk). Fixing
+            this bug for the grounding camera too is flagged as follow-on work, out
+            of scope for this Phase-1 (CAM-2) change.
+
+    Returns:
+        Tuple of (dist, yaw_err): distance in metres from the robot's pelvis
+        origin, and yaw error in radians (positive when the target is to the
+        LEFT, CCW).
     """
     # Un-pitch: rotate around camera x-axis by +pitch_rad
     #   x_robot = x_cam
@@ -899,13 +917,21 @@ def _reject_depth_outliers(depth_vals: np.ndarray,
 # ---------------------------------------------------------------------------
 @dataclass
 class GroundingResult:
+    """Egocentric grounding result: goal geometry plus optional diagnostics.
+
+    `dist`/`cos_th`/`sin_th`/`confidence`/`not_visible` are always populated
+    (see `ground()`'s docstring for the contract). Every other field is an
+    optional diagnostic, default None, populated only by the specific code
+    paths documented in each field's own inline comment below.
+    """
+
     dist:        float         # metres to target (0 if not visible)
     cos_th:      float         # cos(yaw_err)
     sin_th:      float         # sin(yaw_err)
     confidence:  float         # [0, 1]
     not_visible: bool          # True when target not detected
-    mask:        Optional[np.ndarray] = field(default=None, repr=False)
-    bbox:        Optional[tuple]      = field(default=None, repr=False)  # (x,y,w,h)
+    mask:        np.ndarray | None = field(default=None, repr=False)
+    bbox:        tuple | None      = field(default=None, repr=False)  # (x,y,w,h)
     # NX-2 (docs/rs1_lock_mgmt.md M1): raw contour area (px^2) of the accepted blob,
     # i.e. the SAME `best_area` that feeds `conf_area` in the confidence formula
     # below. Purely additive field (default None, always passed by keyword at every
@@ -919,7 +945,7 @@ class GroundingResult:
     # this field directly (LOCK_M1) targets the root cause exactly; gating on bbox
     # w*h would not have reliably distinguished the two populations (verified
     # numerically, see docs/nx2_impl.md).
-    best_area:   Optional[float]      = field(default=None, repr=False)
+    best_area:   float | None         = field(default=None, repr=False)
     # NX-3 (docs/nx3_size_gate.md M6): the accepted blob's back-projected physical
     # width/height in metres (pinhole: pixel_extent * depth / focal -- see
     # _estimate_physical_size). Purely additive fields (default None, always passed
@@ -928,8 +954,8 @@ class GroundingResult:
     # is on (so calibration/diagnostic callers can read result.phys_w/phys_h off any
     # ordinary ground() call without needing to enable the gate or monkeypatch
     # internals -- this is what docs/nx3_size_gate.md's calibration step relies on).
-    phys_w:      Optional[float]      = field(default=None, repr=False)
-    phys_h:      Optional[float]      = field(default=None, repr=False)
+    phys_w:      float | None         = field(default=None, repr=False)
+    phys_h:      float | None         = field(default=None, repr=False)
     # NX-4 (docs/nx4_depth_split.md): split/re-selection diagnostics. Purely
     # additive (default None); only populated when GROUND_SPLIT=1 -- with the
     # toggle off, `ground()` never runs the split/re-selection code path at
@@ -938,13 +964,14 @@ class GroundingResult:
     # ARE always populated because that computation is unconditionally cheap;
     # this one is gated because the split pass itself is the thing being
     # toggled).
-    n_raw_components: Optional[int]   = field(default=None, repr=False)  # contours before split
-    n_candidates:      Optional[int]  = field(default=None, repr=False)  # candidates after split
-    split_reselected:  Optional[bool] = field(default=None, repr=False)  # winner != naive top-score pick
-    size_plausible:    Optional[bool] = field(default=None, repr=False)  # winner passed GROUND_SPLIT_SIZE band
+    n_raw_components: int | None   = field(default=None, repr=False)  # contours before split
+    n_candidates:      int | None  = field(default=None, repr=False)  # candidates after split
+    split_reselected:  bool | None = field(default=None, repr=False)  # winner != naive top-score pick
+    size_plausible:    bool | None = field(default=None, repr=False)  # winner passed GROUND_SPLIT_SIZE band
 
     @property
     def goal_vec(self) -> np.ndarray:
+        """Return [dist, cos_th, sin_th] as a float32 array."""
         return np.array([self.dist, self.cos_th, self.sin_th], dtype=np.float32)
 
 
@@ -1054,21 +1081,22 @@ _ground_net_track_bearing_rad = None
 _ground_net_last_heatmap = None
 
 
-def get_ground_net_last_heatmap() -> Optional[dict]:
+def get_ground_net_last_heatmap() -> dict | None:
     """
     VF-1 pure-read accessor: the last GROUND_NET grounding cycle's cached
     confidence heatmap, keyed to the query it was computed for.
 
-    Returns None if GROUND_NET was never invoked (or is off) in this process,
-    or the detector failed to load. Otherwise a dict:
-      prob:       (H,W) float32 sigmoid confidence map in [0,1], or None
-      confidence: float, the model's raw peak confidence this cycle
-      accepted:   bool, whether this cycle's detection was accepted (>= tau,
-                  or track-hysteresis continuation)
-      color/shape: the (target_color, target_shape) query this cache is for
-      cam_type:   'grounding' | 'proximity'
-
     Render-side only -- never read by any control-flow code path.
+
+    Returns:
+        None if GROUND_NET was never invoked (or is off) in this process,
+        or the detector failed to load. Otherwise a dict:
+          prob:       (H,W) float32 sigmoid confidence map in [0,1], or None
+          confidence: float, the model's raw peak confidence this cycle
+          accepted:   bool, whether this cycle's detection was accepted (>= tau,
+                      or track-hysteresis continuation)
+          color/shape: the (target_color, target_shape) query this cache is for
+          cam_type:   'grounding' | 'proximity'
     """
     return _ground_net_last_heatmap
 
@@ -1083,7 +1111,7 @@ def reset_ground_net_track() -> None:
     _ground_net_track_bearing_rad = None
 
 
-def _get_ground_net_detector():
+def _get_ground_net_detector() -> Any:
     """Lazy global load of the NX-6 heatmap detector checkpoint. Loaded once per
     process (not per call/episode); subsequent calls return the cached instance
     (or None, sticky, if the first load failed -- avoids retry-storming a bad
@@ -1094,6 +1122,11 @@ def _get_ground_net_detector():
     module-level import here would be a circular import; deferring it until
     first GROUND_NET=1 use (well after this module has finished initializing)
     sidesteps that entirely.
+
+    Returns:
+        The cached code.nx6_heatmap_model.HeatmapDetector instance (typed Any
+        here since importing that type at module level would reintroduce the
+        circular import above), or None if loading failed.
     """
     global _ground_net_detector, _ground_net_load_failed
     global _ground_net_class_names, _ground_net_color_names
@@ -1118,16 +1151,20 @@ def _get_ground_net_detector():
 
 
 def ground_net_latency_stats() -> dict:
-    """Summary stats (ms) over every GROUND_NET inference call made so far in
-    this process: n, mean_ms, p50_ms, p95_ms, p99_ms, max_ms. Empty dict if
-    GROUND_NET was never invoked. Diagnostic helper for smoke tests / gate runs
-    to report latency alongside the closed-loop success metrics."""
+    """Diagnostic helper for smoke tests / gate runs to report GROUND_NET
+    latency alongside the closed-loop success metrics.
+
+    Returns:
+        Summary stats (ms) over every GROUND_NET inference call made so far
+        in this process: n, mean_ms, p50_ms, p95_ms, p99_ms, max_ms. Empty
+        dict if GROUND_NET was never invoked.
+    """
     if not _GROUND_NET_LAT_MS:
         return {}
     xs = sorted(_GROUND_NET_LAT_MS)
     n = len(xs)
 
-    def _pct(p):
+    def _pct(p: float) -> float:
         idx = min(n - 1, max(0, int(round(p * (n - 1)))))
         return xs[idx]
 
@@ -1277,18 +1314,17 @@ def ground(
     """
     Detect target object and compute egocentric goal.
 
-    Parameters
-    ----------
-    ego_rgb      : BGR or RGB uint8 image (H,W,3)
-    ego_depth    : depth map in metres (H,W)
-    target_color : colour name (must be in HSV_BOUNDS)
-    target_shape : shape name — used for blob filter heuristics
-    intrinsics   : camera intrinsics dict
-    return_mask  : if True, attach the binary mask to the result
+    Args:
+        ego_rgb: BGR or RGB uint8 image (H,W,3).
+        ego_depth: Depth map in metres (H,W).
+        target_color: Colour name (must be in HSV_BOUNDS).
+        target_shape: Shape name -- used for blob filter heuristics.
+        intrinsics: Camera intrinsics dict.
+        return_mask: If True, attach the binary mask to the result.
 
-    Returns
-    -------
-    GroundingResult
+    Returns:
+        GroundingResult with the detected (dist, cos_th, sin_th, confidence,
+        not_visible) and, when applicable, diagnostic fields.
     """
     # NX-6 INTEGRATION (default ON since NX-9 adoption, docs/nx9_avoid.md §5):
     # GROUND_NET swaps in the learned heatmap detector in place of everything
@@ -1449,7 +1485,7 @@ def ground(
                 shape_key = str(target_shape).lower().strip()
                 if len(plausible_run) >= 2 and shape_key in ("ball", "sphere", "cube", "box"):
                     target_fill = 0.90 if shape_key in ("ball", "sphere") else 0.68
-                    def _fill_dist(e):
+                    def _fill_dist(e: dict) -> float:
                         return abs(_circle_fill_score(e['cnt']) - target_fill)
                     best_shape_pick = min(plausible_run, key=lambda e: (_fill_dist(e), -e['score']))
                     evaluated = [best_shape_pick] + [e for e in evaluated if e is not best_shape_pick]
@@ -1733,15 +1769,18 @@ def validate_grounding(
     """
     Compare grounding output against privileged GT goal from a generated dataset.
 
-    Parameters
-    ----------
-    dataset_dir : path produced by gen_dataset.py
-    n_frames    : number of frames to sample for validation
-    verbose     : print per-episode summary
+    Args:
+        dataset_dir: Path produced by gen_dataset.py.
+        n_frames: Number of frames to sample for validation.
+        verbose: Print per-episode summary.
 
-    Returns
-    -------
-    dict: mean_dist_err, mean_bearing_err_deg, detection_rate, n_eval
+    Returns:
+        dict with keys: mean_dist_err, mean_bearing_err_deg, detection_rate,
+        n_eval.
+
+    Raises:
+        FileNotFoundError: If no episode parquet files are found under
+            `dataset_dir`.
     """
     import glob
     import json
@@ -1865,11 +1904,17 @@ def validate_grounding(
 # ---------------------------------------------------------------------------
 # Parse colour/shape from instruction string
 # ---------------------------------------------------------------------------
-def _parse_instruction(instruction: str) -> tuple[Optional[str], Optional[str]]:
+def _parse_instruction(instruction: str) -> tuple[str | None, str | None]:
     """Extract the first matching colour and shape from a text instruction.
 
     Uses whole-word matching to avoid false positives like 'red' matching
     inside 'purple-colored'.
+
+    Args:
+        instruction: Free-text instruction string.
+
+    Returns:
+        (color, shape) tuple; either element is None if no match was found.
     """
     import re
     from code.arena import COLORS, SHAPES  # noqa: already in path

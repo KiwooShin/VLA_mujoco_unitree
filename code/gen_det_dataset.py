@@ -80,48 +80,48 @@ import mujoco
 import numpy as np
 import pandas as pd
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_HERE: Path = Path(__file__).resolve().parent
+_REPO: Path = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
 from code.arena import (
-    build_arena, ArenaRenderer, backproject_pixel, _set_ego_cam,
-    COLORS, SHAPES, GROUNDING_W, GROUNDING_H, GROUNDING_PITCH,
-    PROXIMITY_W, PROXIMITY_H, PROXIMITY_PITCH,
+    ArenaRenderer, COLORS, GROUNDING_H, GROUNDING_PITCH, GROUNDING_W, PROXIMITY_H,
+    PROXIMITY_PITCH, PROXIMITY_W, SHAPES, _set_ego_cam, backproject_pixel, build_arena,
 )
-from code.scene import sample_scene, derive_rng
 from code.eval_search import sample_search_scene
-from code.steer import steer as steer_cmd, egocentric_goal, _angle_diff
+from code.grounding import cam_to_egocentric, get_ego_intrinsics_rendered
+from code.scene import derive_rng, sample_scene
+from code.steer import _angle_diff, egocentric_goal, steer as steer_cmd
 from code.teacher import WBCTeacher, _yaw_of
-from code.grounding import get_ego_intrinsics_rendered, cam_to_egocentric
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-COLOR_NAMES = [c for c, _ in COLORS]                 # 7 colors
-SHAPE_NAMES = [s for s, _ in SHAPES]                 # 4 shapes: ball,cube,cylinder,cone
-SIZE_M      = dict(SHAPES)                           # nominal diameter/edge per shape
-COLOR2I     = {c: i for i, c in enumerate(COLOR_NAMES)}
-SHAPE2I     = {s: i for i, s in enumerate(SHAPE_NAMES)}
+COLOR_NAMES: list[str] = [c for c, _ in COLORS]                 # 7 colors
+SHAPE_NAMES: list[str] = [s for s, _ in SHAPES]                 # 4 shapes: ball,cube,cylinder,cone
+SIZE_M: dict[str, float] = dict(SHAPES)                         # nominal diameter/edge per shape
+COLOR2I: dict[str, int] = {c: i for i, c in enumerate(COLOR_NAMES)}
+SHAPE2I: dict[str, int] = {s: i for i, s in enumerate(SHAPE_NAMES)}
 
-FALL_HEIGHT      = 0.50
-SETTLE_STEPS     = 80
-MIN_PIXELS       = 6          # minimum mask pixels to keep a detection
-GEOM_RE          = re.compile(r"^obj_(\d+)(?:_tip)?$")
+FALL_HEIGHT: float      = 0.50
+SETTLE_STEPS: int       = 80
+MIN_PIXELS: int         = 6          # minimum mask pixels to keep a detection
+GEOM_RE: re.Pattern[str] = re.compile(r"^obj_(\d+)(?:_tip)?$")
 
-CAM_SWITCH_DIST_M = 1.8        # proximity below this true distance, else grounding
-DUAL_RENDER_PROB   = 0.20      # occasionally render BOTH cams at the same pose
+CAM_SWITCH_DIST_M: float = 1.8        # proximity below this true distance, else grounding
+DUAL_RENDER_PROB: float  = 0.20      # occasionally render BOTH cams at the same pose
 
-MAXSTEPS_TRAJ = {"easy": 260, "demo": 900, "search": 550}
-N_TRAJ_TARGET = 12             # aim for ~this many trajectory samples per scene
-N_TELEPORT_FOCUS  = 10
-N_TELEPORT_RANDOM = 6
-MAX_GAIT_SNAPSHOTS = 8
+MAXSTEPS_TRAJ: dict[str, int] = {"easy": 260, "demo": 900, "search": 550}
+N_TRAJ_TARGET: int  = 12             # aim for ~this many trajectory samples per scene
+N_TELEPORT_FOCUS: int  = 10
+N_TELEPORT_RANDOM: int = 6
+MAX_GAIT_SNAPSHOTS: int = 8
 
-DIFF_FOR_SEARCH = "search"     # pseudo-difficulty label for search-style scenes
+DIFF_FOR_SEARCH: str = "search"     # pseudo-difficulty label for search-style scenes
 
 
-def _env_note():
+def _env_note() -> None:
+    """Prints the active MUJOCO_GL backend and mujoco version to stdout."""
     print(f"[gen_det_dataset] MUJOCO_GL={os.environ.get('MUJOCO_GL')}  "
           f"mujoco={mujoco.__version__}", flush=True)
 
@@ -130,6 +130,20 @@ def _env_note():
 # Geom-id -> object-index map (handles the cone's extra "_tip" geom)
 # ---------------------------------------------------------------------------
 def build_id_to_obj(model: mujoco.MjModel, n_objects: int) -> np.ndarray:
+    """Builds a geom-id -> object-index lookup array.
+
+    Handles the cone's extra "_tip" geom by mapping it to the same object
+    index as its base geom.
+
+    Args:
+        model: Compiled MuJoCo model (from `build_arena`).
+        n_objects: Number of scene objects to map (geoms named "obj_{i}"
+            with i >= n_objects are ignored).
+
+    Returns:
+        (model.ngeom,) int32 array mapping geom id to object index, or -1
+        for geoms that are not scene objects.
+    """
     id_to_obj = -np.ones(model.ngeom, dtype=np.int32)
     for gi in range(model.ngeom):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gi)
@@ -144,7 +158,18 @@ def build_id_to_obj(model: mujoco.MjModel, n_objects: int) -> np.ndarray:
 
 
 def seg_to_objmap(seg: np.ndarray, id_to_obj: np.ndarray) -> np.ndarray:
-    """seg: (H,W,2) int32 from enable_segmentation_rendering(); channel0=geom id."""
+    """Converts a segmentation map to a per-pixel object-index map.
+
+    Args:
+        seg: (H,W,2) int32 array from enable_segmentation_rendering();
+            channel 0 holds the geom id.
+        id_to_obj: Geom-id -> object-index lookup array, from
+            `build_id_to_obj`.
+
+    Returns:
+        (H,W) int32 array of object indices, or -1 where no known scene
+        object is present.
+    """
     inst = seg[..., 0]
     valid = inst >= 0
     idx = np.where(valid, inst, 0)
@@ -158,13 +183,35 @@ def seg_to_objmap(seg: np.ndarray, id_to_obj: np.ndarray) -> np.ndarray:
 # pre-allocate-once pattern as ArenaRenderer's own renderers)
 # ---------------------------------------------------------------------------
 class SegRenderer:
-    def __init__(self, model: mujoco.MjModel):
+    """Persistent grounding/proximity segmentation renderers.
+
+    Both MuJoCo renderers are pre-allocated once (the same
+    pre-allocate-once pattern as `ArenaRenderer`'s own renderers) to avoid
+    EGL context exhaustion from repeated renderer creation.
+    """
+
+    def __init__(self, model: mujoco.MjModel) -> None:
+        """Allocates the grounding and proximity segmentation renderers.
+
+        Args:
+            model: Compiled MuJoCo model to render segmentation masks for.
+        """
         self._gr_rend = mujoco.Renderer(model, GROUNDING_H, GROUNDING_W)
         self._pr_rend = mujoco.Renderer(model, PROXIMITY_H, PROXIMITY_W)
         self._gr_cam = mujoco.MjvCamera(); self._gr_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
         self._pr_cam = mujoco.MjvCamera(); self._pr_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
 
     def render(self, data: mujoco.MjData, yaw: float, cam_type: str) -> np.ndarray:
+        """Renders a segmentation mask from the given robot pose.
+
+        Args:
+            data: MuJoCo data holding the current physics state.
+            yaw: Robot yaw, in radians, used to place the egocentric camera.
+            cam_type: Either "proximity" or anything else for "grounding".
+
+        Returns:
+            (H, W, 2) int32 segmentation array; channel 0 holds geom ids.
+        """
         if cam_type == "proximity":
             rend, cam, pitch = self._pr_rend, self._pr_cam, PROXIMITY_PITCH
         else:
@@ -176,7 +223,8 @@ class SegRenderer:
         rend.disable_segmentation_rendering()
         return seg
 
-    def close(self):
+    def close(self) -> None:
+        """Closes both underlying MuJoCo renderers."""
         self._gr_rend.close()
         self._pr_rend.close()
 
@@ -190,6 +238,34 @@ class SegRenderer:
 def derive_object_labels(rgb: np.ndarray, depth: np.ndarray, obj_map: np.ndarray,
                          objects: list, robot_xy: np.ndarray, robot_yaw: float,
                          intr: dict) -> list:
+    """Derives per-object detection labels from a segmentation-based object map.
+
+    For each object with a foreground mask, computes the pixel bounding
+    box/centroid/area, whether the mask is clipped by an image edge, the
+    median depth, the ground-truth egocentric (distance, bearing), and the
+    back-projected (distance, bearing) computed the same way the deployed
+    grounder does — the gap between the two is the label-geometry sanity
+    check.
+
+    Args:
+        rgb: (H,W,3) uint8 rendered RGB image; only its (H, W) shape is
+            used here.
+        depth: (H,W) float depth image, in meters.
+        obj_map: (H,W) int32 object-index map from `seg_to_objmap` (-1
+            where no object is present).
+        objects: List of object dicts from the scene config (x, y,
+            shape_name, color_name, ...).
+        robot_xy: (2,) robot world xy position.
+        robot_yaw: Robot yaw, in radians.
+        intr: Camera intrinsics dict used for back-projection.
+
+    Returns:
+        A list of per-object label dicts (one per visible object with
+        enough mask pixels), with keys obj_idx, class_name, class_id,
+        color_name, color_id, bbox_x/y/w/h, centroid_px_x/y, area_px,
+        clipped, depth_median_m, dist_gt_m, bearing_gt_deg, dist_bp_m,
+        bearing_bp_deg, err_dist_m, err_bearing_deg.
+    """
     h_img, w_img = rgb.shape[0], rgb.shape[1]
     labels = []
     for oi, obj in enumerate(objects):
@@ -259,6 +335,23 @@ def derive_object_labels(rgb: np.ndarray, depth: np.ndarray, obj_map: np.ndarray
 def capture_frame(renderer: ArenaRenderer, seg_rend: SegRenderer,
                   data_mj: mujoco.MjData, yaw: float, cam_type: str,
                   objects: list, id_to_obj: np.ndarray) -> dict:
+    """Captures one frame: renders RGB/depth/segmentation and derives labels.
+
+    Args:
+        renderer: ArenaRenderer used to render RGB/depth for the camera.
+        seg_rend: SegRenderer used to render the segmentation mask.
+        data_mj: MuJoCo data holding the current physics state.
+        yaw: Robot yaw, in radians, used to place the egocentric camera.
+        cam_type: Either "proximity" or "grounding".
+        objects: List of object dicts from the scene config.
+        id_to_obj: Geom-id -> object-index lookup array, from
+            `build_id_to_obj`.
+
+    Returns:
+        A dict with keys rgb, depth (float16), cam_type, robot_x, robot_y,
+        robot_yaw, qpos, n_objects_visible, and labels (from
+        `derive_object_labels`).
+    """
     if cam_type == "proximity":
         rgb, depth, intr = renderer.render_proximity(data_mj, yaw, render_depth=True)
     else:
@@ -279,6 +372,7 @@ def capture_frame(renderer: ArenaRenderer, seg_rend: SegRenderer,
 
 
 def pick_cam(dist_m: float) -> str:
+    """Returns "proximity" if `dist_m` is within switch range, else "grounding"."""
     return "proximity" if dist_m <= CAM_SWITCH_DIST_M else "grounding"
 
 
@@ -286,6 +380,17 @@ def pick_cam(dist_m: float) -> str:
 # Scene construction (unifies scene.py 'easy'/'demo' + eval_search.py 'search')
 # ---------------------------------------------------------------------------
 def make_scene_cfg(rng: np.random.Generator, style: str, ep_i: int) -> dict:
+    """Builds a scene config for the given style, dispatching to the right sampler.
+
+    Args:
+        rng: Random generator used for sampling.
+        style: "easy" or "demo" (routed to `code.scene.sample_scene`), or
+            "search" (routed to `code.eval_search.sample_search_scene`).
+        ep_i: Episode index, forwarded to the search-style sampler.
+
+    Returns:
+        The sampled scene configuration dict.
+    """
     if style == "search":
         sc = sample_search_scene(rng, ep_i)
     else:
@@ -297,7 +402,27 @@ def make_scene_cfg(rng: np.random.Generator, style: str, ep_i: int) -> dict:
 # One scene -> list of frame records
 # ---------------------------------------------------------------------------
 def run_scene(scene_id: int, style: str, base_seed: int, ep_i: int,
-             rng_sample: np.random.Generator) -> tuple:
+             rng_sample: np.random.Generator) -> tuple[dict, list]:
+    """Runs one scene: builds the arena, then captures trajectory + teleport frames.
+
+    Builds one arena for the scene and captures three families of frames:
+    (1) a walking trajectory toward the scene's nominal target, subsampled
+    along the approach; (2) teleported "focus" frames at controlled
+    (distance, bearing) offsets from a random object; and (3) fully random
+    "confusion" teleport poses. See the module docstring for details.
+
+    Args:
+        scene_id: Scene index, used to derive the scene's RNG seed.
+        style: Scene family: "easy", "demo", or "search".
+        base_seed: Base seed forwarded to `derive_rng`.
+        ep_i: Episode index forwarded to the search-style sampler.
+        rng_sample: Random generator used for all in-scene sampling
+            (teleport poses, dual-camera decisions, etc.).
+
+    Returns:
+        A tuple (scene_cfg, frame_records). `frame_records` is empty if
+        the robot fell during the initial settle.
+    """
     rng = derive_rng(base_seed, scene_id)
     scene_cfg = make_scene_cfg(rng, style, ep_i)
     objects = scene_cfg["objects"]
@@ -332,7 +457,8 @@ def run_scene(scene_id: int, style: str, base_seed: int, ep_i: int,
     frame_records = []
     gait_snapshots = [data_mj.qpos.copy()]   # snapshot 0: settled standing pose
 
-    def _dual_maybe(cam_type, rgb_cam_dist):
+    def _dual_maybe(cam_type: str, rgb_cam_dist: float) -> list[str]:
+        """Returns the camera list for this frame, occasionally rendering both."""
         cams = [cam_type]
         other = "proximity" if cam_type == "grounding" else "grounding"
         if rng_sample.random() < DUAL_RENDER_PROB:
@@ -375,7 +501,10 @@ def run_scene(scene_id: int, style: str, base_seed: int, ep_i: int,
     margin = 0.35
     log_lo, log_hi = math.log(0.3), math.log(10.0)
 
-    def _teleport_pose(focus_xy, dist, bearing_off_deg):
+    def _teleport_pose(
+        focus_xy: tuple[float, float], dist: float, bearing_off_deg: float,
+    ) -> tuple[float, float, float]:
+        """Computes a teleport (x, y, yaw) at `dist`/`bearing_off_deg` from `focus_xy`."""
         approach_ang = float(rng_sample.uniform(-math.pi, math.pi))
         rx = focus_xy[0] + dist * math.cos(approach_ang)
         ry = focus_xy[1] + dist * math.sin(approach_ang)
@@ -383,10 +512,12 @@ def run_scene(scene_id: int, style: str, base_seed: int, ep_i: int,
         yaw = bearing_to_focus - math.radians(bearing_off_deg)
         return rx, ry, yaw
 
-    def _in_bounds(rx, ry):
+    def _in_bounds(rx: float, ry: float) -> bool:
+        """Returns True if (rx, ry) is within the arena bounds minus margin."""
         return abs(rx) < arena_half - margin and abs(ry) < arena_half - margin
 
-    def _apply_pose(rx, ry, yaw):
+    def _apply_pose(rx: float, ry: float, yaw: float) -> None:
+        """Teleports the robot to (rx, ry, yaw) using a cached gait qpos snapshot."""
         snap = gait_snapshots[int(rng_sample.integers(len(gait_snapshots)))]
         data_mj.qpos[:] = snap
         data_mj.qpos[0] = rx
@@ -443,7 +574,18 @@ def run_scene(scene_id: int, style: str, base_seed: int, ep_i: int,
 # ---------------------------------------------------------------------------
 # Driver: generate scenes, split by scene, write per-split artifacts
 # ---------------------------------------------------------------------------
-def generate(args):
+def generate(args: argparse.Namespace) -> tuple[dict, Path]:
+    """Generates scenes, captures frames, and writes per-split dataset artifacts.
+
+    Args:
+        args: Parsed command-line arguments (see `main`), with fields
+            `n_easy`, `n_demo`, `n_search`, `seed`, `out`, `smoke`, and
+            `smoke_scenes`.
+
+    Returns:
+        A tuple (meta, out_dir): the dataset summary dict (also written to
+        `meta.json`) and the output directory path.
+    """
     _env_note()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -599,7 +741,18 @@ def generate(args):
 # ---------------------------------------------------------------------------
 # Preview: 12 random samples -> RGB + mask overlay + bbox + label text
 # ---------------------------------------------------------------------------
-def make_preview(out_dir: Path, n_samples: int = 12, seed: int = 12345):
+def make_preview(out_dir: Path, n_samples: int = 12, seed: int = 12345) -> int:
+    """Writes preview images (RGB + mask overlay + bboxes + text) to disk.
+
+    Args:
+        out_dir: Dataset output directory containing per-split
+            frames/labels parquet files and `scenes.json`.
+        n_samples: Number of random frames to sample for previews.
+        seed: Random seed for sample selection and the label color palette.
+
+    Returns:
+        The number of preview images written.
+    """
     scenes_meta = json.load(open(out_dir / "scenes.json"))
     preview_dir = out_dir / "preview"
     preview_dir.mkdir(exist_ok=True)
@@ -684,7 +837,8 @@ def make_preview(out_dir: Path, n_samples: int = 12, seed: int = 12345):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
+    """Parses CLI arguments and runs dataset generation (plus previews)."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-easy", type=int, default=90)
     ap.add_argument("--n-demo", type=int, default=180)

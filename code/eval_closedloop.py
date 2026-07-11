@@ -39,7 +39,6 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -93,7 +92,7 @@ class EpisodeResult:
     vel_source:   str = 'predicted'
     action_osc_std: float = 0.0   # gait oscillation: mean per-joint std of commanded targets
     forward_disp: float = 0.0     # forward displacement from start (m)
-    video_path:   Optional[str] = None
+    video_path:   str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +100,7 @@ class EpisodeResult:
 # ---------------------------------------------------------------------------
 
 def evaluate(
-    checkpoint_path: Optional[str],
+    checkpoint_path: str | None,
     arch:        str   = 'A',
     difficulty:  str   = 'easy',
     n_scenes:    int   = 15,
@@ -115,10 +114,31 @@ def evaluate(
     vel_source:  str   = 'predicted',   # 'predicted' | 'gt' (Fix 2 upper bound)
     seed:        int   = 999,           # eval seed (default=999 held-out)
 ) -> dict:
-    """
-    Run closed-loop evaluation on n_scenes held-out scenes.
+    """Run closed-loop evaluation on n_scenes held-out scenes.
 
-    Returns summary dict with success_rate + per_episode list.
+    Args:
+        checkpoint_path: Path to a .pt checkpoint, or None for a random-init
+            model (harness validation only).
+        arch: Model architecture identifier ('A' or 'C').
+        difficulty: Scene difficulty preset key (e.g. 'easy', 'demo'); looked
+            up in MAXSTEPS for the per-episode step cap.
+        n_scenes: Number of held-out scenes to evaluate.
+        device: Torch device string for inference ('cpu' or 'cuda').
+        out_dir: Output directory for videos, logs, and the summary JSON.
+        render: Whether to render video for the first N_RENDER_EPS episodes.
+        verbose: Whether to enable verbose Inferencer logging (only takes
+            effect when n_scenes == 1).
+        chunk_H: Action chunking horizon (overrides the checkpoint's value).
+        smoke: If True, forces a single scene, a hard 60-step cap, and
+            disables rendering, for harness validation only.
+        goal_source: Goal source for Arch A: 'learned' | 'classical' | 'gt'.
+        vel_source: Velocity source for Arch A: 'predicted' | 'gt'.
+        seed: Eval seed (default=999, held-out; never used in training).
+
+    Returns:
+        Summary dict with success_rate, per-failure-tag counts, timing
+        stats, and the full per_episode list (also written to a JSON file
+        under out_dir).
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -157,7 +177,7 @@ def evaluate(
         verbose         = verbose and (n_scenes == 1),
     )
 
-    results: List[EpisodeResult] = []
+    results: list[EpisodeResult] = []
     t_eval_start = time.perf_counter()
 
     for ep_i in range(n_scenes):
@@ -310,7 +330,13 @@ def evaluate(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_log(results: list, out_dir: str, arch: str, goal_source: str, difficulty: str):
+def _write_log(
+    results: list[EpisodeResult],
+    out_dir: str,
+    arch: str,
+    goal_source: str,
+    difficulty: str,
+) -> None:
     """Incrementally write results log (growing file for background polling)."""
     log_path = Path(out_dir) / f"eval_log_arch{arch}_{goal_source}_{difficulty}.jsonl"
     with open(log_path, 'w') as f:
@@ -318,7 +344,7 @@ def _write_log(results: list, out_dir: str, arch: str, goal_source: str, difficu
             f.write(json.dumps(asdict(r)) + '\n')
 
 
-def _print_table(results: list):
+def _print_table(results: list[EpisodeResult]) -> None:
     """Print per-scene outcome table."""
     header = (f"{'ep':>4}  {'instruction':<45}  {'dist':>6}  "
               f"{'steps':>6}  {'final_d':>7}  {'outcome':<25}")
@@ -336,7 +362,8 @@ def _print_table(results: list):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
+    """Parse CLI arguments and run the closed-loop evaluation."""
     ap = argparse.ArgumentParser(
         description="Closed-loop evaluation for G1Nav GroundedNav student",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

@@ -22,17 +22,18 @@ yaw_err  : float  signed bearing error (rad)
 """
 
 import math
+
 import numpy as np
 
 # ---------------------------------------------------------------------------
 # Controller parameters
 # ---------------------------------------------------------------------------
-MAX_VX       = 0.55   # max forward speed (m/s)
-MAX_WZ       = 0.80   # max yaw rate (rad/s)
-DECEL_DIST   = 0.90   # start decelerating when dist < this (m)
-FACE_THR_RAD = math.radians(25.0)  # turn-in-place when |yaw_err| > this
-YAW_KP       = 1.2    # proportional gain on yaw error → ωz
-VX_YAW_DAMP  = 0.0    # lateral speed (unused for G1 WBC; G1 walks straight)
+MAX_VX: float       = 0.55   # max forward speed (m/s)
+MAX_WZ: float       = 0.80   # max yaw rate (rad/s)
+DECEL_DIST: float   = 0.90   # start decelerating when dist < this (m)
+FACE_THR_RAD: float = math.radians(25.0)  # turn-in-place when |yaw_err| > this
+YAW_KP: float       = 1.2    # proportional gain on yaw error → ωz
+VX_YAW_DAMP: float  = 0.0    # lateral speed (unused for G1 WBC; G1 walks straight)
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -41,15 +42,23 @@ def _angle_diff(a: float, b: float) -> float:
     return math.atan2(math.sin(d), math.cos(d))
 
 
-def egocentric_goal(robot_xy, robot_yaw: float, target_xy) -> tuple:
-    """
-    Compute egocentric goal from world-frame poses.
+def egocentric_goal(
+    robot_xy: np.ndarray | tuple[float, float],
+    robot_yaw: float,
+    target_xy: np.ndarray | tuple[float, float],
+) -> tuple[float, float, float]:
+    """Compute egocentric goal from world-frame poses.
 
-    Returns
-    -------
-    dist    : float  Euclidean distance (m)
-    yaw_err : float  signed bearing error in robot frame (rad), in (−π, π]
-    bearing : float  world-frame bearing to target (rad)
+    Args:
+        robot_xy: Robot position (x, y) in world frame (m).
+        robot_yaw: Robot yaw angle (rad).
+        target_xy: Target position (x, y) in world frame (m).
+
+    Returns:
+        Tuple of (dist, yaw_err, bearing):
+            dist: Euclidean distance (m).
+            yaw_err: Signed bearing error in robot frame (rad), in (−π, π].
+            bearing: World-frame bearing to target (rad).
     """
     dx = float(target_xy[0]) - float(robot_xy[0])
     dy = float(target_xy[1]) - float(robot_xy[1])
@@ -60,33 +69,31 @@ def egocentric_goal(robot_xy, robot_yaw: float, target_xy) -> tuple:
 
 
 def steer(
-    robot_xy,
+    robot_xy: np.ndarray | tuple[float, float],
     robot_yaw: float,
-    target_xy,
+    target_xy: np.ndarray | tuple[float, float],
     stop_r: float,
     *,
-    max_vx: float   = MAX_VX,
-    max_wz: float   = MAX_WZ,
-    decel_dist: float = DECEL_DIST,
-) -> tuple:
-    """
-    Compute velocity command given robot and target poses.
+    max_vx: float      = MAX_VX,
+    max_wz: float      = MAX_WZ,
+    decel_dist: float  = DECEL_DIST,
+) -> tuple[np.ndarray, float, float]:
+    """Compute velocity command given robot and target poses.
 
-    Parameters
-    ----------
-    robot_xy   : array-like  (x, y)  world frame (m)
-    robot_yaw  : float                yaw angle (rad)
-    target_xy  : array-like  (x, y)  world frame (m)
-    stop_r     : float                success radius (m)
-    max_vx     : float                maximum forward speed (m/s)
-    max_wz     : float                maximum yaw rate (rad/s)
-    decel_dist : float                deceleration onset distance (m)
+    Args:
+        robot_xy: Robot position (x, y) in world frame (m).
+        robot_yaw: Robot yaw angle (rad).
+        target_xy: Target position (x, y) in world frame (m).
+        stop_r: Success radius (m).
+        max_vx: Maximum forward speed (m/s).
+        max_wz: Maximum yaw rate (rad/s).
+        decel_dist: Deceleration onset distance (m).
 
-    Returns
-    -------
-    vel_cmd : np.ndarray shape (3,)   [vx, vy=0, ωz]
-    dist    : float                   distance to target
-    yaw_err : float                   signed bearing error (rad)
+    Returns:
+        Tuple of (vel_cmd, dist, yaw_err):
+            vel_cmd: Velocity command [vx, vy=0, ωz], shape (3,).
+            dist: Distance to target (m).
+            yaw_err: Signed bearing error (rad).
     """
     dist, yaw_err, _ = egocentric_goal(robot_xy, robot_yaw, target_xy)
 
@@ -116,10 +123,16 @@ def steer(
 # Goal vector helpers (for dataset logging)
 # ---------------------------------------------------------------------------
 def goal_vec(dist: float, yaw_err: float) -> np.ndarray:
-    """
-    Return normalised egocentric goal vector (dist, cos θ, sin θ).
+    """Return normalised egocentric goal vector (dist, cos θ, sin θ).
 
     This is the privileged label used in the ADR schema.
+
+    Args:
+        dist: Distance to target (m).
+        yaw_err: Signed bearing error (rad).
+
+    Returns:
+        Array [dist, cos(yaw_err), sin(yaw_err)] of shape (3,), dtype float32.
     """
     return np.array([dist, math.cos(yaw_err), math.sin(yaw_err)], dtype=np.float32)
 

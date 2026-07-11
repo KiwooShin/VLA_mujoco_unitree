@@ -24,10 +24,10 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from code.nx6_heatmap_model import (
-    CLASS_NAMES, COLOR_NAMES, N_CLASS, N_COLOR, SIZE_M, TARGET_W, TARGET_H,
-    TARGET_INTR, PITCH_BY_CAM, MAX_DEPTH_CLIP_M, encode_query,
+    CLASS_NAMES, COLOR_NAMES, MAX_DEPTH_CLIP_M, N_CLASS, N_COLOR, PITCH_BY_CAM,
+    SIZE_M, TARGET_H, TARGET_INTR, TARGET_W, encode_query,
 )
-from code.arena import (GROUNDING_W, GROUNDING_H, PROXIMITY_W, PROXIMITY_H,
+from code.arena import (GROUNDING_H, GROUNDING_W, PROXIMITY_H, PROXIMITY_W,
                         backproject_pixel)
 from code.grounding import cam_to_egocentric
 
@@ -44,7 +44,15 @@ class SplitCache:
     (or the failcases set, which uses the same {images_*.npz, frames.parquet,
     labels.parquet} layout, see docs/nx6_data.md §6/§7)."""
 
-    def __init__(self, root: str, split: str | None, verbose: bool = True):
+    def __init__(self, root: str, split: str | None, verbose: bool = True) -> None:
+        """Loads and resizes one dataset split into memory.
+
+        Args:
+            root: Dataset root directory (e.g. 'dataset/det_v1').
+            split: Split subdirectory name ('train'/'val'/'test'), or None to
+                read directly from `root` (used by the failcases layout).
+            verbose: Print progress and summary lines.
+        """
         self.root = root
         self.split = split
         base = os.path.join(root, split) if split else root
@@ -91,7 +99,8 @@ class SplitCache:
             rgb_o = arr["rgb"][idx]
             depth_o = arr["depth"][idx].astype(np.float32)
             self.rgb[i] = cv2.resize(rgb_o, (TARGET_W, TARGET_H), interpolation=cv2.INTER_AREA)
-            self.depth[i] = cv2.resize(depth_o, (TARGET_W, TARGET_H), interpolation=cv2.INTER_NEAREST)
+            self.depth[i] = cv2.resize(depth_o, (TARGET_W, TARGET_H),
+                                        interpolation=cv2.INTER_NEAREST)
 
             ow, oh = ORIG_WH[cam]
             sx, sy = TARGET_W / ow, TARGET_H / oh
@@ -109,7 +118,7 @@ class SplitCache:
             print(f"[SplitCache {split or root}] {n} frames ready "
                   f"({(self.rgb.nbytes+self.depth.nbytes)/1e6:.0f}MB)", flush=True)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.frames)
 
 
@@ -139,7 +148,9 @@ def load_failcase_cache(root: str = "dataset/det_failcases", verbose: bool = Tru
         ))
 
     npz_cache = {}
-    for ep_tag, cam in cache.frames[["ep_tag", "cam_type"]].drop_duplicates().itertuples(index=False):
+    for ep_tag, cam in (
+        cache.frames[["ep_tag", "cam_type"]].drop_duplicates().itertuples(index=False)
+    ):
         p = os.path.join(root, f"images_{ep_tag}_{cam}.npz")
         with np.load(p) as z:
             npz_cache[(ep_tag, cam)] = dict(rgb=z["rgb"], depth=z["depth"])
@@ -192,6 +203,21 @@ def load_failcase_cache(root: str = "dataset/det_failcases", verbose: bool = Tru
 # ---------------------------------------------------------------------------
 def residual_target(cx: float, cy: float, depth_at_px: float, dist_gt: float,
                     class_id: int, cam_type: str, intr: dict) -> float:
+    """Computes the dist-residual regression target for one positive example.
+
+    Args:
+        cx: Target pixel x-coordinate (post-resize/augmentation).
+        cy: Target pixel y-coordinate (post-resize/augmentation).
+        depth_at_px: Depth (meters) sampled at (cx, cy).
+        dist_gt: Ground-truth egocentric distance to the object (meters).
+        class_id: Object class index (indexes into CLASS_NAMES/SIZE_M).
+        cam_type: 'grounding' or 'proximity'.
+        intr: Camera intrinsics dict (fx, fy, cx, cy).
+
+    Returns:
+        `dist_gt - dist_bp`, i.e. the residual the model must predict on top
+        of the depth-backprojected distance. 0.0 if `depth_at_px` is invalid.
+    """
     if depth_at_px <= 0 or not np.isfinite(depth_at_px):
         return 0.0
     radius = SIZE_M.get(CLASS_NAMES[class_id], 0.24) / 2.0
@@ -202,7 +228,19 @@ def residual_target(cx: float, cy: float, depth_at_px: float, dist_gt: float,
     return float(dist_gt - dist_bp)
 
 
-def gaussian_heatmap(h, w, cx, cy, sigma=2.5):
+def gaussian_heatmap(h: int, w: int, cx: float, cy: float, sigma: float = 2.5) -> np.ndarray:
+    """Renders an unnormalized 2D Gaussian heatmap peaked at (cx, cy).
+
+    Args:
+        h: Heatmap height in pixels.
+        w: Heatmap width in pixels.
+        cx: Peak x-coordinate.
+        cy: Peak y-coordinate.
+        sigma: Gaussian standard deviation in pixels.
+
+    Returns:
+        float32 array of shape (h, w) with values in (0, 1].
+    """
     ys = np.arange(h, dtype=np.float32)[:, None]
     xs = np.arange(w, dtype=np.float32)[None, :]
     hm = np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2.0 * sigma * sigma))
@@ -214,7 +252,7 @@ def gaussian_heatmap(h, w, cx, cy, sigma=2.5):
 # ---------------------------------------------------------------------------
 def build_example_index(cache: SplitCache, rng: np.random.Generator,
                         neg_per_object_frame: int = 1, neg_per_empty_frame: int = 2,
-                        hard_color_negs: int = 0, hard_shape_negs: int = 0):
+                        hard_color_negs: int = 0, hard_shape_negs: int = 0) -> list:
     """One entry per positive label + sampled negative queries per frame.
 
     `hard_color_negs`/`hard_shape_negs` (NX-14 detector v2, docs/nx14_detector_v2.md):
@@ -228,7 +266,11 @@ def build_example_index(cache: SplitCache, rng: np.random.Generator,
     being available on 100% of labeled frames -- see docs/nx14_detector_v2.md §1
     dataset analysis -- hence this option, additive, not a replacement for the
     base `neg_per_object_frame` random draw so overall negative diversity/precision
-    calibration on totally-unrelated queries is preserved too)."""
+    calibration on totally-unrelated queries is preserved too).
+
+    Returns:
+        list of (row_idx, class_id, color_id, label_dict_or_None) tuples.
+    """
     examples = []
     n = len(cache)
     for i in range(n):
@@ -248,7 +290,8 @@ def build_example_index(cache: SplitCache, rng: np.random.Generator,
             present_colors = {co for (_, co) in present}
             present_classes = {ci for (ci, _) in present}
             hard_color_pool = [c for c in complement if c[1] in present_colors]
-            hard_shape_pool = [c for c in complement if c[0] in present_classes and c[1] not in present_colors]
+            hard_shape_pool = [c for c in complement
+                               if c[0] in present_classes and c[1] not in present_colors]
             if hard_color_pool and hard_color_negs > 0:
                 k_n = min(hard_color_negs, len(hard_color_pool))
                 pick = rng.choice(len(hard_color_pool), size=k_n, replace=False)
@@ -265,7 +308,8 @@ def build_example_index(cache: SplitCache, rng: np.random.Generator,
 
 
 def oversample_far_or_wide(examples: list, extra_copies: int = 1,
-                           dist_thresh_m: float = 6.0, bearing_thresh_deg: float = 20.0):
+                           dist_thresh_m: float = 6.0,
+                           bearing_thresh_deg: float = 20.0) -> list:
     """NX-14 detector v2 (docs/nx14_detector_v2.md §1 dataset analysis): det_v1's
     positive labels are only ~11% beyond 6m and only ~4.5% combine >6m with
     >15deg |bearing| -- the far-range/growing-bearing regime that
@@ -276,7 +320,11 @@ def oversample_far_or_wide(examples: list, extra_copies: int = 1,
     per-epoch since HeatmapDataset's per-example RNG is seeded by its list
     index, not by content) -- a bounded, reweighting-only mitigation (no dataset
     regen) per the task brief's "prefer reweighting/sampling" instruction.
-    No-op (extra_copies=0) reproduces the base example list unchanged."""
+    No-op (extra_copies=0) reproduces the base example list unchanged.
+
+    Returns:
+        `examples` with far/wide positive entries duplicated in place at the end.
+    """
     if extra_copies <= 0:
         return examples
     extra = []
@@ -293,6 +341,7 @@ def oversample_far_or_wide(examples: list, extra_copies: int = 1,
 # Augmentation
 # ---------------------------------------------------------------------------
 def _photometric(rgb: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Applies random brightness/scale, offset, and Gaussian noise jitter to an RGB frame."""
     out = rgb.astype(np.float32)
     if rng.random() < 0.7:
         out *= rng.uniform(0.75, 1.3)
@@ -303,7 +352,15 @@ def _photometric(rgb: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _crop_resize(rgb, depth, cx, cy, has_target, rng, intr):
+def _crop_resize(
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    cx: float | None,
+    cy: float | None,
+    has_target: bool,
+    rng: np.random.Generator,
+    intr: dict,
+) -> tuple[np.ndarray, np.ndarray, float | None, float | None, dict]:
     """Random resized crop in [0.8,1.0] scale; keeps target center inside crop (with
     margin) for positive examples. Returns new rgb, depth, new_cx, new_cy, new_intr."""
     H, W = rgb.shape[:2]
@@ -342,7 +399,7 @@ def _crop_resize(rgb, depth, cx, cy, has_target, rng, intr):
     return rgb_r, depth_r, new_cx, new_cy, new_intr
 
 
-def _depth_dropout(depth_in: np.ndarray, rng: np.random.Generator):
+def _depth_dropout(depth_in: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """depth_in: normalized [0,1] depth channel (post-clip/scale). Returns possibly
     corrupted copy + a flag for which mode was applied (for the *input* only --
     the residual target always uses the true un-corrupted depth, see build_batch)."""
@@ -363,17 +420,17 @@ class HeatmapDataset(Dataset):
     disable augmentation and reuse a fixed example list (for val/test)."""
 
     def __init__(self, cache: SplitCache, examples: list, train: bool, seed: int = 0,
-                sigma: float = 2.5):
+                sigma: float = 2.5) -> None:
         self.cache = cache
         self.examples = examples
         self.train = train
         self.sigma = sigma
         self.seed = seed
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
         row_i, class_id, color_id, lab = self.examples[idx]
         rng = np.random.default_rng((self.seed * 1_000_003 + idx) & 0xFFFFFFFF)
 
@@ -423,11 +480,13 @@ class HeatmapDataset(Dataset):
                     resid=torch.tensor(float(resid)), py=torch.tensor(py), px=torch.tensor(px),
                     peak_mask=peak_mask_t,
                     dist_gt=torch.tensor(float(dist_gt) if dist_gt is not None else float("nan")),
-                    bearing_gt=torch.tensor(float(lab["bearing_gt"]) if lab is not None else float("nan")),
+                    bearing_gt=torch.tensor(
+                        float(lab["bearing_gt"]) if lab is not None else float("nan")),
                     cam_type=cam_type, class_id=class_id, color_id=color_id, row_i=row_i)
 
 
-def collate(batch):
+def collate(batch: list[dict]) -> dict:
+    """Collate function for `HeatmapDataset`: stacks tensor fields, lists the rest."""
     out = {}
     for k in ("x", "q", "heat", "has_target", "resid", "py", "px", "dist_gt", "bearing_gt",
              "peak_mask"):

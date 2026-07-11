@@ -116,7 +116,12 @@ RESET_HEIGHT = 0.79
 
 def _grav_orient(quat: np.ndarray) -> np.ndarray:
     """Rotate gravity vector [0, 0, -1] into the body frame via inverse quaternion.
-    quat convention: [w, x, y, z] (MuJoCo convention).
+
+    Args:
+        quat: Orientation quaternion [w, x, y, z] (MuJoCo convention).
+
+    Returns:
+        np.ndarray: The gravity vector expressed in the body frame.
     """
     w, x, y, z = quat
     # conjugate (inverse for unit quaternion): [w, -x, -y, -z]
@@ -137,7 +142,14 @@ def _grav_orient(quat: np.ndarray) -> np.ndarray:
 
 
 def _yaw_of(quat: np.ndarray) -> float:
-    """Extract yaw (rotation around world Z) from MuJoCo quaternion [w,x,y,z]."""
+    """Extract yaw (rotation around world Z) from MuJoCo quaternion [w,x,y,z].
+
+    Args:
+        quat: Orientation quaternion [w, x, y, z] (MuJoCo convention).
+
+    Returns:
+        Yaw angle in radians.
+    """
     w, x, y, z = quat
     return math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
 
@@ -164,7 +176,15 @@ class WBCTeacher:
         xml_path: str = G1_XML,
         onnx_path: str = WALK_ONNX,
         use_gpu: bool = True,
-    ):
+    ) -> None:
+        """Load the ONNX Walk policy and the MuJoCo model, and init state.
+
+        Args:
+            xml_path: Path to the MuJoCo G1 model XML.
+            onnx_path: Path to the ONNX Walk policy.
+            use_gpu: If True, prefer CUDAExecutionProvider (falls back to
+                CPU if unavailable).
+        """
         # ---- Load ONNX ---
         providers = []
         if use_gpu:
@@ -211,8 +231,13 @@ class WBCTeacher:
         self,
         pos_xy: tuple = (0.0, 0.0),
         yaw: float = 0.0,
-    ):
-        """Reset the robot to a standing pose."""
+    ) -> None:
+        """Reset the robot to a standing pose.
+
+        Args:
+            pos_xy: (x, y) world position to reset the pelvis to.
+            yaw: World yaw (radians) to reset the pelvis orientation to.
+        """
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[0] = pos_xy[0]
         self.data.qpos[1] = pos_xy[1]
@@ -249,13 +274,11 @@ class WBCTeacher:
           3. Apply joint targets via PD control for CONTROL_DECIMATION substeps.
           4. Return the 15 joint targets (rad, in DEFAULT_ANGLES frame).
 
-        Parameters
-        ----------
-        vel_cmd : (vx, vy, omega_z) in m/s and rad/s.
+        Args:
+            vel_cmd: (vx, vy, omega_z) in m/s and rad/s.
 
-        Returns
-        -------
-        target_dof : np.ndarray, shape (15,), absolute joint position targets (rad).
+        Returns:
+            np.ndarray of shape (15,): absolute joint position targets (rad).
         """
         # Build obs
         single_obs = self._build_single_obs(vel_cmd)
@@ -286,20 +309,30 @@ class WBCTeacher:
 
     @property
     def base_height(self) -> float:
+        """Pelvis height (z, metres)."""
         return float(self.data.qpos[2])
 
     @property
     def base_yaw(self) -> float:
+        """Pelvis yaw (radians)."""
         return _yaw_of(self.data.qpos[3:7])
 
     @property
     def sim_time(self) -> float:
+        """Elapsed simulation time (seconds)."""
         return float(self.data.time)
 
     # ---- Internal helpers ---
 
-    def _build_single_obs(self, vel_cmd) -> np.ndarray:
-        """Build a single 86-d observation frame."""
+    def _build_single_obs(self, vel_cmd: tuple) -> np.ndarray:
+        """Build a single 86-d observation frame.
+
+        Args:
+            vel_cmd: (vx, vy, omega_z) in m/s and rad/s.
+
+        Returns:
+            np.ndarray of shape (86,): the single-frame observation.
+        """
         vx, vy, wz = vel_cmd
 
         # Command vector (7 elements):
@@ -340,7 +373,7 @@ class WBCTeacher:
         obs[13 + 2 * nj:13 + 2 * nj + 15] = self._action  # previous action
         return obs
 
-    def _apply_pd(self):
+    def _apply_pd(self) -> None:
         """Apply PD torques for the current target_dof to ctrl."""
         nj = self._nj
         # Lower body (15 joints): PD toward target_dof
@@ -388,7 +421,16 @@ if __name__ == "__main__":
     tp_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
     frames = []
 
-    def render_frame(teacher, tp_cam):
+    def render_frame(teacher: WBCTeacher, tp_cam: mujoco.MjvCamera) -> np.ndarray:
+        """Render a third-person frame tracking the robot.
+
+        Args:
+            teacher: Active WBCTeacher instance being tracked.
+            tp_cam: Third-person MjvCamera to position on the robot.
+
+        Returns:
+            np.ndarray: The rendered RGB frame.
+        """
         # Third-person: track the robot
         bxy = teacher.data.qpos[0:2]
         tp_cam.lookat[:] = [bxy[0], bxy[1], 0.5]

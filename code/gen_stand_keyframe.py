@@ -25,18 +25,28 @@ from pathlib import Path
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-import numpy as np
 import mujoco
+import numpy as np
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_HERE: Path = Path(__file__).resolve().parent
+_REPO: Path = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.teacher import WBCTeacher, DEFAULT_ANGLES
+from code.teacher import DEFAULT_ANGLES, WBCTeacher
 
-SETTLE_STEPS = 80   # match inferencer.py constant
+SETTLE_STEPS: int = 80   # match inferencer.py constant
 
-def gen_keyframe(out_path: str = "checkpoint/stand_keyframe.npz"):
+
+def gen_keyframe(out_path: str = "checkpoint/stand_keyframe.npz") -> str:
+    """Runs WBC settle offline and saves the resulting stance as a keyframe.
+
+    Args:
+        out_path: Output path for the keyframe .npz file, relative to the
+            repo root.
+
+    Returns:
+        The absolute path to the saved keyframe file, as a string.
+    """
     out_path = Path(_REPO) / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
 

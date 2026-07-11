@@ -188,7 +188,14 @@ def is_maneuver_scene(scene_cfg: dict) -> bool:
     """Same `scene_cfg.get('difficulty')` carve-out check STALL_BREAK's
     `_stall_is_maneuver` uses in code/inferencer.py — kept here so every AVOID
     call site (inferencer.py / eval_search.py / fancy_demo.py) checks it the
-    same way instead of re-deriving it three times."""
+    same way instead of re-deriving it three times.
+
+    Args:
+        scene_cfg: Scene config dict (checked for a 'difficulty' key).
+
+    Returns:
+        True iff `scene_cfg['difficulty']` is (case-insensitively) 'maneuver'.
+    """
     return str(scene_cfg.get('difficulty', '')).lower() == 'maneuver'
 
 
@@ -198,7 +205,15 @@ def decay_bias(prev_bias_wz: float) -> float:
     produce a fresh bias (stale-goal coast per
     AVOID_STALE_MAX_MISSED_CYCLES; see that constant's comment) but an
     existing bias should still bleed off on the same ~1s schedule a cleared
-    corridor uses, rather than freezing or snapping."""
+    corridor uses, rather than freezing or snapping.
+
+    Args:
+        prev_bias_wz: Previous cycle's bias (rad/s).
+
+    Returns:
+        The decayed bias (rad/s), snapped to 0.0 below AVOID_DEADBAND and
+        clipped to +/-AVOID_MAX_WZ_BIAS.
+    """
     b = prev_bias_wz * AVOID_DECAY_FACTOR
     if abs(b) < AVOID_DEADBAND:
         b = 0.0
@@ -211,20 +226,27 @@ def decay_bias(prev_bias_wz: float) -> float:
 # bearing sign convention: positive = LEFT) so bearings/distances computed
 # here are directly comparable to cached_goal_vec's (dist, cos_th, sin_th).
 # ---------------------------------------------------------------------------
-def _backproject_frame(depth_m: np.ndarray, intr: dict):
+def _backproject_frame(
+    depth_m: np.ndarray, intr: dict
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Full-frame back-projection to robot-egocentric (dist, bearing_rad,
     height_above_cam_m) per pixel. No extra render — consumes the depth
     array the caller already has.
 
-    Returns
-    -------
-    dist    : (H,W) float32 — radial egocentric distance (m)
-    bearing : (H,W) float32 — signed bearing (rad), positive = LEFT
-    y_vert  : (H,W) float32 — vertical robot-frame coordinate (m, DOWN positive,
-              i.e. "how far below the camera this point is" once leveled) —
-              used for the floor cut: a point at world height ~0 is
-              `cam_height_m` below the camera regardless of range.
+    Args:
+        depth_m: (H,W) depth frame (metres) already rendered by the caller.
+        intr: Camera intrinsics dict (fx,fy,cx,cy[,pitch_deg,is_proximity]).
+
+    Returns:
+        Tuple (dist, bearing, y_vert), each an (H,W) float32 array:
+            dist: radial egocentric distance (m).
+            bearing: signed bearing (rad), positive = LEFT.
+            y_vert: vertical robot-frame coordinate (m, DOWN positive,
+                i.e. "how far below the camera this point is" once
+                leveled) — used for the floor cut: a point at world
+                height ~0 is `cam_height_m` below the camera regardless
+                of range.
     """
     h, w = depth_m.shape[:2]
     fx, fy = float(intr['fx']), float(intr['fy'])
@@ -287,36 +309,34 @@ def compute_obstacle_bias(
     goal_bearing_rad:  float,
     prev_bias_wz:      float,
     carved_out:        bool = False,
-) -> tuple:
+) -> tuple[float, dict]:
     """
     Compute this cycle's obstacle-avoidance yaw-rate bias (rad/s).
 
-    Parameters
-    ----------
-    depth_m           : (H,W) float32 depth frame ALREADY rendered by the
-                         caller this grounding cycle (zero extra renders).
-    intr               : intrinsics dict from the SAME render call
-                         (fx,fy,cx,cy[,pitch_deg,is_proximity]).
-    cam_height_m       : current camera height above the (flat) ground plane
-                         (pelvis z + CAM_HEAD_Z) — used for the floor cut.
-    goal_dist_m        : current cached goal distance (m) — used both for the
-                         target-exemption window and to report carve-out.
-    goal_bearing_rad   : current cached goal bearing (rad, positive=LEFT) —
-                         center of the target-exemption window.
-    prev_bias_wz       : previous cycle's returned bias (for hysteresis/decay).
-    carved_out         : True when the CALLER has already determined AVOID
-                         should not apply this cycle (goal_dist < 1.2m or
-                         maneuver scene) — hard-zeros immediately, no decay
-                         (matches "off when goal dist < 1.2m" / "off in
-                         maneuver mode", which are not "corridor cleared"
-                         events and should not linger).
+    Args:
+        depth_m: (H,W) float32 depth frame ALREADY rendered by the
+            caller this grounding cycle (zero extra renders).
+        intr: Intrinsics dict from the SAME render call
+            (fx,fy,cx,cy[,pitch_deg,is_proximity]).
+        cam_height_m: Current camera height above the (flat) ground plane
+            (pelvis z + CAM_HEAD_Z) — used for the floor cut.
+        goal_dist_m: Current cached goal distance (m) — used both for the
+            target-exemption window and to report carve-out.
+        goal_bearing_rad: Current cached goal bearing (rad, positive=LEFT) —
+            center of the target-exemption window.
+        prev_bias_wz: Previous cycle's returned bias (for hysteresis/decay).
+        carved_out: True when the CALLER has already determined AVOID
+            should not apply this cycle (goal_dist < 1.2m or
+            maneuver scene) — hard-zeros immediately, no decay
+            (matches "off when goal dist < 1.2m" / "off in
+            maneuver mode", which are not "corridor cleared"
+            events and should not linger).
 
-    Returns
-    -------
-    (bias_wz, info) : bias_wz is the SMOOTHED/hysteresis-applied bias to add
-                       to the commanded yaw rate this cycle; info is a debug
-                       dict (raw_bias, left, right, severity, imbalance,
-                       n_obstacle_px, carved_out) for logging/tests.
+    Returns:
+        Tuple (bias_wz, info): bias_wz is the SMOOTHED/hysteresis-applied
+        bias to add to the commanded yaw rate this cycle; info is a debug
+        dict (raw_bias, left, right, severity, imbalance, n_obstacle_px,
+        carved_out) for logging/tests.
     """
     if carved_out:
         return 0.0, dict(raw_bias=0.0, left=0.0, right=0.0, severity=0.0,
@@ -448,9 +468,18 @@ def biased_vel_cmd(goal_dist: float, cos_th: float, sin_th: float,
     (inferencer.py / eval_search.py / fancy_demo.py) call one function
     instead of three near-duplicate copies.
 
-    Returns np.float32[3] = [vx, vy=0, wz] (vy always 0 — steer.py's own
-    VX_YAW_DAMP=0.0 / "G1 walks straight" comment: the BC teacher never
-    strafed, so AVOID never injects a lateral command either).
+    Args:
+        goal_dist: Current goal distance (m).
+        cos_th: Cosine of the goal-heading error.
+        sin_th: Sine of the goal-heading error.
+        bias_wz: AVOID yaw-rate bias (rad/s) to add on top of the steering
+            law's own yaw command.
+        stop_r: Stop radius (m) — zero velocity is returned inside this.
+
+    Returns:
+        np.float32[3] = [vx, vy=0, wz] (vy always 0 — steer.py's own
+        VX_YAW_DAMP=0.0 / "G1 walks straight" comment: the BC teacher never
+        strafed, so AVOID never injects a lateral command either).
     """
     from code.steer import MAX_VX, MAX_WZ, YAW_KP, FACE_THR_RAD, DECEL_DIST
 
@@ -481,7 +510,9 @@ if __name__ == "__main__":
     INTR['pitch_deg'] = GROUNDING_PITCH   # 26.0, matches render_grounding()
     CAM_H = 1.34              # RESET_HEIGHT(0.79) + CAM_HEAD_Z(0.55), approx walking height
 
-    def _inverse_uncorrected(x_robot, y_vert, z_robot_raw, intr):
+    def _inverse_uncorrected(
+        x_robot: float, y_vert: float, z_robot_raw: float, intr: dict
+    ) -> tuple[float, float, float]:
         """Invert the UNCORRECTED-branch back-projection
         (z_robot_raw = sp*y_cam + cp*z_cam, y_vert = sp*z_cam + cp*y_cam —
         the grounding/ego pitch combination `_backproject_frame` uses when
@@ -490,7 +521,12 @@ if __name__ == "__main__":
         rather than by hand-algebra to avoid a repeat of the sign-error bug
         this self-test caught the first time around (see `y_vert`'s
         derivation comment in `_backproject_frame`). Test-only helper —
-        production code never needs the inverse."""
+        production code never needs the inverse.
+
+        Returns:
+            Tuple (u, v, z_cam): synthesized pixel coordinates and camera-
+            frame depth for the given robot-frame point.
+        """
         pitch_rad = math.radians(intr['pitch_deg'])
         cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
         A = np.array([[sp, cp], [cp, sp]], dtype=np.float64)
@@ -501,7 +537,7 @@ if __name__ == "__main__":
         v = intr['cy'] + y_cam * intr['fy'] / z_cam
         return u, v, z_cam
 
-    def _blank_floor_frame(near_m=0.4, far_m=6.0):
+    def _blank_floor_frame(near_m: float = 0.4, far_m: float = 6.0) -> np.ndarray:
         """A depth frame where every pixel is a genuine floor point (world
         height 0): for each image ROW, solve the ray/floor-plane intersection
         directly (depth is independent of column for a level floor + a
@@ -525,8 +561,8 @@ if __name__ == "__main__":
             depth[v, :] = float(np.clip(d, near_m, far_m))
         return depth
 
-    def _wall_frame(bearing_deg_lo, bearing_deg_hi, dist_m, world_height_m=1.1,
-                     background_m=6.0):
+    def _wall_frame(bearing_deg_lo: float, bearing_deg_hi: float, dist_m: float,
+                     world_height_m: float = 1.1, background_m: float = 6.0) -> np.ndarray:
         """A frame that is background (far) everywhere except a wall/blob
         spanning [bearing_deg_lo, bearing_deg_hi] at world height
         `world_height_m` (i.e. NOT floor) and radial range `dist_m`. Both
@@ -549,7 +585,8 @@ if __name__ == "__main__":
     n_pass = 0
     n_fail = 0
 
-    def _check(name, cond, extra=""):
+    def _check(name: str, cond: bool, extra: str = "") -> None:
+        """Print a PASS/FAIL line for `name` and tally into n_pass/n_fail."""
         global n_pass, n_fail
         status = "PASS" if cond else "FAIL"
         if cond:

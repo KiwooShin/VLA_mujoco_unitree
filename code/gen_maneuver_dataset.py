@@ -51,27 +51,26 @@ import mujoco
 import numpy as np
 import pandas as pd
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_HERE: Path = Path(__file__).resolve().parent
+_REPO: Path = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
-from code.teacher import (
-    WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
-    NUM_ACTIONS, SIM_DT, CONTROL_DECIMATION,
-)
 from code.arena import build_arena
 from code.gen_dart_dataset import GaitPhaseTracker, build_proprio
-from code.maneuver_scene import sample_maneuver_scene, derive_rng, SETTLE_STEPS, HORIZON
 from code.maneuver_expert import ManeuverExpert, State
+from code.maneuver_scene import HORIZON, SETTLE_STEPS, derive_rng, sample_maneuver_scene
 from code.steer import goal_vec
+from code.teacher import (
+    CONTROL_DECIMATION, DEFAULT_ANGLES, KDS, KPS, NUM_ACTIONS, SIM_DT, WBCTeacher, _yaw_of,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FPS            = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))   # 50 Hz
-FALL_HEIGHT    = 0.50
-HOLD_STEPS     = 5
-PROPRIO_DIM    = 55
+FPS: int         = int(round(1.0 / (SIM_DT * CONTROL_DECIMATION)))   # 50 Hz
+FALL_HEIGHT: float = 0.50
+HOLD_STEPS: int  = 5
+PROPRIO_DIM: int = 55
 
 
 def run_maneuver_episode(
@@ -81,13 +80,35 @@ def run_maneuver_episode(
     global_frame_offset: int,
     noise_sigma:      float = 0.07,
     hard_maxsteps:    int = 1400,
-    rng_noise:        np.random.Generator = None,
+    rng_noise:        np.random.Generator | None = None,
     verbose:          bool = False,
 ) -> dict | None:
-    """
-    DART episode for the maneuver task.
+    """Runs one DART episode for the maneuver task.
 
-    Returns dict with rows (including maneuver columns), or None if fallen.
+    The teacher computes a clean velocity command via the maneuver expert
+    FSM; the resulting clean joint targets are perturbed with Gaussian noise
+    before being applied to physics (DART), while the clean targets are
+    saved as the supervision label.
+
+    Args:
+        teacher: WBCTeacher instance to step; its model/data are replaced
+            with the arena built from `scene_cfg`.
+        scene_cfg: Scene configuration dict from `sample_maneuver_scene`.
+        episode_idx: Episode index recorded in the `episode_index` column
+            and used in progress logs.
+        global_frame_offset: Running frame count offset added to the
+            per-frame `index` column.
+        noise_sigma: Standard deviation of the joint-target noise applied
+            for DART.
+        hard_maxsteps: Maximum number of control steps before the episode
+            ends (if the robot has not already fallen).
+        rng_noise: Random generator used for the DART noise. If None, a
+            fresh default generator is created.
+        verbose: If True, prints periodic progress lines every 100 steps.
+
+    Returns:
+        A dict with keys `rows`, `success`, `n_steps`, `landmark_passed`,
+        and `final_state`, or None if the robot fell during the episode.
     """
     if rng_noise is None:
         rng_noise = np.random.default_rng()
@@ -243,7 +264,14 @@ def run_maneuver_episode(
     }
 
 
-def main_generate(args):
+def main_generate(args: argparse.Namespace) -> None:
+    """Generates a maneuver DART dataset and writes it to `args.out`.
+
+    Args:
+        args: Parsed command-line arguments (see `main`), with fields
+            `seed`, `num_episodes`, `noise`, `maxsteps`, `out`, and
+            `verbose`.
+    """
     t0 = time.time()
 
     out_path = Path(args.out)
@@ -351,7 +379,8 @@ def main_generate(args):
     arr_p = np.array(all_proprio, dtype=np.float32) if all_proprio else np.zeros((1, 55))
     arr_a = np.array(all_actions, dtype=np.float32) if all_actions else np.zeros((1, 15))
 
-    def _stat(a):
+    def _stat(a: np.ndarray) -> dict[str, list[float]]:
+        """Computes per-dimension mean/std/min/max for stats.json."""
         return {"mean": a.mean(0).tolist(), "std": (a.std(0)+1e-6).tolist(),
                 "min": a.min(0).tolist(), "max": a.max(0).tolist()}
 
@@ -408,7 +437,12 @@ def main_generate(args):
     print(f"{'='*60}", flush=True)
 
 
-def main():
+def main() -> None:
+    """Parses CLI arguments and dispatches to the `generate` subcommand.
+
+    Raises:
+        SystemExit: If no subcommand is given (prints help and exits 1).
+    """
     ap = argparse.ArgumentParser(
         description="Maneuver DART dataset generator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
