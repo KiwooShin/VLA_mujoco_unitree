@@ -10,6 +10,17 @@ The only pretrained weights reused are the **GR00T-N1.6 language model** (frozen
 
 <sub>Live demo (`code/fancy_demo.py`): asked for a cube it can't see, the G1 scans, spots it 6.8 m away, and walks to it — passing a **same-color decoy ball** without losing lock, with the ego view (left) switching cameras automatically so the target stays in frame to the stop. Physics-only, WBC-free; policy inference is real-time-capable (3.4 ms vs the 20 ms/step budget) — the render-bound recording plays at ~2.75× sim time. Details of every element in the Method section below.</sub>
 
+## Demo gallery
+
+| | |
+|---|---|
+| ![Long-range navigation](assets/gallery/01_long_range.gif) | ![Search with reversal](assets/gallery/02_search_reversal.gif) |
+| Long-range navigation — scan, spot the cube at 8 m, walk in with camera handoff. | Search with reversal — scan direction flips before locking on, then walks to the target. |
+| ![Multi-goal instruction](assets/gallery/03_multi_goal.gif) | ![Same-color decoy discrimination](assets/gallery/04_twin_decoy.gif) |
+| Multi-goal instruction — reach goal 1, HUD resets, then search and reach goal 2. | Same-color decoy discrimination — heatmap locks the cube, ignoring an identical-colored ball nearby. |
+| ![Obstacle avoidance](assets/gallery/05_obstacle_weave.gif) | ![Detection-loss recovery](assets/gallery/06_loss_recovery.gif) |
+| Obstacle avoidance — repulsion arrow and path bend the robot around a blue cylinder. | Detection-loss recovery — lock expires into a re-scan, then reacquires and reaches the cone. |
+
 ## Results (closed-loop, seed 999, n=15, WBC-free deploy)
 
 | Task | Condition | Learned grounding (default) | Classical grounding (fallback) |

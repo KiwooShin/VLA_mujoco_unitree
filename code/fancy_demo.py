@@ -140,6 +140,62 @@ FIRST_SCENE_SEED = 1259
 
 
 # ---------------------------------------------------------------------------
+# VF-1 (docs/vf1_showpiece.md): render-side-only visual upgrade toggles.
+#
+# Every overlay gated below reads state that ALREADY EXISTS in run_fancy_rollout
+# (cached_goal_vec, _avoid_bias_wz, path_trail, current_state, ...) or a pure-read
+# cache populated alongside a computation the code already does (e.g.
+# code.grounding's GROUND_NET confidence-heatmap cache, populated inside the same
+# forward pass ground()/_ground_net() already runs every grounding cycle -- zero
+# extra inference). None of it writes back into anything a control-flow decision
+# reads (goal vectors, avoid bias, scan schedule, physics, RNG) -- these are
+# strictly VISUAL/OVERLAY additions on top of a behavior-frozen system.
+#
+# Individually toggleable (one env var per feature, default ON) so a recorder
+# can drop a single overlay that misbehaves without losing the rest.
+# FANCY_PLAIN=1 hard-disables ALL of them at once and restores the pre-VF1
+# rendering exactly (same functions / same code paths / same 960-ish x 480
+# canvas) — the single "something broke, fall back" switch.
+# ---------------------------------------------------------------------------
+def _fancy_env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip() == "1"
+
+
+FANCY_PLAIN = _fancy_env_flag("FANCY_PLAIN", "0")
+
+
+def _fancy_feat(name: str) -> bool:
+    """One VF-1 overlay toggle: default ON, forced OFF (regardless of its own
+    env var) whenever FANCY_PLAIN=1."""
+    if FANCY_PLAIN:
+        return False
+    return _fancy_env_flag(f"FANCY_{name}", "1")
+
+
+FEAT_HEATMAP    = _fancy_feat("HEATMAP")        # item 1: detector confidence overlay
+FEAT_AVOID_VIZ  = _fancy_feat("AVOID_VIZ")      # item 2: avoidance vector + corridor tint
+FEAT_HUD        = _fancy_feat("HUD")            # item 3: bottom HUD bar
+FEAT_TRAIL      = _fancy_feat("TRAIL_GRADIENT") # item 4: gradient trail + dashed goal line
+FEAT_TITLECARD  = _fancy_feat("TITLECARD")      # item 5: title card + outro stats card
+FEAT_HIRES      = _fancy_feat("HIRES")          # item 6: ~1600x600 canvas
+
+# Item 6 resolution: both panels displayed at 800x600. Native MuJoCo render sizes
+# (BEV_W/H, EGO_W/H below) are COMPLETELY UNCHANGED -- this is a cheap cv2.resize
+# on the already-rendered frame, never a higher-resolution render, so per-step
+# wall time is unaffected by this toggle (measured, see docs/vf1_showpiece.md).
+PANEL_DISPLAY_W = 800
+PANEL_DISPLAY_H = 600
+HUD_BAR_H       = 46    # extra strip appended below the two panels when FEAT_HUD
+
+# Detector heatmap overlay blend strength (gate check: keep in ~0.35-0.45 so the
+# scene stays legible underneath the color map).
+HEATMAP_ALPHA = 0.40
+
+# 5-stage skill breadcrumb shown in the HUD bar (item 3).
+SKILL_STAGES = ["SCAN", "LOCK", "WALK", "HANDOFF", "REACH"]
+
+
+# ---------------------------------------------------------------------------
 # World→BEV projection helper
 # ---------------------------------------------------------------------------
 
@@ -219,6 +275,119 @@ def world_to_bev_pixel(
 
 
 # ---------------------------------------------------------------------------
+# VF-1 small drawing helpers (pure cv2 pixel-pushing, no state reads beyond
+# their arguments)
+# ---------------------------------------------------------------------------
+def _dashed_line(img, p0, p1, color, thickness=2, dash_len=9, gap_len=7):
+    """Draw a dashed line segment from p0 to p1 (both (x,y) int tuples)."""
+    import cv2
+    x0, y0 = p0
+    x1, y1 = p1
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length < 1e-6:
+        return
+    n_dashes = max(1, int(length / (dash_len + gap_len)))
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash_len, length)
+        sx, sy = x0 + ux * pos, y0 + uy * pos
+        ex, ey = x0 + ux * seg_end, y0 + uy * seg_end
+        cv2.line(img, (int(round(sx)), int(round(sy))),
+                  (int(round(ex)), int(round(ey))), color, thickness, cv2.LINE_AA)
+        pos += dash_len + gap_len
+
+
+def _lerp_color_bgr(c_cool, c_warm, t: float):
+    """Linear-interpolate two BGR color tuples, t in [0,1] (0=cool, 1=warm)."""
+    t = max(0.0, min(1.0, t))
+    return tuple(int(round(a + (b - a) * t)) for a, b in zip(c_cool, c_warm))
+
+
+# Path-trail gradient endpoints (BGR): cool blue (old) -> warm orange/red (recent).
+TRAIL_COOL_BGR = (230, 120, 40)   # blue-ish
+TRAIL_WARM_BGR = (30,  90, 255)   # warm orange-red
+
+
+def draw_avoid_overlay(bev_img: np.ndarray, robot_xy: np.ndarray, robot_yaw: float,
+                       bev_cam: "mujoco.MjvCamera", model: "mujoco.MjModel",
+                       data: "mujoco.MjData", avoid_bias_wz: float,
+                       avoid_info: Optional[dict], fovy_deg: float = 45.0) -> np.ndarray:
+    """
+    VF-1 item 2: visualize NX-9 AVOID's obstacle-repulsion bias on the BEV panel.
+
+    Pure render-side read of the ALREADY-COMPUTED `avoid_bias_wz` / `avoid_info`
+    (code/avoid.py's compute_obstacle_bias() return values, cached by the caller
+    each grounding cycle) -- this function never calls compute_obstacle_bias
+    itself and never influences the value fed back into steer.py's control law.
+
+    No-op (returns bev_img unchanged) when the bias is within the deadband.
+    """
+    import cv2
+    from code import avoid as _avoid
+
+    if avoid_info is None or abs(avoid_bias_wz) < 1e-6:
+        return bev_img
+
+    img = bev_img
+    H, W = img.shape[:2]
+
+    def w2p(xy):
+        pix = world_to_bev_pixel(np.array([[xy[0], xy[1], 0.0]]), bev_cam, model, data, W, H, fovy_deg)
+        return (int(round(pix[0, 0])), int(round(pix[0, 1])))
+
+    # --- Obstacle-corridor wedge tint (same corridor geometry AVOID reads from
+    # the depth frame: +/-AVOID_CORRIDOR_HALF_DEG about the robot heading, out to
+    # AVOID_NEAR_M). Left/right halves shaded independently by L/R severity so the
+    # tint visually matches which side the obstacle mass is actually on. ---
+    half_rad = math.radians(_avoid.AVOID_CORRIDOR_HALF_DEG)
+    rng_m    = _avoid.AVOID_NEAR_M
+    n_pts    = 14
+    L = float(avoid_info.get('left', 0.0))
+    R = float(avoid_info.get('right', 0.0))
+
+    for side, sev in (("left", L), ("right", R)):
+        if sev <= 1e-4:
+            continue
+        if side == "left":
+            ang_lo, ang_hi = robot_yaw, robot_yaw + half_rad
+        else:
+            ang_lo, ang_hi = robot_yaw - half_rad, robot_yaw
+        poly = [[robot_xy[0], robot_xy[1]]]
+        for i in range(n_pts + 1):
+            ang = ang_lo + i * (ang_hi - ang_lo) / n_pts
+            poly.append([robot_xy[0] + rng_m * math.cos(ang),
+                         robot_xy[1] + rng_m * math.sin(ang)])
+        poly_pix = np.array([w2p(p) for p in poly], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [poly_pix], (20, 50, 200), cv2.LINE_AA)  # warm red-orange, BGR
+        a = 0.12 + 0.35 * min(1.0, sev)
+        cv2.addWeighted(overlay, a, img, 1.0 - a, 0, img)
+
+    # --- Repulsion arrow: bias_wz > 0 = steer LEFT, < 0 = steer RIGHT (same sign
+    # convention as steer.py/avoid.py). Drawn as a curved-looking short arrow
+    # tangential to the heading, scaled by |bias| / cap. ---
+    sev_overall = min(1.0, abs(avoid_bias_wz) / max(_avoid.AVOID_MAX_WZ_BIAS, 1e-6))
+    turn_sign   = 1.0 if avoid_bias_wz > 0 else -1.0
+    arrow_ang   = robot_yaw + turn_sign * (math.pi / 2.0) * (0.5 + 0.5 * sev_overall)
+    arrow_len_m = 0.5 + 1.2 * sev_overall
+    base_pt = w2p(robot_xy)
+    tip_pt  = w2p([robot_xy[0] + arrow_len_m * math.cos(arrow_ang),
+                   robot_xy[1] + arrow_len_m * math.sin(arrow_ang)])
+    cv2.arrowedLine(img, base_pt, tip_pt, (0, 210, 255), 3, cv2.LINE_AA, tipLength=0.35)
+
+    # --- "AVOID" indicator chip (top-left of BEV panel, only lit while active) ---
+    chip_txt = "AVOID"
+    cv2.rectangle(img, (6, 6), (76, 28), (0, 140, 255), -1)
+    cv2.putText(img, chip_txt, (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(img, chip_txt, (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (255, 255, 255), 1, cv2.LINE_AA)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
 # BEV Overlay drawing
 # ---------------------------------------------------------------------------
 
@@ -239,15 +408,21 @@ def draw_bev_overlays(
     goal_idx: int = 0,
     n_goals: int = 1,
     completed_targets: Optional[List[np.ndarray]] = None,  # already-reached targets
+    # VF-1 item 4: dashed robot->target goal line drawn in the target's own color.
+    target_color_bgr: Optional[tuple] = None,
+    # VF-1 item 2: AVOID visualization (pure read of already-computed bias/info).
+    avoid_bias_wz: float = 0.0,
+    avoid_info: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Draw all BEV overlays on bev_img (in-place + return).
 
     Overlays:
-      (a) PATH TRAIL — green polyline
+      (a) PATH TRAIL — green polyline (VF-1: gradient cool->warm when FEAT_TRAIL)
       (b) TARGET HIGHLIGHT — orange ring + cross
       (c) FOV CONE — yellow wedge on ground
       (d) STATUS BANNER — bottom banner with state + distance
+      (e) VF-1: AVOID repulsion viz (item 2), dashed goal line in target color (item 4)
     """
     import cv2
 
@@ -262,18 +437,28 @@ def draw_bev_overlays(
         return (int(round(pix[0, 0])), int(round(pix[0, 1])))
 
     # (a) PATH TRAIL — polyline of past base positions
+    # VF-1 item 4: gradient color by recency (cool blue -> warm orange/red),
+    # thicker line. FEAT_TRAIL=0 (or FANCY_PLAIN) keeps the exact original
+    # single-color fade-only trail.
     if len(path_trail) >= 2:
         pts_pix = []
         for xy in path_trail:
             p = w2p(xy)
             pts_pix.append(p)
-        for i in range(1, len(pts_pix)):
-            alpha = i / len(pts_pix)  # fade from dim to bright
-            c = tuple(int(x * alpha + x * 0.3) for x in COLOR_PATH_TRAIL)
-            # Clamp to image bounds before drawing
+        n_pts = len(pts_pix)
+        for i in range(1, n_pts):
             p0 = pts_pix[i - 1]
             p1 = pts_pix[i]
-            if (0 <= p0[0] < W and 0 <= p0[1] < H) or (0 <= p1[0] < W and 0 <= p1[1] < H):
+            if not ((0 <= p0[0] < W and 0 <= p0[1] < H) or (0 <= p1[0] < W and 0 <= p1[1] < H)):
+                continue
+            if FEAT_TRAIL:
+                t = i / max(1, n_pts - 1)          # 0 (oldest) -> 1 (most recent)
+                c = _lerp_color_bgr(TRAIL_COOL_BGR, TRAIL_WARM_BGR, t)
+                thickness = 2 + (2 if t > 0.7 else 0)
+                cv2.line(img, p0, p1, c, thickness, cv2.LINE_AA)
+            else:
+                alpha = i / n_pts  # fade from dim to bright (ORIGINAL behavior)
+                c = tuple(int(x * alpha + x * 0.3) for x in COLOR_PATH_TRAIL)
                 cv2.line(img, p0, p1, COLOR_PATH_TRAIL, 2, cv2.LINE_AA)
 
     # Robot position dot (white)
@@ -344,13 +529,25 @@ def draw_bev_overlays(
                 cv2.putText(img, "✓", (ct_pix[0] - 6, ct_pix[1] + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 220, 60), 1, cv2.LINE_AA)
 
-    # Draw a line from robot to target if target visible in BEV
+    # Draw a line from robot to target if target visible in BEV.
+    # VF-1 item 4: dashed, in the target's own color, when FEAT_TRAIL + a color
+    # was supplied; otherwise the exact original thin solid magenta line.
     if target_xy is not None and dist_to_target is not None:
         tgt_pix2 = w2p([target_xy[0], target_xy[1], 0.0])
         if (0 <= tgt_pix2[0] < W and 0 <= tgt_pix2[1] < H and
                 0 <= robot_pix[0] < W and 0 <= robot_pix[1] < H and
                 state in (STATE_MOVING, STATE_LOCATED)):
-            cv2.line(img, robot_pix, tgt_pix2, (180, 80, 255), 1, cv2.LINE_AA)
+            if FEAT_TRAIL and target_color_bgr is not None:
+                _dashed_line(img, robot_pix, tgt_pix2, target_color_bgr, thickness=2)
+            else:
+                cv2.line(img, robot_pix, tgt_pix2, (180, 80, 255), 1, cv2.LINE_AA)
+
+    # VF-1 item 2: AVOID repulsion visualization (corridor tint + arrow + chip).
+    # Pure read of already-computed avoid_bias_wz/avoid_info -- no-op internally
+    # when the bias is within the deadband.
+    if FEAT_AVOID_VIZ:
+        img = draw_avoid_overlay(img, robot_xy, robot_yaw, bev_cam, model, data,
+                                  avoid_bias_wz, avoid_info, fovy_deg=fovy_deg)
 
     # (d) STATUS BANNER — bottom strip (56px normal, 68px for multi-goal)
     banner_h = 68 if n_goals > 1 else 56
@@ -414,6 +611,63 @@ def draw_bev_overlays(
     return img
 
 
+_STATE_COLOR_MAP = {
+    STATE_SEARCHING: COLOR_STATE_SEARCH,
+    STATE_LOCATED:   COLOR_STATE_LOCATE,
+    STATE_MOVING:    COLOR_STATE_MOVE,
+    STATE_REACHED:   COLOR_STATE_REACH,
+    STATE_FAILED:    (100, 100, 100),
+    STATE_IDLE:      (150, 150, 150),
+}
+
+
+def draw_detector_heatmap_overlay(ego_bgr: np.ndarray, heatmap_cache: Optional[dict],
+                                  target_color: str, target_shape: str,
+                                  alpha: float = HEATMAP_ALPHA):
+    """
+    VF-1 item 1: blend the NX-6 GROUND_NET detector's OWN confidence heatmap
+    (cached by code/grounding.py's _ground_net() the same cycle it already ran
+    the forward pass for detection -- ZERO extra inference here) onto the ego
+    panel as a semi-transparent color map.
+
+    Render-side only: reads a cache, writes only to the returned image copy.
+    No-op (returns (ego_bgr, None) unchanged) when GROUND_NET was never
+    invoked, the cache is empty/stale (wrong color+shape query -- i.e. the
+    cache belongs to a different target than the one THIS episode is
+    pursuing), or the cached cycle did not accept a detection.
+
+    Returns (blended_bgr, confidence_or_None).
+    """
+    import cv2
+    if heatmap_cache is None or heatmap_cache.get('prob') is None:
+        return ego_bgr, None
+    if (heatmap_cache.get('color') != target_color.lower().strip() or
+            heatmap_cache.get('shape') != target_shape.lower().strip()):
+        return ego_bgr, None
+    if not heatmap_cache.get('accepted', False):
+        return ego_bgr, None
+
+    prob = heatmap_cache['prob']
+    h, w = ego_bgr.shape[:2]
+    prob_r = cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
+    prob_u8 = np.clip(prob_r * 255.0, 0, 255).astype(np.uint8)
+    heat_bgr = cv2.applyColorMap(prob_u8, cv2.COLORMAP_JET)
+
+    # Per-pixel alpha proportional to confidence (capped at `alpha`) -- a smooth
+    # glow that fades out with confidence rather than a hard-edged patch, and
+    # is a provable no-op (alpha~0) wherever the map says "nothing here" (gate
+    # check: heatmap must not obscure the scene). A small blur spreads the
+    # (typically tight, few-pixel) detector peak into a visible glow radius --
+    # purely a display nicety, the underlying confidence values are unchanged.
+    alpha_map = np.clip(prob_r, 0.0, 1.0) * alpha
+    blur_px = max(3, int(round(0.02 * w))) | 1   # odd kernel size, ~2% of panel width
+    alpha_map = cv2.GaussianBlur(alpha_map, (blur_px, blur_px), 0)
+    alpha_map = alpha_map[..., None]
+    out = (heat_bgr.astype(np.float32) * alpha_map +
+           ego_bgr.astype(np.float32) * (1.0 - alpha_map)).astype(np.uint8)
+    return out, float(heatmap_cache.get('confidence', 0.0))
+
+
 def compose_sbs_frame(
     ego_rgb: np.ndarray,   # (EGO_H, EGO_W, 3) uint8 RGB — CAM-2 ACTIVE camera feed
     bev_img: np.ndarray,   # (BEV_H, BEV_W, 3) uint8 BGR
@@ -423,53 +677,287 @@ def compose_sbs_frame(
     goal_idx: int = 0,
     n_goals: int = 1,
     active_cam: str = "GROUNDING",   # CAM-2 (docs/cam_p1.md): 'GROUNDING' (head, far) | 'PROXIMITY' (near)
+    # VF-1 item 1: detector heatmap cache + the query it should match.
+    heatmap_cache: Optional[dict] = None,
+    target_color: str = "",
+    target_shape: str = "",
+    # VF-1 item 3: HUD bar context dict (see draw_hud_bar) — None disables it
+    # regardless of FEAT_HUD.
+    hud_ctx: Optional[dict] = None,
 ) -> np.ndarray:
     """
-    Compose side-by-side frame: ego (left, CAM-2 active-camera feed) | BEV (right).
+    Compose side-by-side frame: ego (left, CAM-2 active-camera feed) | BEV (right)
+    [+ VF-1 bottom HUD strip when FEAT_HUD and hud_ctx is given].
 
-    Returns (max_h, total_w, 3) uint8 BGR frame.
+    Returns (H, W, 3) uint8 BGR frame. When every VF-1 toggle is off (FANCY_PLAIN=1)
+    this reproduces the pre-VF1 frame byte-for-byte (same resize target, same badge
+    layout, same divider).
     """
     import cv2
 
     # Convert ego from RGB to BGR
     ego_bgr = cv2.cvtColor(ego_rgb, cv2.COLOR_RGB2BGR)
 
-    # Scale ego to match BEV height
-    target_h = BEV_H
-    if ego_bgr.shape[0] != target_h:
-        scale = target_h / ego_bgr.shape[0]
-        ego_bgr = cv2.resize(ego_bgr, (int(ego_bgr.shape[1] * scale), target_h))
+    # VF-1 item 6: display both panels at PANEL_DISPLAY_W x PANEL_DISPLAY_H
+    # (upscaled from the UNCHANGED native render sizes via cv2.resize — no
+    # extra MuJoCo render cost). Falls back to the exact original "scale ego
+    # to BEV_H, keep BEV native" behavior when FEAT_HIRES is off.
+    if FEAT_HIRES:
+        target_h = PANEL_DISPLAY_H
+        if (ego_bgr.shape[1], ego_bgr.shape[0]) != (PANEL_DISPLAY_W, PANEL_DISPLAY_H):
+            ego_bgr = cv2.resize(ego_bgr, (PANEL_DISPLAY_W, PANEL_DISPLAY_H), interpolation=cv2.INTER_LINEAR)
+        if (bev_img.shape[1], bev_img.shape[0]) != (PANEL_DISPLAY_W, PANEL_DISPLAY_H):
+            bev_img = cv2.resize(bev_img, (PANEL_DISPLAY_W, PANEL_DISPLAY_H), interpolation=cv2.INTER_LINEAR)
+    else:
+        target_h = BEV_H
+        if ego_bgr.shape[0] != target_h:
+            scale = target_h / ego_bgr.shape[0]
+            ego_bgr = cv2.resize(ego_bgr, (int(ego_bgr.shape[1] * scale), target_h))
 
-    # Ego overlay: state badge + active-camera label
-    badge_h = 36
+    # VF-1 item 1: blend the detector heatmap AFTER the resize (so both the
+    # color blend and the text tag below are at final display resolution).
+    heatmap_conf = None
+    if FEAT_HEATMAP:
+        ego_bgr, heatmap_conf = draw_detector_heatmap_overlay(ego_bgr, heatmap_cache,
+                                                              target_color, target_shape)
+
+    # Ego overlay: state badge + active-camera label. VF-1: larger badge/font
+    # when FEAT_HIRES (kept at the original small size otherwise).
+    badge_h = 70 if FEAT_HIRES else 36
     cv2.rectangle(ego_bgr, (0, 0), (ego_bgr.shape[1], badge_h), (20, 20, 20), -1)
-    state_color_map = {
-        STATE_SEARCHING: COLOR_STATE_SEARCH,
-        STATE_LOCATED:   COLOR_STATE_LOCATE,
-        STATE_MOVING:    COLOR_STATE_MOVE,
-        STATE_REACHED:   COLOR_STATE_REACH,
-        STATE_FAILED:    (100, 100, 100),
-        STATE_IDLE:      (150, 150, 150),
-    }
-    sc = state_color_map.get(state, (200, 200, 200))
-    cv2.rectangle(ego_bgr, (4, 4), (90, 30), sc, -1)
-    cv2.putText(ego_bgr, state[:10], (7, 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+    sc = _STATE_COLOR_MAP.get(state, (200, 200, 200))
+    if FEAT_HIRES:
+        cv2.rectangle(ego_bgr, (10, 8), (240, 58), sc, -1)
+        cv2.putText(ego_bgr, state, (20, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 0), 3, cv2.LINE_AA)
+    else:
+        cv2.rectangle(ego_bgr, (4, 4), (90, 30), sc, -1)
+        cv2.putText(ego_bgr, state[:10], (7, 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
     # CAM-2 handoff label: "HEAD CAM" (GROUNDING, far) / "PROXIMITY CAM" (near) —
     # makes the camera handoff visible to viewers, distinct from the small
     # "CAM: GROUNDING|PROXIMITY d=X.XXm" overlay already baked into ego_rgb by
     # _label_active_cam() in the main rollout loop.
     cam_label = "PROXIMITY CAM" if active_cam == "PROXIMITY" else "HEAD CAM"
     cam_color = (60, 210, 255) if active_cam == "PROXIMITY" else (255, 200, 150)
-    (tw, _), _ = cv2.getTextSize(cam_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-    cv2.putText(ego_bgr, cam_label, (ego_bgr.shape[1] - tw - 8, 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, cam_color, 1, cv2.LINE_AA)
+    cam_font  = 0.9 if FEAT_HIRES else 0.4
+    cam_thick = 2 if FEAT_HIRES else 1
+    (tw, th_), _ = cv2.getTextSize(cam_label, cv2.FONT_HERSHEY_SIMPLEX, cam_font, cam_thick)
+    cam_tx = ego_bgr.shape[1] - tw - (16 if FEAT_HIRES else 8)
+    cam_ty = 44 if FEAT_HIRES else 23
+    # VF-1 item 3: flash the camera chip's background for a few frames right
+    # after a GROUNDING<->PROXIMITY handoff (hud_ctx['cam_flash'], a pure
+    # render-side counter maintained by the caller — never read by control).
+    if hud_ctx is not None and hud_ctx.get('cam_flash'):
+        pad = 6
+        cv2.rectangle(ego_bgr, (cam_tx - pad, cam_ty - th_ - pad),
+                      (cam_tx + tw + pad, cam_ty + pad), (0, 255, 255), -1)
+        cv2.putText(ego_bgr, cam_label, (cam_tx, cam_ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, cam_font, (0, 0, 0), cam_thick, cv2.LINE_AA)
+    else:
+        cv2.putText(ego_bgr, cam_label, (cam_tx, cam_ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, cam_font, cam_color, cam_thick, cv2.LINE_AA)
+
+    # VF-1 item 1: "NEURAL DETECTOR" tag + live confidence, bottom-left of the
+    # ego panel (drawn at final display resolution for a crisp font).
+    if FEAT_HEATMAP and heatmap_conf is not None:
+        tag = f"NEURAL DETECTOR  conf={heatmap_conf:.2f}"
+        tag_font = 0.62 if FEAT_HIRES else 0.38
+        ty = ego_bgr.shape[0] - (14 if FEAT_HIRES else 8)
+        cv2.putText(ego_bgr, tag, (10, ty), cv2.FONT_HERSHEY_SIMPLEX, tag_font,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(ego_bgr, tag, (10, ty), cv2.FONT_HERSHEY_SIMPLEX, tag_font,
+                    (60, 255, 210), 1, cv2.LINE_AA)
 
     # Divider line
-    divider = np.full((target_h, 3, 3), 60, dtype=np.uint8)
+    divider = np.full((ego_bgr.shape[0], 3, 3), 60, dtype=np.uint8)
 
     sbs = np.concatenate([ego_bgr, divider, bev_img], axis=1)
+
+    # VF-1 item 3: bottom HUD bar (separate strip, full canvas width).
+    if FEAT_HUD and hud_ctx is not None:
+        hud_strip = draw_hud_bar(sbs.shape[1], hud_ctx)
+        sbs = np.concatenate([sbs, hud_strip], axis=0)
+
     return sbs
+
+
+def draw_hud_bar(width: int, ctx: dict) -> np.ndarray:
+    """
+    VF-1 item 3: bottom HUD strip spanning the full canvas width --
+      - typed instruction, verbatim (left)
+      - live distance + bearing, step counter, walk speed (right)
+      - 5-stage skill breadcrumb SCAN > LOCK > WALK > HANDOFF > REACH, active
+        stage highlighted (center)
+      - camera-in-use chip (HEAD/PROXIMITY), flashes for a few frames right
+        after a handoff
+
+    Pure render-side function: every field in `ctx` is a read of state that
+    already exists in run_fancy_rollout (see its call site in _render_sbs_frame).
+    """
+    import cv2
+    h = HUD_BAR_H
+    img = np.full((h, width, 3), (18, 18, 24), dtype=np.uint8)
+    cv2.line(img, (0, 0), (width, 0), (70, 70, 90), 1, cv2.LINE_AA)
+
+    # --- Left: typed instruction, verbatim (truncated only if it can't fit) ---
+    prompt = ctx.get('prompt') or ''
+    max_chars = max(10, width // 12)
+    prompt_disp = prompt if len(prompt) <= max_chars else prompt[:max_chars - 3] + "..."
+    cv2.putText(img, f'"{prompt_disp}"', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (220, 220, 235), 1, cv2.LINE_AA)
+
+    # --- Center: skill breadcrumb ---
+    stage_idx = ctx.get('stage_idx', -1)
+    # Pre-measure total width so the breadcrumb is truly centered.
+    seg_font, sep = 0.44, "  >  "
+    widths = [cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, seg_font, 2)[0][0] for s in SKILL_STAGES]
+    sep_w  = cv2.getTextSize(sep, cv2.FONT_HERSHEY_SIMPLEX, seg_font, 1)[0][0]
+    total_w = sum(widths) + sep_w * (len(SKILL_STAGES) - 1)
+    bc_x = max(10, (width - total_w) // 2)
+    bc_y = 28
+    for i, lab in enumerate(SKILL_STAGES):
+        active = (i == stage_idx)
+        done = (i < stage_idx)
+        color = (255, 255, 255) if active else ((100, 220, 130) if done else (95, 95, 105))
+        thick = 2 if active else 1
+        if active:
+            (tw, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, seg_font, thick)
+            cv2.rectangle(img, (bc_x - 6, bc_y - th - 6), (bc_x + tw + 6, bc_y + 6), (150, 90, 20), -1)
+        cv2.putText(img, lab, (bc_x, bc_y), cv2.FONT_HERSHEY_SIMPLEX, seg_font, color, thick, cv2.LINE_AA)
+        bc_x += widths[i]
+        if i < len(SKILL_STAGES) - 1:
+            cv2.putText(img, sep, (bc_x, bc_y), cv2.FONT_HERSHEY_SIMPLEX, seg_font, (90, 90, 100), 1, cv2.LINE_AA)
+            bc_x += sep_w
+
+    # --- Right: distance / bearing / step / speed + camera chip ---
+    dist        = ctx.get('dist')
+    bearing_deg = ctx.get('bearing_deg')
+    step        = ctx.get('step', 0)
+    speed       = ctx.get('walk_speed_mps', 0.0)
+    parts = []
+    if dist is not None:
+        parts.append(f"dist={dist:.2f}m")
+    if bearing_deg is not None:
+        parts.append(f"brg={bearing_deg:+.0f}deg")
+    parts.append(f"step={step}")
+    parts.append(f"v={speed:.2f}m/s")
+    txt = "   ".join(parts)
+
+    chip_w = 118
+    (txt_w, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+    chip_x0 = width - 12 - chip_w
+    cv2.putText(img, txt, (chip_x0 - txt_w - 18, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                (150, 220, 255), 1, cv2.LINE_AA)
+
+    active_cam = ctx.get('active_cam', 'GROUNDING')
+    cam_flash  = bool(ctx.get('cam_flash'))
+    cam_label  = "PROXIMITY" if active_cam == 'PROXIMITY' else "HEAD"
+    cam_color  = (60, 210, 255) if active_cam == 'PROXIMITY' else (255, 200, 150)
+    chip_bg    = (0, 230, 255) if cam_flash else (48, 48, 58)
+    cv2.rectangle(img, (chip_x0, 8), (chip_x0 + chip_w, h - 8), chip_bg, -1)
+    cv2.rectangle(img, (chip_x0, 8), (chip_x0 + chip_w, h - 8), (90, 90, 100), 1)
+    cv2.putText(img, f"CAM: {cam_label}", (chip_x0 + 8, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (0, 0, 0) if cam_flash else cam_color, 1, cv2.LINE_AA)
+
+    return img
+
+
+def _final_canvas_dims() -> Tuple[int, int]:
+    """
+    Mirrors compose_sbs_frame's own size arithmetic WITHOUT rendering anything,
+    so the title/outro card frames (built before/after the simulation loop, with
+    no ego/bev frame at hand) match the exact (H, W) of the per-step SBS frames
+    -- required since every frame appended to one video must share one shape.
+    """
+    if FEAT_HIRES:
+        w = PANEL_DISPLAY_W * 2 + 3
+        h = PANEL_DISPLAY_H
+    else:
+        # ORIGINAL sizing: ego (always resized to EGO_W x EGO_H by
+        # _label_active_cam) is rescaled to BEV_H tall in compose_sbs_frame,
+        # i.e. width = EGO_W * (BEV_H / EGO_H); BEV stays native BEV_W x BEV_H.
+        w = int(EGO_W * (BEV_H / EGO_H)) + 3 + BEV_W
+        h = BEV_H
+    if FEAT_HUD:
+        h += HUD_BAR_H
+    return h, w
+
+
+def make_title_card(instruction: str, scenario_title: str, frame_idx: int, n_frames: int) -> np.ndarray:
+    """
+    VF-1 item 5: ~1.5s pre-roll title card -- scenario name (large) + the
+    typed instruction, with a short fade-in over the first ~10 frames. Static
+    content generated BEFORE the simulation loop starts (see its call site in
+    run_fancy_rollout) -- purely additive frames, never interleaved with control.
+    """
+    import cv2
+    h, w = _final_canvas_dims()
+    img = np.full((h, w, 3), (24, 18, 14), dtype=np.uint8)
+    cv2.rectangle(img, (0, 0), (w - 1, h - 1), (60, 50, 40), 2)
+
+    fade = min(1.0, frame_idx / 10.0)
+
+    def _fade(bgr):
+        return tuple(int(c * fade) for c in bgr)
+
+    title = scenario_title
+    font_scale_title = min(1.8, w / 700.0)
+    (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, font_scale_title, 3)
+    cv2.putText(img, title, ((w - tw) // 2, h // 2 - 50), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale_title, _fade((230, 230, 235)), 3, cv2.LINE_AA)
+
+    instr = f'"{instruction}"'
+    font_scale_instr = min(1.1, w / 900.0)
+    (iw, ih), _ = cv2.getTextSize(instr, cv2.FONT_HERSHEY_SIMPLEX, font_scale_instr, 2)
+    cv2.putText(img, instr, ((w - iw) // 2, h // 2 + 20), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale_instr, _fade((120, 220, 255)), 2, cv2.LINE_AA)
+
+    sub = "G1 HUMANOID  -  AUTONOMOUS VISUAL SEARCH & RETRIEVAL"
+    (sw, sh), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.putText(img, sub, ((w - sw) // 2, h // 2 + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                _fade((150, 150, 160)), 1, cv2.LINE_AA)
+
+    pipeline = "   ".join(SKILL_STAGES)
+    (pw, ph), _ = cv2.getTextSize(pipeline, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.putText(img, pipeline, ((w - pw) // 2, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                _fade((90, 200, 140)), 1, cv2.LINE_AA)
+
+    return img
+
+
+def make_outro_card(last_frame: np.ndarray, sim_time_s: float, dist_traveled_m: float,
+                    final_dist_m: float, steps: int) -> np.ndarray:
+    """
+    VF-1 item 5: ~2s freeze-frame on REACHED with a stats card overlay (elapsed
+    sim time, distance traveled, final distance to target, step count). Built
+    from the ACTUAL last rendered SBS frame (scene/robot/target still visible)
+    plus a semi-transparent stats panel -- never re-renders anything.
+    """
+    import cv2
+    img = last_frame.copy()
+    h, w = img.shape[:2]
+
+    panel_w = min(440, w - 40)
+    panel_h = 190
+    px0, py0 = (w - panel_w) // 2, (h - panel_h) // 2
+    overlay = img.copy()
+    cv2.rectangle(overlay, (px0, py0), (px0 + panel_w, py0 + panel_h), (18, 18, 18), -1)
+    cv2.addWeighted(overlay, 0.80, img, 0.20, 0, img)
+    cv2.rectangle(img, (px0, py0), (px0 + panel_w, py0 + panel_h), (90, 220, 140), 2)
+
+    cv2.putText(img, "REACHED", (px0 + 22, py0 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95,
+                (90, 220, 140), 2, cv2.LINE_AA)
+    lines = [
+        f"time:       {sim_time_s:5.1f} s",
+        f"traveled:   {dist_traveled_m:5.2f} m",
+        f"final dist: {final_dist_m:5.3f} m",
+        f"steps:      {steps}",
+    ]
+    for i, ln in enumerate(lines):
+        cv2.putText(img, ln, (px0 + 22, py0 + 74 + i * 27), cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                    (230, 230, 230), 1, cv2.LINE_AA)
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +978,13 @@ def run_fancy_rollout(
     n_goals: int = 1,
     path_trail_in: Optional[List[np.ndarray]] = None,  # carry trail from prior sub-goals
     completed_targets: Optional[List[np.ndarray]] = None,  # already-reached targets
+    # VF-1 item 5: title card scenario name (CLI: --scenario-title). Only ever
+    # rendered when goal_idx == 0 (once per overall episode, not per sub-goal).
+    scenario_title: str = "G1Nav Autonomous Fetch",
+    # VF-1 item 5: full instruction text for the title card, if different from
+    # the per-sub-goal `prompt` (e.g. multi-goal's combined instruction).
+    # Defaults to `prompt` when not given.
+    title_instruction: Optional[str] = None,
 ) -> dict:
     """
     Search-then-goto rollout with ego|BEV side-by-side frames + 4 overlays.
@@ -510,7 +1005,8 @@ def run_fancy_rollout(
     from code.arena import build_arena, ArenaRenderer, GROUNDING_W, GROUNDING_H
     from code.teacher import (WBCTeacher, _yaw_of, DEFAULT_ANGLES, KPS, KDS,
                                NUM_ACTIONS, SIM_DT, CONTROL_DECIMATION)
-    from code.grounding import ground as classical_ground, get_ego_intrinsics_rendered
+    from code.grounding import (ground as classical_ground, get_ego_intrinsics_rendered,
+                                get_ground_net_last_heatmap)
     from code.steer import steer as _steer_cmd
     from code.eval_search import STOP_R_SEARCH, SCAN_ALIGNED_THR_DEG
     from code.scan_sched import (BidirectionalScanSchedule, SCAN_LEG_DEG,
@@ -749,6 +1245,10 @@ def run_fancy_rollout(
     _avoid_is_maneuver   = (_avoid.AVOID and _avoid.is_maneuver_scene(scene_cfg))
     _avoid_cycles_total  = 0
     _avoid_cycles_active = 0
+    # VF-1 item 2: last obstacle-bias debug dict (compute_obstacle_bias()'s own
+    # `info` return) -- pure read target for draw_avoid_overlay(); never fed
+    # back into the bias/control computation above.
+    _last_avoid_dbg      = None
 
     spotted     = False
     scan_steps  = 0
@@ -769,6 +1269,38 @@ def run_fancy_rollout(
     current_dist  = float(np.linalg.norm(data_mj.qpos[0:2] - target_xy))
 
     TRAIL_SUBSAMPLE = 3    # record every N steps
+
+    # VF-1 telemetry (pure-read/pure-accumulate, never fed back into control):
+    #  - dist_traveled_m: running odometry total, for the outro stats card.
+    #  - _hud_state: camera-handoff flash countdown for the HUD bar / cam chip
+    #    (item 3) -- rendering-only mutable state, never read by any control path.
+    dist_traveled_m = 0.0
+    _prev_rxy_odom  = np.array([rx, ry], dtype=np.float64)
+    _hud_state = {"prev_cam": None, "flash_frames_left": 0}
+    CAM_FLASH_FRAMES = 10
+
+    def _hud_cam_flash_update(active_cam_now: str) -> bool:
+        """VF-1 item 3: returns True while a recent GROUNDING<->PROXIMITY handoff
+        should still be flashing the camera chip. Render-side only."""
+        if _hud_state["prev_cam"] is not None and _hud_state["prev_cam"] != active_cam_now:
+            _hud_state["flash_frames_left"] = CAM_FLASH_FRAMES
+        _hud_state["prev_cam"] = active_cam_now
+        flashing = _hud_state["flash_frames_left"] > 0
+        if flashing:
+            _hud_state["flash_frames_left"] -= 1
+        return flashing
+
+    def _skill_stage_idx() -> int:
+        """VF-1 item 3: map the existing state-machine variables to the 5-stage
+        breadcrumb SCAN>LOCK>WALK>HANDOFF>REACH. Pure read of _scan_active /
+        current_state / _active_cam -- computes a display index only."""
+        if _scan_active:
+            return 0  # SCAN
+        if current_state == STATE_LOCATED:
+            return 1  # LOCK
+        if current_state == STATE_REACHED:
+            return 4  # REACH
+        return 3 if _active_cam == 'PROXIMITY' else 2  # HANDOFF vs WALK
 
     def _update_bev_cam():
         """Follow robot with BEV camera."""
@@ -800,7 +1332,14 @@ def run_fancy_rollout(
         bev_raw = renderer.render_tp(data_mj, bev_cam)   # (480, 640, 3) RGB
         bev_bgr = cv2.cvtColor(bev_raw, cv2.COLOR_RGB2BGR)
 
-        # Draw overlays (FD2: pass goal progress + completed targets)
+        # VF-1 item 4: dashed goal-line color = the target's own scene color (BGR).
+        _tgt_rgb = target_obj.get('color_rgb')
+        target_color_bgr = ((int(_tgt_rgb[2]), int(_tgt_rgb[1]), int(_tgt_rgb[0])
+                              ) if _tgt_rgb is not None else None)
+
+        # Draw overlays (FD2: pass goal progress + completed targets; VF-1: pass
+        # AVOID bias/info -- pure read of the control loop's own already-computed
+        # state -- and the target's color for the dashed goal line)
         bev_bgr = draw_bev_overlays(
             bev_img=bev_bgr,
             path_trail=path_trail,
@@ -816,11 +1355,55 @@ def run_fancy_rollout(
             goal_idx=goal_idx,
             n_goals=n_goals,
             completed_targets=_completed_targets,
+            target_color_bgr=target_color_bgr,
+            avoid_bias_wz=_avoid_bias_wz,
+            avoid_info=_last_avoid_dbg,
         )
 
+        # VF-1 item 1: last cached GROUND_NET heatmap (None when GROUND_NET is
+        # off / never fired / query doesn't match this episode's target).
+        heatmap_cache = get_ground_net_last_heatmap() if FEAT_HEATMAP else None
+
+        # VF-1 item 3: HUD bar context -- pure reads of state that already
+        # exists in this function (proprio-derived speed, geometry-derived
+        # bearing, the loop's own step/prompt, the skill-stage mapping above).
+        hud_ctx = None
+        if FEAT_HUD:
+            bearing_deg = _math.degrees(_math.atan2(target_xy[1] - rxy[1],
+                                                     target_xy[0] - rxy[0]) - yaw_now)
+            bearing_deg = _math.degrees(_math.atan2(_math.sin(_math.radians(bearing_deg)),
+                                                     _math.cos(_math.radians(bearing_deg))))
+            walk_speed = float(np.linalg.norm(data_mj.qvel[0:2]))
+            cam_flash  = _hud_cam_flash_update(_active_cam)
+            hud_ctx = dict(
+                prompt=prompt, dist=dist, bearing_deg=bearing_deg, step=step,
+                walk_speed_mps=walk_speed, stage_idx=_skill_stage_idx(),
+                active_cam=_active_cam, cam_flash=cam_flash,
+            )
+
         sbs = compose_sbs_frame(ego_rgb, bev_bgr, current_state, prompt, dist,
-                                goal_idx=goal_idx, n_goals=n_goals, active_cam=_active_cam)
+                                goal_idx=goal_idx, n_goals=n_goals, active_cam=_active_cam,
+                                heatmap_cache=heatmap_cache, target_color=target_color,
+                                target_shape=target_shape, hud_ctx=hud_ctx)
         return sbs, dist
+
+    # ------------------------------------------------------------------
+    # VF-1 item 5: title card pre-roll (~1.5s @ 25fps), once per overall
+    # episode (goal_idx==0 only -- a multi-goal run's later sub-goals don't
+    # repeat it). Static frames appended BEFORE the simulation loop below
+    # starts -- never interleaved with control, purely additive to the video.
+    # ------------------------------------------------------------------
+    if render_video and FEAT_TITLECARD and goal_idx == 0:
+        N_TITLE_FRAMES = 38   # ~1.5s @ 25fps
+        _title_instr = title_instruction if title_instruction is not None else prompt
+        for _fi in range(N_TITLE_FRAMES):
+            _card = make_title_card(_title_instr, scenario_title, _fi, N_TITLE_FRAMES)
+            frames_sbs.append(_card)
+            if frame_callback:
+                try:
+                    frame_callback(_card, STATE_IDLE, None, -1)
+                except Exception:
+                    pass
 
     for step in range(maxsteps):
         t0 = time.perf_counter()
@@ -980,6 +1563,7 @@ def run_fancy_rollout(
                         goal_dist_m=_avoid_goal_dist_now,
                         goal_bearing_rad=_avoid_goal_bearing_now,
                         prev_bias_wz=_avoid_bias_wz, carved_out=_avoid_carved)
+                    _last_avoid_dbg = _avoid_dbg   # VF-1: pure-read cache for the BEV viz
                 if abs(_avoid_bias_wz) > 1e-9:
                     _avoid_cycles_active += 1
 
@@ -1051,6 +1635,13 @@ def run_fancy_rollout(
                 prev_action = target_dof.copy()
                 steps_done = step + 1
 
+                # VF-1 item 5: odometry accumulator for the outro stats card
+                # (pure telemetry read -- data_mj.qpos already updated by the
+                # mj_step() calls above; never influences any decision).
+                _rxy_now_odom = data_mj.qpos[0:2].copy()
+                dist_traveled_m += float(np.linalg.norm(_rxy_now_odom - _prev_rxy_odom))
+                _prev_rxy_odom = _rxy_now_odom
+
                 # Render SBS frame for video / stream
                 if render_video and _video_frame_cache is not None:
                     try:
@@ -1111,6 +1702,12 @@ def run_fancy_rollout(
         prev_action = student_dof.copy()
         steps_done  = step + 1
 
+        # VF-1 item 5: odometry accumulator for the outro stats card (same
+        # pure-telemetry read as the scan branch above).
+        _rxy_now_odom = data_mj.qpos[0:2].copy()
+        dist_traveled_m += float(np.linalg.norm(_rxy_now_odom - _prev_rxy_odom))
+        _prev_rxy_odom = _rxy_now_odom
+
         if render_video and _video_frame_cache is not None:
             try:
                 sbs, dist = _render_sbs_frame()
@@ -1157,6 +1754,27 @@ def run_fancy_rollout(
     ms_per_step = float(np.mean(step_times)) if step_times else 0.0
     print(f"  [fancy] DONE: {failure_tag}  final_dist={final_dist:.3f}m  "
           f"steps={steps_done}  ms/step={ms_per_step:.1f}", flush=True)
+
+    # ------------------------------------------------------------------
+    # VF-1 item 5: outro stats card (~2s freeze @ 25fps) on a successful
+    # REACHED finish -- built from the actual LAST rendered SBS frame (so the
+    # scene/robot/target are still visible) + a stats overlay (elapsed sim
+    # time, distance traveled, final distance). Only appended once, at the
+    # FINAL sub-goal (goal_idx == n_goals-1), so a multi-goal run gets one
+    # outro at the very end rather than one per sub-goal.
+    # ------------------------------------------------------------------
+    if render_video and FEAT_TITLECARD and success and goal_idx == (n_goals - 1) and frames_sbs:
+        N_OUTRO_FRAMES = 50   # ~2s @ 25fps
+        sim_time_s = steps_done * SIM_DT * CONTROL_DECIMATION
+        _outro = make_outro_card(frames_sbs[-1], sim_time_s, dist_traveled_m,
+                                 final_dist, steps_done)
+        for _ in range(N_OUTRO_FRAMES):
+            frames_sbs.append(_outro)
+            if frame_callback:
+                try:
+                    frame_callback(_outro, STATE_REACHED, final_dist, steps_done)
+                except Exception:
+                    pass
 
     # Save MP4 in background
     out_vid = None
@@ -1375,6 +1993,9 @@ def run_fancy_rollout_multi(
     render_video: bool = True,
     video_path: Optional[str] = None,
     frame_callback=None,
+    # VF-1 item 5: title card params, forwarded to the FIRST sub-goal's
+    # run_fancy_rollout() call (which is the only one that renders a title card).
+    scenario_title: str = "G1Nav Autonomous Fetch",
 ) -> dict:
     """
     Execute sequential sub-goals on the SAME scene.
@@ -1441,6 +2062,8 @@ def run_fancy_rollout_multi(
             n_goals=n_goals,
             path_trail_in=path_trail,
             completed_targets=completed_targets,
+            scenario_title=scenario_title,
+            title_instruction=" then ".join(g.get("prompt_part", f"{g['color']} {g['shape']}") for g in goals),
         )
 
         # Carry trail forward
@@ -2221,6 +2844,7 @@ def _start_fancy_web_ui(
     port: int = WEB_PORT,
     maxsteps: int = MAXSTEPS_FANCY,
     render_video: bool = True,
+    scenario_title: str = "G1Nav Autonomous Fetch",
 ):
     """Start Flask web UI for fancy demo in a background thread."""
     try:
@@ -2286,6 +2910,7 @@ def _start_fancy_web_ui(
                     render_video=render_video,
                     video_path=vid_path,
                     frame_callback=_cb,
+                    scenario_title=scenario_title,
                 )
             else:
                 # NX-15: target comes from the resolved instruction, not the
@@ -2302,6 +2927,7 @@ def _start_fancy_web_ui(
                     render_video=render_video,
                     video_path=vid_path,
                     frame_callback=_cb,
+                    scenario_title=scenario_title,
                 )
         except Exception as e:
             import traceback
@@ -2472,6 +3098,7 @@ def run_smoke(
     maxsteps: int = MAXSTEPS_FANCY,
     render_video: bool = True,
     n_episodes: int = 6,
+    scenario_title: str = "G1Nav Autonomous Fetch",
 ):
     """
     FD2 Headless smoke: LONG-DISTANCE search episodes + multi-goal, saved as MP4s.
@@ -2562,6 +3189,7 @@ def run_smoke(
                     maxsteps=maxsteps,
                     render_video=render_video,
                     video_path=vid_path,
+                    scenario_title=scenario_title,
                 )
             except Exception as e:
                 import traceback
@@ -2631,6 +3259,7 @@ def run_smoke(
                     maxsteps=maxsteps,
                     render_video=render_video,
                     video_path=vid_path,
+                    scenario_title=scenario_title,
                 )
             except Exception as e:
                 import traceback
@@ -2727,6 +3356,8 @@ def main():
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--n-smoke",   type=int, default=6,
                         help="Number of smoke episodes (FD2: last ep is multi-goal)")
+    parser.add_argument("--scenario-title", default="G1Nav Autonomous Fetch",
+                        help="VF-1: scenario name shown on the pre-roll title card")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -2739,6 +3370,7 @@ def main():
             maxsteps=args.maxsteps,
             render_video=not args.no_render,
             n_episodes=args.n_smoke,
+            scenario_title=args.scenario_title,
         )
         return
 
@@ -2766,6 +3398,7 @@ def main():
             port=args.port,
             maxsteps=args.maxsteps,
             render_video=not args.no_render,
+            scenario_title=args.scenario_title,
         )
         print(f"[fancy_demo] Web UI running at http://localhost:{args.port}", flush=True)
         print("[fancy_demo] Open browser → type 'find the red ball' → watch ego|BEV stream", flush=True)
@@ -2777,10 +3410,12 @@ def main():
             print("[fancy_demo] Shutting down.", flush=True)
     else:
         # Interactive terminal fallback
-        _terminal_loop(inf, scene_mgr, args.out, args.maxsteps, not args.no_render)
+        _terminal_loop(inf, scene_mgr, args.out, args.maxsteps, not args.no_render,
+                       scenario_title=args.scenario_title)
 
 
-def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
+def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video,
+                   scenario_title: str = "G1Nav Autonomous Fetch"):
     """Simple terminal loop."""
     print("\n" + "=" * 60, flush=True)
     print("G1Nav Fancy Demo — Terminal Mode", flush=True)
@@ -2838,6 +3473,7 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
                     maxsteps=maxsteps,
                     render_video=render_video,
                     video_path=vid_path,
+                    scenario_title=scenario_title,
                 )
             else:
                 # NX-15: target comes from the resolved instruction; scene_cfg
@@ -2852,6 +3488,7 @@ def _terminal_loop(inf, scene_mgr, out_dir, maxsteps, render_video):
                     prompt=user,
                     maxsteps=maxsteps,
                     render_video=render_video,
+                    scenario_title=scenario_title,
                     video_path=vid_path,
                 )
         except Exception as e:

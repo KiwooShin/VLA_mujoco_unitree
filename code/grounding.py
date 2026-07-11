@@ -1046,6 +1046,32 @@ _GROUND_NET_LAT_MS: list = []      # per-cycle inference latency (ms), module-le
 _ground_net_track_dist_m     = None
 _ground_net_track_bearing_rad = None
 
+# VF-1 (docs/vf1_showpiece.md): render-side-only cache of the last GROUND_NET
+# grounding cycle's confidence heatmap + this-cycle decision, so a caller can
+# display it (fancy_demo.py's detector-heatmap overlay) with ZERO extra
+# inference (reuses the SAME forward pass _ground_net() already ran). Never
+# read by any control-flow code path -- see get_ground_net_last_heatmap().
+_ground_net_last_heatmap = None
+
+
+def get_ground_net_last_heatmap() -> Optional[dict]:
+    """
+    VF-1 pure-read accessor: the last GROUND_NET grounding cycle's cached
+    confidence heatmap, keyed to the query it was computed for.
+
+    Returns None if GROUND_NET was never invoked (or is off) in this process,
+    or the detector failed to load. Otherwise a dict:
+      prob:       (H,W) float32 sigmoid confidence map in [0,1], or None
+      confidence: float, the model's raw peak confidence this cycle
+      accepted:   bool, whether this cycle's detection was accepted (>= tau,
+                  or track-hysteresis continuation)
+      color/shape: the (target_color, target_shape) query this cache is for
+      cam_type:   'grounding' | 'proximity'
+
+    Render-side only -- never read by any control-flow code path.
+    """
+    return _ground_net_last_heatmap
+
 
 def reset_ground_net_track() -> None:
     """Clear NX-7 FIX B's hysteresis track state. Callers should invoke this
@@ -1193,6 +1219,24 @@ def _ground_net(ego_rgb: np.ndarray, ego_depth: np.ndarray, target_color: str,
             if d_bearing <= bearing_gate_rad and d_dist <= dist_gate_m:
                 accepted = True
                 accept_reason = 'track'
+
+    # VF-1 (docs/vf1_showpiece.md): cache this cycle's confidence heatmap +
+    # decision for render-side display (fancy_demo.py's detector-heatmap
+    # overlay). Reuses the forward pass det.infer() already ran above (the
+    # detector caches its own last sigmoid map as an attribute, set with zero
+    # extra inference -- see nx6_heatmap_model.HeatmapDetector.infer()). Pure
+    # additive side effect: does not change `accepted`/`conf`/`dist`/`yaw_err`
+    # or either return path below.
+    global _ground_net_last_heatmap
+    _heat_prob = getattr(det, 'last_heat_prob', None)
+    _ground_net_last_heatmap = dict(
+        prob=(_heat_prob.copy() if _heat_prob is not None else None),
+        confidence=conf,
+        accepted=accepted,
+        color=color_key,
+        shape=shape_key,
+        cam_type=cam_type,
+    )
 
     if not accepted:
         return GroundingResult(0, 1, 0, 0.0, True)
