@@ -275,7 +275,7 @@ VLA_mujoco_unitree/
 ```
 
 Created at runtime and **gitignored**: `dataset/`, `runs/`, `checkpoint/`, `eval/`, `videos/`.
-Code comments cite experiment notes by filename (`docs/nx*.md`, `docs/cam_*.md`, …) — that's the private development ledger recording each mechanism's adoption/rejection evidence; it is not included in this repo.
+Code comments cite experiment notes by filename (`docs/nx*.md`, `docs/cam_*.md`, …) — that's the **experiment ledger** recording each mechanism's adoption/rejection evidence, published under [docs/](docs/) (start at [docs/INDEX.md](docs/INDEX.md)). Every cited file resolves.
 External, **not committed**: `checkpoints/` (GR00T-N1.6), `third_party/` (GR00T + WBC).
 
 ---

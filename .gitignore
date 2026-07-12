@@ -39,7 +39,6 @@ videos/
 third_party/
 
 # Project/experiment docs (kept out of the public source repo)
-docs/
 archive_v1/
 report.md
 report.pdf

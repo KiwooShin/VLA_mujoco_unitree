@@ -185,8 +185,8 @@ DIST_MAX_LONG    = 7.0   # maximum target distance (reliable detection ceiling)
 #   nearest distractor 2.15m off the straight path.
 #   Both runs: success=True, fell=False, steps=714/711, final_dist=0.468m/
 #   0.468m, wall~308-309s each (small step-count delta is the documented
-#   EGL/physics jitter, docs/reproduce.md -- not a concern). See
-#   docs/fs2_first_scene_resample.md.
+#   EGL/physics jitter, docs/gen1_multiseed.md -- not a concern). See
+#   docs/vf5_cam_objects.md (first-scene re-curation notes).
 FIRST_SCENE_SEED = 3461
 
 
