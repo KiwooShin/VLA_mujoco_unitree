@@ -3,6 +3,11 @@
 G1Nav Environment Verification Script
 Checks all dependencies needed for the campaign.
 Run with: python code/check_env.py   (inside the g1nav conda env)
+
+RF-1 (docs/refactor_plan.md): stays at top level unmoved (see the plan's
+top-level row: "entry shims, check_env (G3)") — it is a standalone,
+directly-executed diagnostic script (no importers anywhere in the repo),
+not library code, so it has no package home and needs no old-path alias.
 """
 
 from collections.abc import Callable

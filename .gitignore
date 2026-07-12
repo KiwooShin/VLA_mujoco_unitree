@@ -22,7 +22,7 @@ dataset_*/
 
 # Training runs, evals, logs
 runs/
-eval/
+/eval/
 logs/
 *.log
 MUJOCO_LOG.TXT

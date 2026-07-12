@@ -252,31 +252,54 @@ To view the web UI from your laptop over SSH: `ssh -L 5001:localhost:5001 <user>
 
 ## Repository Layout
 
+As of **RF-1** (docs/refactor_plan.md), the flat `code/*.py` layout was split into a
+package hierarchy, every file under 500 lines. Every old top-level path
+(`code/arena.py`, `code/grounding.py`, …) still works unchanged — it's now a thin
+`sys.modules` compat alias (or, for the six CLI entry points, a thin argument-parsing
+shim) onto the real module in its package, so **every command below is unaffected**.
+
 ```
 VLA_mujoco_unitree/
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
 ├── assets/demo.gif             # the README demo clip
-└── code/                       # source (37 files, incl. __init__.py)
-    ├── teacher.py              # WBC teacher wrapper (training-only)
-    ├── arena.py  scene.py  steer.py  maneuver_scene.py  maneuver_expert.py
-    ├── gen_dataset.py  gen_dart_dataset.py  gen_maneuver_dataset.py  gen_stand_keyframe.py  groot_lang.py
-    ├── dataset.py  dataset_phase.py  dataset_maneuver.py
-    ├── small_vla.py  train_dart_phase.py  train_gaitfix.py  train_maneuver.py  action_stats.py
-    ├── grounding.py            # grounding: learned detector (default when trained) + classical HSV+depth fallback
-    ├── gen_det_dataset.py  nx6_heatmap_model.py  nx6_heatmap_data.py     # learned-detector pipeline
-    ├── train_nx6_heatmap.py  eval_nx6_heatmap.py  nx6_heatmap_eval_utils.py
-    ├── lock_mgmt.py  scan_sched.py  avoid.py    # target-lock hygiene, bounded bidirectional scan, obstacle avoidance
-    ├── inferencer.py           # closed-loop deploy (3-rate pipeline, WBC-free)
-    ├── eval_closedloop.py  eval_search.py  eval_maneuver.py
-    ├── demo.py  fancy_demo.py
-    └── check_env.py
+└── code/
+    ├── __init__.py             # EGL fix (kept top-level)
+    ├── check_env.py            # GPU + MuJoCo + GR00T + WBC-ONNX verification (kept top-level; own tests/)
+    ├── arena.py  scene.py  steer.py  avoid.py  scan_sched.py  ...   # 37 old-path compat aliases / CLI shims — every command below is unaffected
+    ├── sim/                     # MuJoCo world: arena (build/render/cameras), scene, maneuver_scene/expert, WBC teacher — own tests/
+    ├── perception/               # grounding dispatch, geometry, HSV+depth pipeline, lock_mgmt (gate/rescan); detector/ = nx6 heatmap model/data/eval_utils — own tests/
+    ├── control/                  # steer, scan_sched, avoid/ (corridor repulsion, split core/geometry) — own tests/
+    ├── policy/                   # action_stats, groot_lang; small_vla/ = GroundedNav student model (blocks/heads/model) — own tests/
+    ├── data/                     # dataset, dataset_phase, dataset_maneuver (PyTorch loaders) — own tests/
+    ├── datagen/                  # gen_dataset, gen_dart_dataset, gen_maneuver_dataset, gen_det_dataset, gen_stand_keyframe (deterministic rollout generators) — own tests/
+    ├── train/                    # dart_phase, maneuver, gaitfix, nx6_heatmap (+eval) — training entry points — own tests/
+    ├── eval/                     # closedloop, search, maneuver — closed-loop evaluators (seed 999) — own tests/
+    ├── runtime/                  # inferencer — closed-loop deploy rollout harness (3-rate pipeline, WBC-free) — own tests/
+    └── apps/
+        ├── repl/                 # demo.py split: planner, executor, web, cli — own tests/
+        └── fancy/                # fancy_demo.py split: sampling, overlays, hud, cards, rollout, multi_goal, live, web, cli — own tests/
 ```
 
-Created at runtime and **gitignored**: `dataset/`, `runs/`, `checkpoint/`, `eval/`, `videos/`.
+Created at runtime and **gitignored**: `dataset/`, `runs/`, `checkpoint/`, `/eval/` (top-level, run outputs — not `code/eval/`), `videos/`.
 Code comments cite experiment notes by filename (`docs/nx*.md`, `docs/cam_*.md`, …) — that's the **experiment ledger** recording each mechanism's adoption/rejection evidence, published under [docs/](docs/) (start at [docs/INDEX.md](docs/INDEX.md)). Every cited file resolves.
 External, **not committed**: `checkpoints/` (GR00T-N1.6), `third_party/` (GR00T + WBC).
+
+### Running the tests
+
+Stdlib `unittest`, no new dependencies. Every package above (plus `check_env.py`)
+carries a sibling `tests/` directory (`code/<pkg>/tests/test_*.py`), discovered
+from the `code/` root:
+
+```bash
+export PYTHONPATH=.:$PYTHONPATH
+python -m unittest discover -s code -p "test_*.py"
+```
+
+~1000 tests (1039 in the reference run). A handful skip gracefully when EGL
+rendering or the external checkpoint/third_party assets (see **Prerequisites**
+above) aren't present — everything else runs offline, no GR00T load required.
 
 ---
 
